@@ -41,9 +41,9 @@
   --shadow-md: 0 8px 28px rgba(0, 0, 0, 0.35);
   --shadow-sm: 0 2px 10px rgba(0, 0, 0, 0.25);
 
-  /* 动效：统一时长与缓动（easeOutQuart 类曲线，收尾柔和） */
-  --t: 0.26s;
-  --ease: cubic-bezier(0.22, 0.8, 0.3, 1);
+  /* 动效：统一时长与缓动（Material 标准 S 曲线，起止都柔和，无起步突跳） */
+  --t: 0.32s;
+  --ease: cubic-bezier(0.4, 0, 0.2, 1);
 
   --font: "Segoe UI Variable Display", "Segoe UI", "PingFang SC", "Microsoft YaHei UI",
     "Microsoft YaHei", system-ui, -apple-system, sans-serif;
@@ -260,7 +260,7 @@ select option {
   color: var(--text-dim);
   white-space: nowrap;
   cursor: pointer;
-  transition: all 0.15s var(--ease);
+  transition: all 0.2s var(--ease);
 }
 .select-opt.active {
   background: var(--bg-hover);
