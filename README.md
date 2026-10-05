@@ -1,5 +1,8 @@
 # chatbot-platform
 
+[![CI](https://github.com/laonienb/chatbot-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/laonienb/chatbot-platform/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+
 自建聊天机器人平台：API 优先的"大脑"，多端接入的客户端体系。
 
 - **Web / App / 小程序** 通过平台原生 API 聊天，每个用户可自定义对话人设
@@ -85,3 +88,11 @@ Docker 方式（PostgreSQL + Redis + server）：
 ```bash
 cd deploy && docker compose up --build
 ```
+
+## 参与贡献
+
+欢迎 Issue 与 PR，开发环境搭建与提交约定见 [CONTRIBUTING.md](./CONTRIBUTING.md)。
+
+## 许可证
+
+[MIT](./LICENSE)
