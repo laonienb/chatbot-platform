@@ -50,3 +50,9 @@ class PersonaOut(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class PersonaMarketOut(PersonaOut):
+    """市场卡片：附作者昵称。"""
+
+    owner_name: str | None = None

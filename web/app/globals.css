@@ -703,6 +703,55 @@ button.stop {
 
 /* ---------- 人设市场 ---------- */
 
+.market-search-row {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.market-search-row .market-search {
+  margin-bottom: 0;
+  flex: 1;
+}
+.market-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 18px;
+}
+.chip {
+  font-size: 13px;
+  padding: 4px 14px;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-dim);
+}
+.chip.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.tag.link {
+  border: none;
+  background: rgba(91, 124, 250, 0.12);
+  color: var(--accent-hover);
+  cursor: pointer;
+  padding: 2px 10px;
+}
+.tag.mine {
+  background: rgba(70, 196, 111, 0.15);
+  color: #46c46f;
+}
+.market-card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.market-card-foot .owner {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
 .market-page {
   max-width: 900px;
   margin: 0 auto;

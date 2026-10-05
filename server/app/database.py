@@ -1,5 +1,6 @@
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
+import json
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
@@ -16,6 +17,11 @@ def utcnow() -> datetime:
     return datetime.now(UTC)
 
 
+def _json_serializer(value) -> str:
+    # 默认 json.dumps 会把中文转义成 \uXXXX，导致 JSON 列无法用文本匹配（如市场标签筛选）
+    return json.dumps(value, ensure_ascii=False)
+
+
 class Base(DeclarativeBase):
     pass
 
@@ -25,7 +31,12 @@ settings = get_settings()
 # SQLite 需要 check_same_thread=False 以配合测试内的连接复用；PostgreSQL 无此参数
 connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
 
-engine = create_async_engine(settings.database_url, echo=settings.debug, connect_args=connect_args)
+engine = create_async_engine(
+    settings.database_url,
+    echo=settings.debug,
+    connect_args=connect_args,
+    json_serializer=_json_serializer,
+)
 
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 

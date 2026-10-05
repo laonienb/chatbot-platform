@@ -183,6 +183,10 @@ export interface LlmModel {
   sort: number;
 }
 
+export interface MarketPersona extends Persona {
+  owner_name: string | null;
+}
+
 export interface AdminModelCreate {
   name: string;
   model: string;
@@ -249,6 +253,13 @@ export const platformApi = {
     api<LlmModel>(`/api/v1/admin/models/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   deleteModel: (id: string) => api<void>(`/api/v1/admin/models/${id}`, { method: "DELETE" }),
   forkPersona: (id: string) => api<Persona>(`/api/v1/personas/${id}/fork`, { method: "POST" }),
+  market: (params?: { q?: string; tag?: string }) => {
+    const sp = new URLSearchParams();
+    if (params?.q) sp.set("q", params.q);
+    if (params?.tag) sp.set("tag", params.tag);
+    const qs = sp.toString();
+    return api<MarketPersona[]>(`/api/v1/personas/market${qs ? `?${qs}` : ""}`);
+  },
 };
 
 /** 发送 POST 并消费 SSE 流；401 时自动刷新 token 重试一次。 */

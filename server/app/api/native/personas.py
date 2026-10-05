@@ -1,13 +1,13 @@
-"""人设 CRUD（M0 范围：创建/列表/详情/更新/删除；市场与 fork 在 M3）。"""
+"""人设 CRUD 与市场（M0 范围：CRUD；市场：搜索/标签/fork）。"""
 
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, status
-from sqlalchemy import or_, select
+from sqlalchemy import String, cast, or_, select
 
 from app.api.deps import CurrentUser, DbSession
-from app.models import Conversation, Persona
-from app.schemas.persona import PersonaCreate, PersonaOut, PersonaUpdate
+from app.models import Conversation, Persona, User
+from app.schemas.persona import PersonaCreate, PersonaMarketOut, PersonaOut, PersonaUpdate
 from app.services.persona import can_view_persona, generate_unique_slug
 
 router = APIRouter(prefix="/api/v1/personas", tags=["personas"])
@@ -40,6 +40,42 @@ async def create_persona(body: PersonaCreate, user: CurrentUser, db: DbSession):
     await db.commit()
     await db.refresh(persona)
     return persona
+
+
+@router.get("/market", response_model=list[PersonaMarketOut])
+async def persona_market(
+    user: CurrentUser,
+    db: DbSession,
+    q: str | None = None,
+    tag: str | None = None,
+    limit: int = 60,
+):
+    """公共市场：public 且 active 的人设，支持关键词（名称/人设正文）与标签过滤。
+
+    注意：必须声明在 /{persona_id} 之前，否则 "market" 会被当作 UUID 解析失败。
+    """
+    limit = min(max(limit, 1), 100)
+    stmt = (
+        select(Persona, User.display_name.label("owner_name"))
+        .join(User, Persona.owner_id == User.id)
+        .where(Persona.visibility == "public", Persona.status == "active")
+        .order_by(Persona.created_at.desc())
+        .limit(limit)
+    )
+    if q:
+        like = f"%{q.strip()}%"
+        stmt = stmt.where(or_(Persona.name.ilike(like), Persona.system_prompt.ilike(like)))
+    if tag:
+        # tags 是 JSON 数组列，SQLite/PG 通用做法：转文本后按 "tag" 匹配
+        stmt = stmt.where(cast(Persona.tags, String).ilike(f'%"{tag.strip()}"%'))
+    rows = (await db.execute(stmt)).all()
+    return [
+        PersonaMarketOut(
+            **PersonaOut.model_validate(persona).model_dump(),
+            owner_name=owner_name,
+        )
+        for persona, owner_name in rows
+    ]
 
 
 @router.get("/{persona_id}", response_model=PersonaOut)

@@ -170,3 +170,61 @@ async def test_fork_private_persona_forbidden(client, auth_headers):
 async def test_fork_own_persona_conflict(client, auth_headers, persona):
     resp = await client.post(f"/api/v1/personas/{persona['id']}/fork", headers=auth_headers)
     assert resp.status_code == 409
+
+
+async def _mk_public_persona(client, headers, name, slug, prompt, tags=None):
+    resp = await client.post(
+        "/api/v1/personas",
+        json={"name": name, "slug": slug, "system_prompt": prompt, "visibility": "public", "tags": tags},
+        headers=headers,
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()
+
+
+async def test_market_search_and_tag_filter(client, auth_headers):
+    """市场：只含 public，支持关键词与标签过滤，带作者昵称。"""
+    other = await client.post(
+        "/api/v1/auth/register",
+        json={"email": "market-author@test.dev", "password": "password123", "display_name": "市场作者"},
+    )
+    h = {"Authorization": f"Bearer {other.json()['access_token']}"}
+    await _mk_public_persona(client, h, "杜甫", "dufu", "你是诗圣杜甫，沉郁顿挫。", tags=["诗词", "历史角色"])
+    await _mk_public_persona(client, h, "口语陪练", "oral-en", "陪你练英语口语，纠音正词。", tags=["语言学习"])
+    await _mk_public_persona(client, h, "私有不该出现", "hidden-mkt", "私有内容", tags=None)
+    await client.post(
+        "/api/v1/personas",
+        json={"name": "真私有", "slug": "really-private", "system_prompt": "x"},
+        headers=h,
+    )
+
+    # 全量：只有 public 的（不看私有）
+    resp = await client.get("/api/v1/personas/market", headers=auth_headers)
+    assert resp.status_code == 200
+    items = resp.json()
+    names = {i["name"] for i in items}
+    assert {"杜甫", "口语陪练"} <= names
+    assert "真私有" not in names and "hidden-mkt" not in names
+
+    du_fu = next(i for i in items if i["name"] == "杜甫")
+    assert du_fu["owner_name"] == "市场作者"
+    assert set(du_fu["tags"]) == {"诗词", "历史角色"}
+
+    # 关键词搜索（命中人设正文）
+    resp = await client.get("/api/v1/personas/market", params={"q": "英语口语"}, headers=auth_headers)
+    assert {i["name"] for i in resp.json()} == {"口语陪练"}
+
+    # 标签过滤
+    resp = await client.get("/api/v1/personas/market", params={"tag": "历史角色"}, headers=auth_headers)
+    assert {i["name"] for i in resp.json()} == {"杜甫"}
+
+    # 关键词 + 标签组合（无交集 → 空）
+    resp = await client.get(
+        "/api/v1/personas/market", params={"q": "英语口语", "tag": "历史角色"}, headers=auth_headers
+    )
+    assert resp.json() == []
+
+    # 自己发布的也出现在市场（用于管理自己的公开人设）
+    own_public = await _mk_public_persona(client, auth_headers, "我的公开", "my-public", "公开测试")
+    resp = await client.get("/api/v1/personas/market", headers=auth_headers)
+    assert any(i["id"] == own_public["id"] for i in resp.json())

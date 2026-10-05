@@ -15,7 +15,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
-from app.database import Base, get_db
+from app.database import Base, _json_serializer, get_db
 from app.main import app as fastapi_app
 import app.models  # noqa: F401
 
@@ -26,6 +26,7 @@ async def db_engine():
         "sqlite+aiosqlite://",
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
+        json_serializer=_json_serializer,  # 与应用引擎一致：中文不转义，市场标签过滤才可用
     )
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
