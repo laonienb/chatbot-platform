@@ -141,6 +141,9 @@ button:disabled {
   cursor: default;
 }
 button.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   padding: 2px 8px;
   border: none;
   background: transparent;
@@ -580,6 +583,11 @@ a {
   width: 16px;
   font-size: 12px;
   flex: none;
+  display: inline-flex;
+  justify-content: center;
+}
+.conv-pin .pinned {
+  color: var(--accent-hover);
 }
 .conv-title {
   flex: 1;
@@ -845,6 +853,9 @@ button.stop {
   background: linear-gradient(135deg, #e5484d, #f06a4f);
   border: none;
   box-shadow: 0 4px 16px rgba(240, 91, 98, 0.35);
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
 }
 
 .conv-search {

@@ -19,6 +19,16 @@ import {
 import MemoryModal from "@/components/MemoryModal";
 import Select from "@/components/Select";
 import Avatar from "@/components/Avatar";
+import {
+  IconBrain,
+  IconCopy,
+  IconGear,
+  IconMenu,
+  IconPencil,
+  IconPin,
+  IconRefresh,
+  IconStop,
+} from "@/components/Icons";
 
 const PAGE_SIZE = 20;
 
@@ -334,7 +344,7 @@ export default function ChatPage() {
             <small>{me.email}</small>
           </div>
           <button className="icon-btn" title="账号设置" onClick={() => setShowSettings(true)}>
-            ⚙
+            <IconGear />
           </button>
         </div>
 
@@ -360,7 +370,7 @@ export default function ChatPage() {
                       ＋
                     </button>
                     <button className="icon-btn" title="编辑" onClick={() => setPersonaModal({ mode: "edit", persona: p })}>
-                      ✎
+                      <IconPencil />
                     </button>
                   </span>
                 )}
@@ -392,14 +402,14 @@ export default function ChatPage() {
                     setSidebarOpen(false);
                   }}
                 >
-                  <span className="conv-pin">{c.pinned ? "📌" : ""}</span>
+                  <span className="conv-pin">{c.pinned && <IconPin filled size={13} className="pinned" />}</span>
                   <span className="conv-title">{c.title ?? p?.name ?? "会话"}</span>
                   <span className="conv-actions">
-                    <button className="icon-btn" title="置顶/取消置顶" onClick={(e) => { e.stopPropagation(); togglePin(c); }}>
-                      📌
+                    <button className="icon-btn" title={c.pinned ? "取消置顶" : "置顶"} onClick={(e) => { e.stopPropagation(); togglePin(c); }}>
+                      <IconPin size={14} />
                     </button>
                     <button className="icon-btn" title="重命名" onClick={(e) => { e.stopPropagation(); renameConversation(c); }}>
-                      ✎
+                      <IconPencil size={14} />
                     </button>
                     <button className="icon-btn danger" title="删除会话" onClick={(e) => { e.stopPropagation(); removeConversation(c.id); }}>
                       ×
@@ -435,7 +445,7 @@ export default function ChatPage() {
           <>
             <header className="chat-header">
               <button className="icon-btn menu-btn" title="菜单" onClick={() => setSidebarOpen(true)}>
-                ☰
+                <IconMenu />
               </button>
               <div className="chat-header-info">
                 <Avatar
@@ -457,7 +467,7 @@ export default function ChatPage() {
                     if (p) setMemoryModalFor(p);
                   }}
                 >
-                  🧠
+                  <IconBrain />
                 </button>
               )}
               <Select
@@ -505,14 +515,14 @@ export default function ChatPage() {
                         {m.role === "assistant" && (
                           <span className="bubble-meta">
                             {m.model && <small>{m.model}</small>}
-                            <button className="icon-btn copy-btn" title="复制" onClick={() => copyMessage(m)}>
-                              ⧉
-                            </button>
-                            {m.id === lastAssistantId && (
-                              <button className="icon-btn copy-btn" title="重新生成" onClick={regenerate}>
-                                ↻
-                              </button>
-                            )}
+                        <button className="icon-btn copy-btn" title="复制" onClick={() => copyMessage(m)}>
+                          <IconCopy />
+                        </button>
+                        {m.id === lastAssistantId && (
+                          <button className="icon-btn copy-btn" title="重新生成" onClick={regenerate}>
+                            <IconRefresh />
+                          </button>
+                        )}
                           </span>
                         )}
                       </div>
@@ -539,7 +549,7 @@ export default function ChatPage() {
               />
               {streaming ? (
                 <button className="primary stop" onClick={stopStreaming}>
-                  ■ 停止
+                  <IconStop /> 停止
                 </button>
               ) : (
                 <button className="primary" onClick={send} disabled={!input.trim()}>
@@ -551,7 +561,7 @@ export default function ChatPage() {
         ) : (
           <div className="chat-empty">
             <button className="icon-btn menu-btn" title="菜单" onClick={() => setSidebarOpen(true)}>
-              ☰
+              <IconMenu />
             </button>
             <h2>选择或创建一个会话</h2>
             <p>左侧点一个人设开始对话；也可以去人设市场逛逛</p>

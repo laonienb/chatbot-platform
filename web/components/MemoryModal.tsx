@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { platformApi, type Memory, type Persona } from "@/lib/api";
+import { IconPencil } from "@/components/Icons";
 
 /** 人设的长期记忆管理：查看/添加/编辑/删除 + 记忆开关。 */
 export default function MemoryModal({
@@ -116,7 +117,7 @@ export default function MemoryModal({
                 <span className="memory-meta">
                   <small>{m.source === "chat" ? "自动" : "手动"}</small>
                   <button className="icon-btn" title="编辑" onClick={() => edit(m)}>
-                    ✎
+                    <IconPencil size={14} />
                   </button>
                   <button className="icon-btn danger" title="删除" onClick={() => remove(m)}>
                     ×
