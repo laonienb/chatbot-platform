@@ -7,6 +7,14 @@
 
 流式协议：chat_stream 返回异步迭代器，逐个 yield 内容增量（str），
 结束时 yield 一个 StreamDone 携带记账所需信息。
+
+计量精度（计费 step 1）：
+- litellm 流式路径攒下全部 chunks，收尾用 stream_chunk_builder 拼回完整
+  ModelResponse —— 拿到的 prompt/completion token 是实测值，而非
+  completion_tokens = len//4 这样的字符估算（后者对推理模型方向性错误）。
+- 拿不到 usage 时回退 litellm.token_counter（tiktoken），再回退字符估算，
+  并把 metering_source 标成 tiktoken / estimated，needs_review 同步置位，
+  计价层据此决定是否需要人工复核。
 """
 
 import asyncio
@@ -24,6 +32,12 @@ class LLMResult:
     model: str
     prompt_tokens: int
     completion_tokens: int
+    # 计费扩展（step 1）：默认 0，只在能实测时填，mock 不产生这些
+    cache_read_tokens: int = 0
+    reasoning_tokens: int = 0
+    finish_reason: str | None = None
+    metering_source: str = "provider"  # provider | tiktoken | estimated
+    needs_review: bool = False  # 计量不可信 → 计价需复核
 
     @property
     def total_tokens(self) -> int:
@@ -37,11 +51,48 @@ class StreamDone:
     model: str
     prompt_tokens: int
     completion_tokens: int
+    cache_read_tokens: int = 0
+    reasoning_tokens: int = 0
+    finish_reason: str | None = None
+    metering_source: str = "provider"
+    needs_review: bool = False
 
 
 def _estimate_tokens(text: str) -> int:
     # 粗略估算（≈4 字符/token），仅 mock 与兜底记账用
     return max(1, len(text) // 4)
+
+
+def _tiktoken_count(text: str, model: str | None) -> int | None:
+    """tiktoken 实际计数；未装 litellm 或计数失败返回 None，让调用方回退估算。"""
+    if not text:
+        return 0
+    try:
+        import litellm
+
+        n = litellm.token_counter(model=model or "", text=text)
+        return int(n) if n else None
+    except Exception:
+        return None
+
+
+def _usage_parts(obj: Any, model: str) -> tuple[int, int, int, int, str | None]:
+    """从 ModelResponse（或带 usage 的对象）提 (prompt, completion, cache, reasoning, finish)。"""
+    usage = getattr(obj, "usage", None)
+    prompt = getattr(usage, "prompt_tokens", 0) or 0
+    completion = getattr(usage, "completion_tokens", 0) or 0
+    # cache 明细：prompt_tokens_details.cached_tokens（OpenAI/DeepSeek 格式）
+    details = getattr(usage, "prompt_tokens_details", None)
+    cache_read = getattr(details, "cached_tokens", 0) or 0
+    # reasoning 明细：completion_tokens_details.reasoning_tokens（推理模型计价用）
+    comp_details = getattr(usage, "completion_tokens_details", None)
+    reasoning = getattr(comp_details, "reasoning_tokens", 0) or 0
+    finish = None
+    try:
+        finish = obj.choices[0].finish_reason
+    except Exception:
+        pass
+    return int(prompt), int(completion), int(cache_read), int(reasoning), finish
 
 
 def _backend_kwargs(api_base: str | None, api_key: str | None) -> dict[str, Any]:
@@ -87,11 +138,16 @@ class MockBackend:
             ]
             if facts:
                 content += f" |已知:{facts[0]}"
+        prompt_tokens = sum(_estimate_tokens(m["content"]) for m in messages)
+        completion_tokens = _estimate_tokens(content)
         return LLMResult(
             content=content,
             model=model,
-            prompt_tokens=sum(_estimate_tokens(m["content"]) for m in messages),
-            completion_tokens=_estimate_tokens(content),
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            finish_reason="stop",
+            metering_source="estimated",  # mock 就是估算，诚实标注
+            needs_review=False,  # mock 本身是假数，不进真实计价流，不标复核
         )
 
     async def chat_stream(
@@ -113,6 +169,11 @@ class MockBackend:
             model=result.model,
             prompt_tokens=result.prompt_tokens,
             completion_tokens=result.completion_tokens,
+            cache_read_tokens=result.cache_read_tokens,
+            reasoning_tokens=result.reasoning_tokens,
+            finish_reason=result.finish_reason,
+            metering_source=result.metering_source,
+            needs_review=result.needs_review,
         )
 
 
@@ -138,12 +199,33 @@ class LiteLLMBackend:
             kwargs["max_tokens"] = max_tokens
 
         resp = await litellm.acompletion(model=model, messages=messages, **kwargs)
-        usage = resp.usage
+        prompt, completion, cache_read, reasoning, finish = _usage_parts(resp, model)
+        try:
+            content = resp.choices[0].message.content or ""
+        except Exception:
+            content = ""
+
+        metering = "provider"
+        if prompt == 0 or completion == 0:
+            # usage 缺失 → tiktoken 补；tiktoken 也失败再回退字符估算
+            metering = "tiktoken"
+            prompt = prompt or _tiktoken_count(content, model) or _estimate_tokens(
+                "".join(m["content"] for m in messages)
+            )
+            completion = completion or _tiktoken_count(content, model) or _estimate_tokens(content)
+            if completion == 0 or prompt == 0:
+                metering = "estimated"
+
         return LLMResult(
-            content=resp.choices[0].message.content or "",
+            content=content,
             model=model,
-            prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
-            completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
+            prompt_tokens=prompt,
+            completion_tokens=completion,
+            cache_read_tokens=cache_read,
+            reasoning_tokens=reasoning,
+            finish_reason=finish,
+            metering_source=metering,
+            needs_review=metering != "provider",
         )
 
     async def chat_stream(
@@ -169,20 +251,47 @@ class LiteLLMBackend:
         resp = await litellm.acompletion(
             model=model, messages=messages, stream=True, stream_options={"include_usage": True}, **kwargs
         )
-        prompt_tokens = 0
+
         parts: list[str] = []
+        chunks: list[Any] = []  # 攒下全部 chunk，收尾用 builder 拼回真实 usage
         async for chunk in resp:
-            if getattr(chunk, "usage", None) is not None:
-                prompt_tokens = getattr(chunk.usage, "prompt_tokens", 0) or prompt_tokens
+            chunks.append(chunk)
             if chunk.choices:
                 content = chunk.choices[0].delta.content
                 if content:
                     parts.append(content)
                     yield content
+
+        # 收尾：builder 拼回完整响应拿真实 usage；失败或缺字段回退 tiktoken/估算
+        prompt = completion = cache_read = reasoning = 0
+        finish: str | None = None
+        metering = "tiktoken"
+        try:
+            built = litellm.stream_chunk_builder(chunks, messages=messages)
+            if built is not None:
+                prompt, completion, cache_read, reasoning, finish = _usage_parts(built, model)
+                if prompt and completion:
+                    metering = "provider"
+        except Exception:
+            pass
+
+        if prompt == 0:
+            joined_msg = "".join(m["content"] for m in messages)
+            prompt = _tiktoken_count(joined_msg, model) or _estimate_tokens(joined_msg)
+        if completion == 0:
+            joined = "".join(parts)
+            completion = _tiktoken_count(joined, model) or _estimate_tokens(joined)
+            metering = "estimated" if not completion else metering
+
         yield StreamDone(
             model=model,
-            prompt_tokens=prompt_tokens or _estimate_tokens("".join(m["content"] for m in messages)),
-            completion_tokens=_estimate_tokens("".join(parts)),
+            prompt_tokens=prompt,
+            completion_tokens=completion,
+            cache_read_tokens=cache_read,
+            reasoning_tokens=reasoning,
+            finish_reason=finish,
+            metering_source=metering,
+            needs_review=metering != "provider",
         )
 
 
