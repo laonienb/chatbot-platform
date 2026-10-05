@@ -3,24 +3,32 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
+import Markdown from "@/components/Markdown";
 import {
   clearTokens,
   getAccessToken,
   platformApi,
+  regenerateStream,
   sendMessageStream,
   type Conversation,
+  type LlmModel,
   type Message,
   type Persona,
   type User,
 } from "@/lib/api";
 
+const PAGE_SIZE = 20;
+
 export default function ChatPage() {
   const router = useRouter();
   const [me, setMe] = useState<User | null>(null);
   const [personas, setPersonas] = useState<Persona[]>([]);
+  const [models, setModels] = useState<LlmModel[]>([]);
   const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [convSearch, setConvSearch] = useState("");
   const [activeId, setActiveId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
+  const [hasMore, setHasMore] = useState(false);
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -28,6 +36,9 @@ export default function ChatPage() {
     { mode: "create" } | { mode: "edit"; persona: Persona } | null
   >(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const abortRef = useRef<AbortController | null>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   const scrollToBottom = useCallback(() => {
@@ -36,13 +47,15 @@ export default function ChatPage() {
 
   const loadData = useCallback(async () => {
     try {
-      const [user, ps, convs] = await Promise.all([
+      const [user, ps, ms, convs] = await Promise.all([
         platformApi.me(),
         platformApi.personas(),
+        platformApi.models(),
         platformApi.conversations(),
       ]);
       setMe(user);
       setPersonas(ps);
+      setModels(ms);
       setConversations(convs);
     } catch (err) {
       if (err instanceof Error && err.message.includes("登录已过期")) return;
@@ -62,8 +75,11 @@ export default function ChatPage() {
     async (id: string) => {
       setActiveId(id);
       setMessages([]);
+      setHasMore(false);
       try {
-        setMessages(await platformApi.messages(id));
+        const msgs = await platformApi.messages(id, { limit: PAGE_SIZE });
+        setMessages(msgs);
+        setHasMore(msgs.length === PAGE_SIZE);
         scrollToBottom();
       } catch (err) {
         setError(err instanceof Error ? err.message : "加载会话失败");
@@ -75,6 +91,7 @@ export default function ChatPage() {
   /** 点人设：优先接续该人设最近的会话，没有才新建。 */
   async function chatWithPersona(persona: Persona, forceNew = false) {
     setError(null);
+    setSidebarOpen(false);
     try {
       if (!forceNew) {
         const existing = conversations
@@ -92,10 +109,40 @@ export default function ChatPage() {
       setConversations((prev) => [conv, ...prev]);
       setActiveId(conv.id);
       setMessages(await platformApi.messages(conv.id));
+      setHasMore(false);
       scrollToBottom();
     } catch (err) {
       setError(err instanceof Error ? err.message : "创建会话失败");
     }
+  }
+
+  /** 向上滚动加载更早的消息，并保持视口位置。 */
+  async function loadOlder() {
+    if (!activeId || !hasMore || messages.length === 0) return;
+    const container = scrollRef.current;
+    const prevHeight = container?.scrollHeight ?? 0;
+    try {
+      const older = await platformApi.messages(activeId, {
+        limit: PAGE_SIZE,
+        before_id: messages[0].id,
+      });
+      setMessages((prev) => [...older, ...prev]);
+      setHasMore(older.length === PAGE_SIZE);
+      requestAnimationFrame(() => {
+        if (container) container.scrollTop = container.scrollHeight - prevHeight;
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "加载历史失败");
+    }
+  }
+
+  function onScroll() {
+    const el = scrollRef.current;
+    if (el && el.scrollTop === 0 && hasMore && !streaming) loadOlder();
+  }
+
+  function stopStreaming() {
+    abortRef.current?.abort();
   }
 
   async function send() {
@@ -104,6 +151,8 @@ export default function ChatPage() {
     setInput("");
     setStreaming(true);
     setError(null);
+    const controller = new AbortController();
+    abortRef.current = controller;
     setMessages((prev) => [
       ...prev,
       { id: `tmp-u-${Date.now()}`, role: "user", content, model: null, created_at: "" },
@@ -111,23 +160,84 @@ export default function ChatPage() {
     ]);
     scrollToBottom();
     try {
-      await sendMessageStream(activeId, content, (delta) => {
-        setMessages((prev) => {
-          const next = [...prev];
-          const last = next[next.length - 1];
-          if (last?.role === "assistant") next[next.length - 1] = { ...last, content: last.content + delta };
-          return next;
-        });
-        scrollToBottom();
-      });
-      setMessages(await platformApi.messages(activeId));
+      await sendMessageStream(
+        activeId,
+        content,
+        (delta) => {
+          setMessages((prev) => {
+            const next = [...prev];
+            const last = next[next.length - 1];
+            if (last?.role === "assistant") next[next.length - 1] = { ...last, content: last.content + delta };
+            return next;
+          });
+          scrollToBottom();
+        },
+        controller.signal
+      );
+      setMessages(await platformApi.messages(activeId, { limit: PAGE_SIZE }));
       setConversations(await platformApi.conversations());
     } catch (err) {
-      setError(err instanceof Error ? err.message : "发送失败");
-      if (activeId) setMessages(await platformApi.messages(activeId).catch(() => []));
+      if ((err as Error).name !== "AbortError") {
+        setError(err instanceof Error ? err.message : "发送失败");
+      }
+      if (activeId) setMessages(await platformApi.messages(activeId, { limit: PAGE_SIZE }).catch(() => []));
     } finally {
+      abortRef.current = null;
       setStreaming(false);
       scrollToBottom();
+    }
+  }
+
+  async function regenerate() {
+    if (!activeId || streaming) return;
+    setStreaming(true);
+    setError(null);
+    const controller = new AbortController();
+    abortRef.current = controller;
+    // 服务端会替换最后一条助手回复；前端先把末尾助手消息清空接流
+    setMessages((prev) => {
+      const next = [...prev];
+      if (next[next.length - 1]?.role === "assistant") {
+        next[next.length - 1] = { ...next[next.length - 1], content: "" };
+      } else {
+        next.push({ id: `tmp-a-${Date.now()}`, role: "assistant", content: "", model: null, created_at: "" });
+      }
+      return next;
+    });
+    scrollToBottom();
+    try {
+      await regenerateStream(
+        activeId,
+        (delta) => {
+          setMessages((prev) => {
+            const next = [...prev];
+            const last = next[next.length - 1];
+            if (last?.role === "assistant") next[next.length - 1] = { ...last, content: last.content + delta };
+            return next;
+          });
+          scrollToBottom();
+        },
+        controller.signal
+      );
+      setMessages(await platformApi.messages(activeId, { limit: PAGE_SIZE }));
+    } catch (err) {
+      if ((err as Error).name !== "AbortError") {
+        setError(err instanceof Error ? err.message : "重新生成失败");
+      }
+      if (activeId) setMessages(await platformApi.messages(activeId, { limit: PAGE_SIZE }).catch(() => []));
+    } finally {
+      abortRef.current = null;
+      setStreaming(false);
+      scrollToBottom();
+    }
+  }
+
+  async function switchModel(conv: Conversation, model: string) {
+    try {
+      const updated = await platformApi.updateConversation(conv.id, { model: model || "" });
+      setConversations((prev) => prev.map((c) => (c.id === conv.id ? updated : c)));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "切换模型失败");
     }
   }
 
@@ -187,6 +297,15 @@ export default function ChatPage() {
 
   const activeConv = conversations.find((c) => c.id === activeId);
   const personaOf = (id: string) => personas.find((p) => p.id === id);
+  const lastAssistantId =
+    !streaming && messages.length > 0 && messages[messages.length - 1].role === "assistant"
+      ? messages[messages.length - 1].id
+      : null;
+  const filteredConvs = convSearch.trim()
+    ? conversations.filter((c) =>
+        (c.title ?? personaOf(c.persona_id)?.name ?? "").toLowerCase().includes(convSearch.trim().toLowerCase())
+      )
+    : conversations;
 
   if (!me) {
     return <main className="chat-loading">{error ?? "加载中…"}</main>;
@@ -194,7 +313,8 @@ export default function ChatPage() {
 
   return (
     <div className="chat-layout">
-      <aside className="sidebar">
+      {sidebarOpen && <div className="sidebar-mask" onClick={() => setSidebarOpen(false)} />}
+      <aside className={`sidebar ${sidebarOpen ? "open" : ""}`}>
         <div className="sidebar-user">
           <span className="avatar">{(me.display_name ?? me.email)[0]?.toUpperCase()}</span>
           <div className="sidebar-user-info">
@@ -220,7 +340,7 @@ export default function ChatPage() {
                 <button className="persona-main" onClick={() => chatWithPersona(p)} disabled={streaming}>
                   <span className="avatar sm">{p.name[0]}</span>
                   <span className="persona-name">{p.name}</span>
-                  <small>{p.visibility === "public" && p.owner_id !== me.id ? "公共" : "私有"}</small>
+                  <small>{p.visibility === "public" ? (p.owner_id === me.id ? "已发布" : "公共") : "私有"}</small>
                 </button>
                 {p.owner_id === me.id && (
                   <span className="persona-actions">
@@ -240,16 +360,25 @@ export default function ChatPage() {
         <div className="sidebar-section grow">
           <div className="section-head">
             <span>会话</span>
+            <input
+              className="conv-search"
+              placeholder="搜索…"
+              value={convSearch}
+              onChange={(e) => setConvSearch(e.target.value)}
+            />
           </div>
           <div className="conv-list">
-            {conversations.length === 0 && <p className="empty">点上方人设开始对话</p>}
-            {conversations.map((c) => {
+            {filteredConvs.length === 0 && <p className="empty">{convSearch ? "无匹配会话" : "点上方人设开始对话"}</p>}
+            {filteredConvs.map((c) => {
               const p = personaOf(c.persona_id);
               return (
                 <div
                   key={c.id}
                   className={`conv-item ${c.id === activeId ? "active" : ""}`}
-                  onClick={() => openConversation(c.id)}
+                  onClick={() => {
+                    openConversation(c.id);
+                    setSidebarOpen(false);
+                  }}
                 >
                   <span className="conv-pin">{c.pinned ? "📌" : ""}</span>
                   <span className="conv-title">{c.title ?? p?.name ?? "会话"}</span>
@@ -271,6 +400,9 @@ export default function ChatPage() {
         </div>
 
         <footer className="sidebar-footer">
+          <Link href="/market" className="sidebar-link">
+            🛍️ 人设市场
+          </Link>
           <Link href="/keys" className="sidebar-link">
             🔑 密钥与用量
           </Link>
@@ -281,20 +413,48 @@ export default function ChatPage() {
         {activeConv ? (
           <>
             <header className="chat-header">
-              <strong>{activeConv.title ?? personaOf(activeConv.persona_id)?.name ?? "会话"}</strong>
-              <small>{personaOf(activeConv.persona_id)?.name}</small>
+              <button className="icon-btn menu-btn" title="菜单" onClick={() => setSidebarOpen(true)}>
+                ☰
+              </button>
+              <div className="chat-header-info">
+                <strong>{activeConv.title ?? personaOf(activeConv.persona_id)?.name ?? "会话"}</strong>
+                <small>{personaOf(activeConv.persona_id)?.name}</small>
+              </div>
+              <select
+                className="model-select"
+                value={activeConv.model ?? ""}
+                onChange={(e) => switchModel(activeConv, e.target.value)}
+                title="切换本会话使用的模型"
+              >
+                <option value="">默认模型</option>
+                {models.map((m) => (
+                  <option key={m.id} value={m.model}>
+                    {m.name}
+                  </option>
+                ))}
+              </select>
             </header>
-            <div className="messages">
+            <div className="messages" ref={scrollRef} onScroll={onScroll}>
+              {hasMore && (
+                <button className="load-older" onClick={loadOlder} disabled={streaming}>
+                  ↑ 加载更早的消息
+                </button>
+              )}
               {messages.map((m) => (
                 <div key={m.id} className={`bubble-row ${m.role}`}>
                   <div className={`bubble ${m.role}`}>
-                    {m.content}
+                    {m.role === "assistant" ? <Markdown content={m.content} /> : m.content}
                     {m.role === "assistant" && (
                       <span className="bubble-meta">
                         {m.model && <small>{m.model}</small>}
                         <button className="icon-btn copy-btn" title="复制" onClick={() => copyMessage(m)}>
                           ⧉
                         </button>
+                        {m.id === lastAssistantId && (
+                          <button className="icon-btn copy-btn" title="重新生成" onClick={regenerate}>
+                            ↻
+                          </button>
+                        )}
                       </span>
                     )}
                   </div>
@@ -316,15 +476,24 @@ export default function ChatPage() {
                 rows={2}
                 disabled={streaming}
               />
-              <button className="primary" onClick={send} disabled={streaming || !input.trim()}>
-                {streaming ? "…" : "发送"}
-              </button>
+              {streaming ? (
+                <button className="primary stop" onClick={stopStreaming}>
+                  ■ 停止
+                </button>
+              ) : (
+                <button className="primary" onClick={send} disabled={!input.trim()}>
+                  发送
+                </button>
+              )}
             </footer>
           </>
         ) : (
           <div className="chat-empty">
+            <button className="icon-btn menu-btn" title="菜单" onClick={() => setSidebarOpen(true)}>
+              ☰
+            </button>
             <h2>选择或创建一个会话</h2>
-            <p>左侧点一个人设开始对话；点人设旁的 ＋ 开新对话</p>
+            <p>左侧点一个人设开始对话；也可以去人设市场逛逛</p>
           </div>
         )}
         {error && <div className="toast error">{error}</div>}
@@ -381,6 +550,8 @@ function PersonaForm({
   const [opening, setOpening] = useState(persona?.opening_message ?? "");
   const [model, setModel] = useState(persona?.model ?? "");
   const [temperature, setTemperature] = useState(persona?.temperature?.toString() ?? "");
+  const [tags, setTags] = useState(persona?.tags?.join(", ") ?? "");
+  const [visibility, setVisibility] = useState(persona?.visibility ?? "private");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -389,12 +560,18 @@ function PersonaForm({
     setBusy(true);
     setError(null);
     try {
+      const tagList = tags
+        .split(/[,，\s]+/)
+        .map((t) => t.trim())
+        .filter(Boolean);
       const body: Record<string, unknown> = {
         name,
         system_prompt: systemPrompt,
         opening_message: opening || undefined,
         model: model || undefined,
         temperature: temperature ? Number(temperature) : undefined,
+        visibility,
+        tags: tagList.length ? tagList : undefined,
       };
       const saved = isEdit
         ? await platformApi.updatePersona(persona!.id, body)
@@ -464,6 +641,19 @@ function PersonaForm({
               value={temperature}
               onChange={(e) => setTemperature(e.target.value)}
             />
+          </label>
+        </div>
+        <div className="field-row">
+          <label>
+            标签（逗号分隔，市场搜索用）
+            <input value={tags} onChange={(e) => setTags(e.target.value)} placeholder="诗词, 历史角色" />
+          </label>
+          <label>
+            可见性
+            <select value={visibility} onChange={(e) => setVisibility(e.target.value)}>
+              <option value="private">私有</option>
+              <option value="public">公开（发布到人设市场）</option>
+            </select>
           </label>
         </div>
         {error && <p className="auth-error">{error}</p>}

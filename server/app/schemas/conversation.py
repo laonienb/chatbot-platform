@@ -13,6 +13,7 @@ class ConversationCreate(BaseModel):
 class ConversationUpdate(BaseModel):
     title: str | None = Field(default=None, min_length=1, max_length=128)
     pinned: bool | None = None
+    model: str | None = Field(default=None, max_length=128)  # 会话级模型覆盖，空串=清除
 
 
 class ConversationOut(BaseModel):
@@ -21,6 +22,7 @@ class ConversationOut(BaseModel):
     channel: str
     title: str | None
     pinned: bool
+    model: str | None
     last_message_at: datetime | None
     created_at: datetime
 

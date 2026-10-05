@@ -18,7 +18,7 @@ from app.schemas.conversation import (
     MessageSendIn,
     SendMessageOut,
 )
-from app.services.chat import send_message, send_message_stream
+from app.services.chat import regenerate_stream, send_message, send_message_stream
 from app.services.persona import can_view_persona
 
 router = APIRouter(prefix="/api/v1/conversations", tags=["conversations"])
@@ -73,7 +73,10 @@ async def update_conversation(
     conversation_id: UUID, body: ConversationUpdate, user: CurrentUser, db: DbSession
 ):
     conv = await _get_owned_conversation(conversation_id, user.id, db)
-    for field, value in body.model_dump(exclude_unset=True).items():
+    data = body.model_dump(exclude_unset=True)
+    if data.get("model") == "":
+        data["model"] = None  # 空串=恢复默认（人设/平台默认）
+    for field, value in data.items():
         setattr(conv, field, value)
     await db.commit()
     await db.refresh(conv)
@@ -109,6 +112,23 @@ async def send(
         user_message=MessageOut.model_validate(user_message),
         assistant_message=MessageOut.model_validate(assistant_message),
     )
+
+
+@router.post("/{conversation_id}/regenerate")
+async def regenerate(
+    conversation_id: UUID, user: CurrentUser, db: DbSession
+):
+    """重新生成最后一条助手回复（替换而非追加）。仅 SSE 流式返回。"""
+    conv = await _get_owned_conversation(conversation_id, user.id, db)
+
+    async def event_stream():
+        async for piece in regenerate_stream(db, conv):
+            if isinstance(piece, StreamDone):
+                continue
+            yield format_sse({"choices": [{"index": 0, "delta": {"content": piece}}]})
+        yield SSE_DONE
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers=SSE_HEADERS)
 
 
 @router.get("/{conversation_id}/messages", response_model=list[MessageOut])

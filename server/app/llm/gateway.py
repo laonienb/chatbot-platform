@@ -43,6 +43,19 @@ def _estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+def _backend_kwargs(api_base: str | None, api_key: str | None) -> dict[str, Any]:
+    """按请求覆盖凭证（来自 llm_models 注册表）；空则回落到全局配置。"""
+    settings = get_settings()
+    kwargs: dict[str, Any] = {}
+    base = api_base if api_base is not None else (settings.llm_base_url or None)
+    key = api_key if api_key is not None else (settings.llm_api_key or None)
+    if base:
+        kwargs["api_base"] = base
+    if key:
+        kwargs["api_key"] = key
+    return kwargs
+
+
 class MockBackend:
     """确定性 mock：回复中携带 persona 标识与用户末句，便于验证人设注入与链路。"""
 
@@ -53,6 +66,8 @@ class MockBackend:
         temperature: float | None = None,
         top_p: float | None = None,
         max_tokens: int | None = None,
+        api_base: str | None = None,
+        api_key: str | None = None,
     ) -> LLMResult:
         system = messages[0]["content"] if messages and messages[0]["role"] == "system" else ""
         last_user = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
@@ -74,6 +89,8 @@ class MockBackend:
         temperature: float | None = None,
         top_p: float | None = None,
         max_tokens: int | None = None,
+        api_base: str | None = None,
+        api_key: str | None = None,
     ) -> AsyncIterator[str | StreamDone]:
         result = await self.chat(messages, model, temperature, top_p, max_tokens)
         chunk_size = 8
@@ -95,21 +112,18 @@ class LiteLLMBackend:
         temperature: float | None = None,
         top_p: float | None = None,
         max_tokens: int | None = None,
+        api_base: str | None = None,
+        api_key: str | None = None,
     ) -> LLMResult:
         import litellm  # lazy import：mock 模式无需安装/加载
 
-        settings = get_settings()
-        kwargs: dict[str, Any] = {}
+        kwargs = _backend_kwargs(api_base, api_key)
         if temperature is not None:
             kwargs["temperature"] = temperature
         if top_p is not None:
             kwargs["top_p"] = top_p
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
-        if settings.llm_api_key:
-            kwargs["api_key"] = settings.llm_api_key
-        if settings.llm_base_url:
-            kwargs["api_base"] = settings.llm_base_url
 
         resp = await litellm.acompletion(model=model, messages=messages, **kwargs)
         usage = resp.usage
@@ -127,21 +141,18 @@ class LiteLLMBackend:
         temperature: float | None = None,
         top_p: float | None = None,
         max_tokens: int | None = None,
+        api_base: str | None = None,
+        api_key: str | None = None,
     ) -> AsyncIterator[str | StreamDone]:
         import litellm  # lazy import：mock 模式无需安装/加载
 
-        settings = get_settings()
-        kwargs: dict[str, Any] = {}
+        kwargs = _backend_kwargs(api_base, api_key)
         if temperature is not None:
             kwargs["temperature"] = temperature
         if top_p is not None:
             kwargs["top_p"] = top_p
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
-        if settings.llm_api_key:
-            kwargs["api_key"] = settings.llm_api_key
-        if settings.llm_base_url:
-            kwargs["api_base"] = settings.llm_base_url
 
         resp = await litellm.acompletion(
             model=model, messages=messages, stream=True, stream_options={"include_usage": True}, **kwargs
@@ -176,7 +187,10 @@ async def chat_stream(
     temperature: float | None = None,
     top_p: float | None = None,
     max_tokens: int | None = None,
+    api_base: str | None = None,
+    api_key: str | None = None,
 ) -> AsyncIterator[str | StreamDone]:
     """便捷入口：按配置选后端并开始流式输出。"""
-    async for piece in get_llm_backend().chat_stream(messages, model, temperature, top_p, max_tokens):
+    backend = get_llm_backend()
+    async for piece in backend.chat_stream(messages, model, temperature, top_p, max_tokens, api_base, api_key):
         yield piece

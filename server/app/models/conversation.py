@@ -19,6 +19,7 @@ class Conversation(Base):
     channel: Mapped[str] = mapped_column(String(16), default="web")  # web / qq / wechat / miniprogram
     title: Mapped[str | None] = mapped_column(String(128))
     pinned: Mapped[bool] = mapped_column(Boolean, default=False)
+    model: Mapped[str | None] = mapped_column(String(128))  # 会话级模型覆盖（LiteLLM 模型串）
     last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 

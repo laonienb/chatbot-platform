@@ -4,12 +4,12 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.llm.gateway import LLMResult, StreamDone, chat_stream, get_llm_backend
-from app.models import ApiKey, Conversation, Message, Persona, UsageLog, User
+from app.models import ApiKey, Conversation, LlmModel, Message, Persona, UsageLog, User
 
 # 上下文窗口：最多回看的历史消息条数（超长截断策略 M1 细化为滚动摘要）
 CONTEXT_WINDOW = 50
@@ -42,42 +42,43 @@ async def resolve_model(db: AsyncSession, model_field: str) -> tuple[Persona | N
     return persona, persona.model or get_settings().llm_default_model
 
 
-async def _record_usage(
-    db: AsyncSession,
-    *,
-    user_id: UUID,
-    model: str,
-    result: LLMResult,
-    persona_id: UUID | None = None,
-    conversation_id: UUID | None = None,
-    api_key_id: UUID | None = None,
-) -> None:
-    db.add(
-        UsageLog(
-            user_id=user_id,
-            api_key_id=api_key_id,
-            conversation_id=conversation_id,
-            model=model,
-            persona_id=persona_id,
-            prompt_tokens=result.prompt_tokens,
-            completion_tokens=result.completion_tokens,
+async def lookup_model_credentials(
+    db: AsyncSession, model: str
+) -> tuple[str | None, str | None]:
+    """从模型注册表查该模型串的专属端点凭证（自部署/第三方 API）。"""
+    row = (
+        await db.execute(select(LlmModel).where(LlmModel.model == model, LlmModel.enabled == True))  # noqa: E712
+    ).scalars().first()
+    return (row.api_base, row.api_key) if row else (None, None)
+
+
+async def default_model_string(db: AsyncSession) -> str:
+    """注册表里的默认模型；注册表为空则用环境配置。"""
+    row = (
+        await db.execute(
+            select(LlmModel).where(LlmModel.enabled == True, LlmModel.is_default == True)  # noqa: E712
         )
-    )
+    ).scalars().first()
+    if row is None:
+        row = (await db.execute(select(LlmModel).where(LlmModel.enabled == True).limit(1))).scalars().first()  # noqa: E712
+    return row.model if row else get_settings().llm_default_model
 
 
-async def send_message(db: AsyncSession, conversation: Conversation, content: str) -> tuple[Message, Message]:
-    """有状态链路：落用户消息 → 组装上下文 → 调 LLM → 落助手消息与用量。返回 (用户消息, 助手消息)。"""
-    persona = await db.get(Persona, conversation.persona_id)
+async def resolve_chat_model(
+    db: AsyncSession, conversation: Conversation, persona: Persona | None
+) -> tuple[str, str | None, str | None]:
+    """会话级覆盖 > 人设偏好 > 注册表默认；并带出该模型的专属端点凭证。"""
+    model = conversation.model or (persona.model if persona else None) or await default_model_string(db)
+    api_base, api_key = await lookup_model_credentials(db, model)
+    return model, api_base, api_key
 
-    user_message = Message(conversation_id=conversation.id, role="user", content=content)
-    db.add(user_message)
-    await db.flush()  # 先拿到 user_message.id/created_at，便于上下文排序
 
-    history = (
+async def _history(db: AsyncSession, conversation_id: UUID) -> list[Message]:
+    rows = (
         (
             await db.execute(
                 select(Message)
-                .where(Message.conversation_id == conversation.id)
+                .where(Message.conversation_id == conversation_id)
                 .order_by(Message.created_at.desc(), Message.id.desc())
                 .limit(CONTEXT_WINDOW)
             )
@@ -85,37 +86,61 @@ async def send_message(db: AsyncSession, conversation: Conversation, content: st
         .scalars()
         .all()
     )
-    history = list(reversed(history))  # 时间正序喂给模型
+    return list(reversed(rows))
 
+
+async def _save_reply(
+    db: AsyncSession,
+    conversation: Conversation,
+    persona: Persona | None,
+    done: StreamDone,
+    content: str,
+) -> Message:
+    assistant_message = Message(
+        conversation_id=conversation.id,
+        role="assistant",
+        content=content,
+        model=done.model,
+        prompt_tokens=done.prompt_tokens,
+        completion_tokens=done.completion_tokens,
+    )
+    db.add(assistant_message)
+    conversation.last_message_at = datetime.now(UTC)
+    db.add(
+        UsageLog(
+            user_id=conversation.user_id,
+            conversation_id=conversation.id,
+            model=done.model,
+            persona_id=persona.id if persona else None,
+            prompt_tokens=done.prompt_tokens,
+            completion_tokens=done.completion_tokens,
+        )
+    )
+    await db.commit()
+    return assistant_message
+
+
+async def send_message(db: AsyncSession, conversation: Conversation, content: str) -> tuple[Message, Message]:
+    """有状态非流式链路：落用户消息 → 组装上下文 → 调 LLM → 落助手消息与用量。"""
+    persona = await db.get(Persona, conversation.persona_id)
+    user_message = Message(conversation_id=conversation.id, role="user", content=content)
+    db.add(user_message)
+    await db.flush()
+
+    history = await _history(db, conversation.id)
     llm_messages = build_llm_messages(persona, history)
-    model = persona.model if persona and persona.model else get_settings().llm_default_model
+    model, api_base, api_key = await resolve_chat_model(db, conversation, persona)
     result = await get_llm_backend().chat(
         llm_messages,
         model,
         temperature=persona.temperature if persona else None,
         top_p=persona.top_p if persona else None,
         max_tokens=persona.max_tokens if persona else None,
+        api_base=api_base,
+        api_key=api_key,
     )
-
-    assistant_message = Message(
-        conversation_id=conversation.id,
-        role="assistant",
-        content=result.content,
-        model=result.model,
-        prompt_tokens=result.prompt_tokens,
-        completion_tokens=result.completion_tokens,
-    )
-    db.add(assistant_message)
-    conversation.last_message_at = datetime.now(UTC)
-    await _record_usage(
-        db,
-        user_id=conversation.user_id,
-        model=result.model,
-        result=result,
-        persona_id=persona.id if persona else None,
-        conversation_id=conversation.id,
-    )
-    await db.commit()
+    done = StreamDone(model=result.model, prompt_tokens=result.prompt_tokens, completion_tokens=result.completion_tokens)
+    assistant_message = await _save_reply(db, conversation, persona, done, result.content)
     await db.refresh(user_message)
     await db.refresh(assistant_message)
     return user_message, assistant_message
@@ -126,29 +151,56 @@ async def send_message_stream(
 ) -> AsyncIterator[str | StreamDone]:
     """有状态流式链路：落用户消息 → 流式 yield 内容增量 → 结束时落库助手消息与用量。
 
-    生成器正常迭代完毕才提交；客户端中途断开导致 GeneratorExit 时不提交本次回复。
+    客户端中断（停止生成）时生成器被取消，本次回复与用户消息均不落库。
     """
     persona = await db.get(Persona, conversation.persona_id)
-    user_message = Message(conversation_id=conversation.id, role="user", content=content)
-    db.add(user_message)
+    db.add(Message(conversation_id=conversation.id, role="user", content=content))
     await db.flush()
+    async for piece in _stream_reply(db, conversation, persona):
+        yield piece
 
-    history = (
-        (
-            await db.execute(
-                select(Message)
-                .where(Message.conversation_id == conversation.id)
-                .order_by(Message.created_at.desc(), Message.id.desc())
-                .limit(CONTEXT_WINDOW)
-            )
+
+async def regenerate_stream(
+    db: AsyncSession, conversation: Conversation
+) -> AsyncIterator[str | StreamDone]:
+    """重新生成：删除末尾的助手消息，基于既有历史（以用户消息结尾）再次生成。
+
+    会话里还没有用户消息时（只有开场白）不删除任何内容，仅生成一条新回复。
+    """
+    persona = await db.get(Persona, conversation.persona_id)
+    has_user_message = (
+        await db.execute(
+            select(Message.id)
+            .where(Message.conversation_id == conversation.id, Message.role == "user")
+            .limit(1)
         )
-        .scalars()
-        .all()
-    )
-    history = list(reversed(history))
+    ).scalar_one_or_none()
+    if has_user_message is not None:
+        # 逐条删除末尾连续的 assistant 消息
+        while True:
+            last = (
+                await db.execute(
+                    select(Message)
+                    .where(Message.conversation_id == conversation.id)
+                    .order_by(Message.created_at.desc(), Message.id.desc())
+                    .limit(1)
+                )
+            ).scalars().first()
+            if last is None or last.role != "assistant":
+                break
+            await db.execute(delete(Message).where(Message.id == last.id))
+            await db.flush()
+    async for piece in _stream_reply(db, conversation, persona):
+        yield piece
 
+
+async def _stream_reply(
+    db: AsyncSession, conversation: Conversation, persona: Persona | None
+) -> AsyncIterator[str | StreamDone]:
+    """基于当前历史（应已含最新用户消息）流式生成并落库助手回复。"""
+    history = await _history(db, conversation.id)
     llm_messages = build_llm_messages(persona, history)
-    model = persona.model if persona and persona.model else get_settings().llm_default_model
+    model, api_base, api_key = await resolve_chat_model(db, conversation, persona)
     parts: list[str] = []
     async for piece in chat_stream(
         llm_messages,
@@ -156,29 +208,11 @@ async def send_message_stream(
         temperature=persona.temperature if persona else None,
         top_p=persona.top_p if persona else None,
         max_tokens=persona.max_tokens if persona else None,
+        api_base=api_base,
+        api_key=api_key,
     ):
         if isinstance(piece, StreamDone):
-            assistant_message = Message(
-                conversation_id=conversation.id,
-                role="assistant",
-                content="".join(parts),
-                model=piece.model,
-                prompt_tokens=piece.prompt_tokens,
-                completion_tokens=piece.completion_tokens,
-            )
-            db.add(assistant_message)
-            conversation.last_message_at = datetime.now(UTC)
-            db.add(
-                UsageLog(
-                    user_id=conversation.user_id,
-                    conversation_id=conversation.id,
-                    model=piece.model,
-                    persona_id=persona.id if persona else None,
-                    prompt_tokens=piece.prompt_tokens,
-                    completion_tokens=piece.completion_tokens,
-                )
-            )
-            await db.commit()
+            await _save_reply(db, conversation, persona, piece, "".join(parts))
             yield piece
         else:
             parts.append(piece)
@@ -206,10 +240,15 @@ async def run_completion(
         temperature = persona.temperature if persona.temperature is not None else temperature
         top_p = persona.top_p if persona.top_p is not None else top_p
         max_tokens = persona.max_tokens if persona.max_tokens is not None else max_tokens
+        api_base, api_key_cfg = await lookup_model_credentials(db, model)
     else:
         llm_messages = messages
+        api_base = api_key_cfg = None
 
-    result = await get_llm_backend().chat(llm_messages, model, temperature=temperature, top_p=top_p, max_tokens=max_tokens)
+    result = await get_llm_backend().chat(
+        llm_messages, model, temperature=temperature, top_p=top_p, max_tokens=max_tokens,
+        api_base=api_base, api_key=api_key_cfg,
+    )
     await _record_usage(
         db,
         user_id=user.id,
@@ -240,10 +279,15 @@ async def run_completion_stream(
         temperature = persona.temperature if persona.temperature is not None else temperature
         top_p = persona.top_p if persona.top_p is not None else top_p
         max_tokens = persona.max_tokens if persona.max_tokens is not None else max_tokens
+        api_base, api_key_cfg = await lookup_model_credentials(db, model)
     else:
         llm_messages = messages
+        api_base = api_key_cfg = None
 
-    async for piece in chat_stream(llm_messages, model, temperature=temperature, top_p=top_p, max_tokens=max_tokens):
+    async for piece in chat_stream(
+        llm_messages, model, temperature=temperature, top_p=top_p, max_tokens=max_tokens,
+        api_base=api_base, api_key=api_key_cfg,
+    ):
         if isinstance(piece, StreamDone):
             db.add(
                 UsageLog(
@@ -257,3 +301,26 @@ async def run_completion_stream(
             )
             await db.commit()
         yield piece
+
+
+async def _record_usage(
+    db: AsyncSession,
+    *,
+    user_id: UUID,
+    model: str,
+    result: LLMResult,
+    persona_id: UUID | None = None,
+    conversation_id: UUID | None = None,
+    api_key_id: UUID | None = None,
+) -> None:
+    db.add(
+        UsageLog(
+            user_id=user_id,
+            api_key_id=api_key_id,
+            conversation_id=conversation_id,
+            model=model,
+            persona_id=persona_id,
+            prompt_tokens=result.prompt_tokens,
+            completion_tokens=result.completion_tokens,
+        )
+    )

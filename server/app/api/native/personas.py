@@ -50,6 +50,39 @@ async def get_persona(persona_id: UUID, user: CurrentUser, db: DbSession):
     return persona
 
 
+@router.post("/{persona_id}/fork", response_model=PersonaOut, status_code=status.HTTP_201_CREATED)
+async def fork_persona(persona_id: UUID, user: CurrentUser, db: DbSession):
+    """复制他人（或自己）的人设为私有副本。"""
+    persona = await db.get(Persona, persona_id)
+    if persona is None or not can_view_persona(persona, user.id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "人设不存在")
+    if persona.owner_id == user.id:
+        raise HTTPException(status.HTTP_409_CONFLICT, "自己的人设无需 fork，直接编辑即可")
+    try:
+        slug = await generate_unique_slug(db, None, f"{persona.slug}-fork")
+    except ValueError:
+        raise HTTPException(status.HTTP_409_CONFLICT, "无法生成唯一 slug")
+    forked = Persona(
+        owner_id=user.id,
+        slug=slug,
+        name=persona.name,
+        avatar_url=persona.avatar_url,
+        system_prompt=persona.system_prompt,
+        model=persona.model,
+        temperature=persona.temperature,
+        top_p=persona.top_p,
+        max_tokens=persona.max_tokens,
+        opening_message=persona.opening_message,
+        visibility="private",
+        forked_from=persona.id,
+        tags=persona.tags,
+    )
+    db.add(forked)
+    await db.commit()
+    await db.refresh(forked)
+    return forked
+
+
 @router.patch("/{persona_id}", response_model=PersonaOut)
 async def update_persona(persona_id: UUID, body: PersonaUpdate, user: CurrentUser, db: DbSession):
     persona = await db.get(Persona, persona_id)

@@ -119,6 +119,9 @@ export interface Persona {
   temperature: number | null;
   visibility: string;
   owner_id: string;
+  forked_from: string | null;
+  tags: string[] | null;
+  avatar_url: string | null;
 }
 
 export interface Conversation {
@@ -126,6 +129,7 @@ export interface Conversation {
   persona_id: string;
   title: string | null;
   pinned: boolean;
+  model: string | null;
   last_message_at: string | null;
   created_at: string;
 }
@@ -167,6 +171,26 @@ export interface ApiKeyCreated extends ApiKey {
   key: string;
 }
 
+export interface LlmModel {
+  id: string;
+  name: string;
+  model: string;
+  api_base: string | null;
+  has_key: boolean;
+  enabled: boolean;
+  is_default: boolean;
+  sort: number;
+}
+
+export interface AdminModelCreate {
+  name: string;
+  model: string;
+  api_base?: string;
+  api_key?: string;
+  is_default?: boolean;
+  sort?: number;
+}
+
 // ---------- 业务封装 ----------
 
 export const authApi = {
@@ -202,38 +226,61 @@ export const platformApi = {
   conversations: () => api<Conversation[]>("/api/v1/conversations"),
   createConversation: (persona_id: string) =>
     api<Conversation>("/api/v1/conversations", { method: "POST", body: JSON.stringify({ persona_id }) }),
-  updateConversation: (id: string, body: { title?: string; pinned?: boolean }) =>
+  updateConversation: (id: string, body: { title?: string; pinned?: boolean; model?: string }) =>
     api<Conversation>(`/api/v1/conversations/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   deleteConversation: (id: string) => api<void>(`/api/v1/conversations/${id}`, { method: "DELETE" }),
-  messages: (conversationId: string) =>
-    api<Message[]>(`/api/v1/conversations/${conversationId}/messages`),
+  messages: (conversationId: string, params?: { limit?: number; before_id?: string }) => {
+    const q = new URLSearchParams();
+    if (params?.limit) q.set("limit", String(params.limit));
+    if (params?.before_id) q.set("before_id", params.before_id);
+    const qs = q.toString();
+    return api<Message[]>(`/api/v1/conversations/${conversationId}/messages${qs ? `?${qs}` : ""}`);
+  },
   keys: () => api<ApiKey[]>("/api/v1/me/keys"),
   createKey: (body: { name: string; model_whitelist?: string[]; expires_at?: string }) =>
     api<ApiKeyCreated>("/api/v1/me/keys", { method: "POST", body: JSON.stringify(body) }),
   revokeKey: (id: string) => api<void>(`/api/v1/me/keys/${id}`, { method: "DELETE" }),
+  models: () => api<LlmModel[]>("/api/v1/models"),
+  adminModels: () => api<LlmModel[]>("/api/v1/admin/models"),
+  createModel: (body: AdminModelCreate) =>
+    api<LlmModel>("/api/v1/admin/models", { method: "POST", body: JSON.stringify(body) }),
+  updateModel: (id: string, body: Record<string, unknown>) =>
+    api<LlmModel>(`/api/v1/admin/models/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+  deleteModel: (id: string) => api<void>(`/api/v1/admin/models/${id}`, { method: "DELETE" }),
+  forkPersona: (id: string) => api<Persona>(`/api/v1/personas/${id}/fork`, { method: "POST" }),
 };
 
-/** 发送消息并消费 SSE 流。 */
-export async function sendMessageStream(
-  conversationId: string,
-  content: string,
-  onDelta: (text: string) => void
+/** 发送 POST 并消费 SSE 流；401 时自动刷新 token 重试一次。 */
+async function postSSE(
+  path: string,
+  body: unknown,
+  onDelta: (t: string) => void,
+  signal?: AbortSignal,
+  retried = false
 ): Promise<void> {
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  const token = getAccessToken();
-  if (token) headers.Authorization = `Bearer ${token}`;
-  const resp = await fetch(`${API_BASE}/api/v1/conversations/${conversationId}/messages`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ content, stream: true }),
-  });
+  const doFetch = async (): Promise<Response> => {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    const token = getAccessToken();
+    if (token) headers.Authorization = `Bearer ${token}`;
+    return fetch(`${API_BASE}${path}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal,
+    });
+  };
+
+  let resp = await doFetch();
+  if (resp.status === 401 && !retried && (await refreshTokens())) {
+    resp = await doFetch(); // 换新 token 重试一次
+  }
   if (resp.status === 401) {
     clearTokens();
     window.location.href = "/login";
     throw new ApiError(401, "登录已过期");
   }
   if (!resp.ok) {
-    let detail = `发送失败 (${resp.status})`;
+    let detail = `请求失败 (${resp.status})`;
     try {
       detail = (await resp.json()).detail ?? detail;
     } catch {
@@ -242,4 +289,27 @@ export async function sendMessageStream(
     throw new ApiError(resp.status, detail);
   }
   await streamSSE(resp, onDelta);
+}
+
+export async function sendMessageStream(
+  conversationId: string,
+  content: string,
+  onDelta: (text: string) => void,
+  signal?: AbortSignal
+): Promise<void> {
+  await postSSE(
+    `/api/v1/conversations/${conversationId}/messages`,
+    { content, stream: true },
+    onDelta,
+    signal
+  );
+}
+
+/** 重新生成最后一条助手回复（SSE）。 */
+export async function regenerateStream(
+  conversationId: string,
+  onDelta: (text: string) => void,
+  signal?: AbortSignal
+): Promise<void> {
+  await postSSE(`/api/v1/conversations/${conversationId}/regenerate`, {}, onDelta, signal);
 }
