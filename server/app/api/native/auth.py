@@ -12,7 +12,7 @@ from app.core.security import (
     verify_password,
 )
 from app.models import User
-from app.schemas.auth import LoginIn, RefreshIn, RegisterIn, TokenOut, UserOut
+from app.schemas.auth import LoginIn, MeUpdate, RefreshIn, RegisterIn, TokenOut, UserOut
 
 router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 
@@ -64,4 +64,18 @@ async def refresh(body: RefreshIn, db: DbSession):
 
 @router.get("/me", response_model=UserOut)
 async def me(user: CurrentUser):
+    return user
+
+
+@router.patch("/me", response_model=UserOut)
+async def update_me(body: MeUpdate, user: CurrentUser, db: DbSession):
+    """改昵称；改密码需验证当前密码。"""
+    if body.new_password is not None:
+        if not body.current_password or not verify_password(body.current_password, user.password_hash):
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "当前密码错误")
+        user.password_hash = hash_password(body.new_password)
+    if body.display_name is not None:
+        user.display_name = body.display_name or None
+    await db.commit()
+    await db.refresh(user)
     return user

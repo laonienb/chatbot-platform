@@ -138,6 +138,35 @@ export interface Message {
   created_at: string;
 }
 
+export interface UsageByModel {
+  model: string;
+  requests: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+}
+
+export interface Usage {
+  days: number;
+  total_requests: number;
+  total_prompt_tokens: number;
+  total_completion_tokens: number;
+  by_model: UsageByModel[];
+}
+
+export interface ApiKey {
+  id: string;
+  name: string;
+  key_prefix: string;
+  model_whitelist: string[] | null;
+  revoked: boolean;
+  last_used_at: string | null;
+  created_at: string;
+}
+
+export interface ApiKeyCreated extends ApiKey {
+  key: string;
+}
+
 // ---------- 业务封装 ----------
 
 export const authApi = {
@@ -161,16 +190,27 @@ export const authApi = {
 
 export const platformApi = {
   me: () => api<User>("/api/v1/auth/me"),
+  updateMe: (body: { display_name?: string; new_password?: string; current_password?: string }) =>
+    api<User>("/api/v1/auth/me", { method: "PATCH", body: JSON.stringify(body) }),
+  usage: (days = 30) => api<Usage>(`/api/v1/me/usage?days=${days}`),
   personas: () => api<Persona[]>("/api/v1/personas"),
   createPersona: (body: Record<string, unknown>) =>
     api<Persona>("/api/v1/personas", { method: "POST", body: JSON.stringify(body) }),
+  updatePersona: (id: string, body: Record<string, unknown>) =>
+    api<Persona>(`/api/v1/personas/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   deletePersona: (id: string) => api<void>(`/api/v1/personas/${id}`, { method: "DELETE" }),
   conversations: () => api<Conversation[]>("/api/v1/conversations"),
   createConversation: (persona_id: string) =>
     api<Conversation>("/api/v1/conversations", { method: "POST", body: JSON.stringify({ persona_id }) }),
+  updateConversation: (id: string, body: { title?: string; pinned?: boolean }) =>
+    api<Conversation>(`/api/v1/conversations/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   deleteConversation: (id: string) => api<void>(`/api/v1/conversations/${id}`, { method: "DELETE" }),
   messages: (conversationId: string) =>
     api<Message[]>(`/api/v1/conversations/${conversationId}/messages`),
+  keys: () => api<ApiKey[]>("/api/v1/me/keys"),
+  createKey: (body: { name: string; model_whitelist?: string[]; expires_at?: string }) =>
+    api<ApiKeyCreated>("/api/v1/me/keys", { method: "POST", body: JSON.stringify(body) }),
+  revokeKey: (id: string) => api<void>(`/api/v1/me/keys/${id}`, { method: "DELETE" }),
 };
 
 /** 发送消息并消费 SSE 流。 */

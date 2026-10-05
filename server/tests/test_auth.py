@@ -86,3 +86,46 @@ async def test_refresh_rejects_access_token(client, user_tokens):
         json={"refresh_token": user_tokens["access_token"]},
     )
     assert resp.status_code == 401
+
+
+async def test_update_me_display_name(client, auth_headers):
+    resp = await client.patch(
+        "/api/v1/auth/me",
+        json={"display_name": "新昵称"},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["display_name"] == "新昵称"
+
+
+async def test_update_me_password_flow(client, user_tokens):
+    headers = {"Authorization": f"Bearer {user_tokens['access_token']}"}
+    # 当前密码错误 → 403
+    resp = await client.patch(
+        "/api/v1/auth/me",
+        json={"new_password": "newpassword123", "current_password": "wrong"},
+        headers=headers,
+    )
+    assert resp.status_code == 403
+    # 正确改密
+    resp = await client.patch(
+        "/api/v1/auth/me",
+        json={"new_password": "newpassword123", "current_password": "password123"},
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    # 旧密码失效、新密码可登录
+    assert (
+        await client.post(
+            "/api/v1/auth/login", json={"email": "alice@test.dev", "password": "password123"}
+        )
+    ).status_code == 401
+    assert (
+        await client.post(
+            "/api/v1/auth/login", json={"email": "alice@test.dev", "password": "newpassword123"}
+        )
+    ).status_code == 200
+
+
+async def test_update_me_requires_auth(client):
+    assert (await client.patch("/api/v1/auth/me", json={"display_name": "x"})).status_code == 401

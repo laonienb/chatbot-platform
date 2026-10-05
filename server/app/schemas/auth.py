@@ -35,3 +35,9 @@ class UserOut(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class MeUpdate(BaseModel):
+    display_name: str | None = Field(default=None, max_length=64)
+    new_password: str | None = Field(default=None, min_length=8, max_length=128)
+    current_password: str | None = None  # 改密码时必填校验
