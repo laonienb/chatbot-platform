@@ -1,6 +1,7 @@
 /** 平台 API 客户端：token 管理、401 自动刷新重试、SSE 解析。 */
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000";
+// 默认同源（经 Next.js 反向代理转发到后端）；前后端分离部署时用 NEXT_PUBLIC_API_BASE 指向后端
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "";
 
 export type Tokens = { access_token: string; refresh_token: string };
 
