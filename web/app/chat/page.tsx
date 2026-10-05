@@ -18,8 +18,17 @@ import {
 } from "@/lib/api";
 import MemoryModal from "@/components/MemoryModal";
 import Select from "@/components/Select";
+import Avatar from "@/components/Avatar";
 
 const PAGE_SIZE = 20;
+
+/** 人设头像 emoji 预设（avatar_url 里存非 URL 字符串时按 emoji 渲染） */
+const AVATAR_EMOJIS = [
+  "🧙", "🧚", "🥷", "👸", "🤴", "🧛", "🧜", "🧑‍🎓",
+  "👩‍🏫", "🧑‍💻", "👨‍🍳", "🧑‍🚀", "🤖", "🐉", "🦊", "🐱",
+  "🐼", "🦉", "🐺", "🦄", "🎭", "🎨", "📚", "🎵",
+  "🍵", "🌸", "🌊", "🌙", "⭐", "🔥", "⚽", "🀄",
+];
 
 export default function ChatPage() {
   const router = useRouter();
@@ -319,7 +328,7 @@ export default function ChatPage() {
       {sidebarOpen && <div className="sidebar-mask" onClick={() => setSidebarOpen(false)} />}
       <aside className={`sidebar ${sidebarOpen ? "open" : ""}`}>
         <div className="sidebar-user">
-          <span className="avatar">{(me.display_name ?? me.email)[0]?.toUpperCase()}</span>
+          <Avatar name={me.display_name ?? me.email} size={36} />
           <div className="sidebar-user-info">
             <strong>{me.display_name ?? me.email}</strong>
             <small>{me.email}</small>
@@ -341,7 +350,7 @@ export default function ChatPage() {
             {personas.map((p) => (
               <div key={p.id} className="persona-item">
                 <button className="persona-main" onClick={() => chatWithPersona(p)} disabled={streaming}>
-                  <span className="avatar sm">{p.name[0]}</span>
+                  <Avatar name={p.name} url={p.avatar_url} size={28} />
                   <span className="persona-name">{p.name}</span>
                   <small>{p.visibility === "public" ? (p.owner_id === me.id ? "已发布" : "公共") : "私有"}</small>
                 </button>
@@ -429,8 +438,15 @@ export default function ChatPage() {
                 ☰
               </button>
               <div className="chat-header-info">
-                <strong>{activeConv.title ?? personaOf(activeConv.persona_id)?.name ?? "会话"}</strong>
-                <small>{personaOf(activeConv.persona_id)?.name}</small>
+                <Avatar
+                  name={personaOf(activeConv.persona_id)?.name ?? activeConv.title ?? "会话"}
+                  url={personaOf(activeConv.persona_id)?.avatar_url}
+                  size={34}
+                />
+                <div className="chat-header-text">
+                  <strong>{activeConv.title ?? personaOf(activeConv.persona_id)?.name ?? "会话"}</strong>
+                  <small>{personaOf(activeConv.persona_id)?.name}</small>
+                </div>
               </div>
               {personaOf(activeConv.persona_id)?.owner_id === me.id && (
                 <button
@@ -462,26 +478,49 @@ export default function ChatPage() {
                   ↑ 加载更早的消息
                 </button>
               )}
-              {messages.map((m) => (
-                <div key={m.id} className={`bubble-row ${m.role}`}>
-                  <div className={`bubble ${m.role}`}>
-                    {m.role === "assistant" ? <Markdown content={m.content} /> : m.content}
-                    {m.role === "assistant" && (
-                      <span className="bubble-meta">
-                        {m.model && <small>{m.model}</small>}
-                        <button className="icon-btn copy-btn" title="复制" onClick={() => copyMessage(m)}>
-                          ⧉
-                        </button>
-                        {m.id === lastAssistantId && (
-                          <button className="icon-btn copy-btn" title="重新生成" onClick={regenerate}>
-                            ↻
-                          </button>
-                        )}
-                      </span>
+              {messages.map((m, i) => {
+                const prev = messages[i - 1];
+                const showAvatar = !prev || prev.role !== m.role;
+                const time = new Date(m.created_at).toLocaleTimeString("zh-CN", {
+                  hour: "2-digit",
+                  minute: "2-digit",
+                });
+                const activePersona = personaOf(activeConv.persona_id);
+                return (
+                  <div key={m.id} className={`bubble-row ${m.role}`}>
+                    {m.role === "assistant" ? (
+                      showAvatar ? (
+                        <Avatar name={activePersona?.name ?? "AI"} url={activePersona?.avatar_url} size={34} />
+                      ) : (
+                        <span className="avatar-spacer" />
+                      )
+                    ) : showAvatar ? (
+                      <Avatar name={me.display_name ?? me.email} size={34} />
+                    ) : (
+                      <span className="avatar-spacer" />
                     )}
+                    <div className="msg-col">
+                      <div className={`bubble ${m.role}`}>
+                        {m.role === "assistant" ? <Markdown content={m.content} /> : m.content}
+                        {m.role === "assistant" && (
+                          <span className="bubble-meta">
+                            {m.model && <small>{m.model}</small>}
+                            <button className="icon-btn copy-btn" title="复制" onClick={() => copyMessage(m)}>
+                              ⧉
+                            </button>
+                            {m.id === lastAssistantId && (
+                              <button className="icon-btn copy-btn" title="重新生成" onClick={regenerate}>
+                                ↻
+                              </button>
+                            )}
+                          </span>
+                        )}
+                      </div>
+                      <small className="msg-time">{time}</small>
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
               <div ref={bottomRef} />
             </div>
             <footer className="composer">
@@ -582,6 +621,7 @@ function PersonaForm({
   const [temperature, setTemperature] = useState(persona?.temperature?.toString() ?? "");
   const [tags, setTags] = useState(persona?.tags?.join(", ") ?? "");
   const [visibility, setVisibility] = useState(persona?.visibility ?? "private");
+  const [avatar, setAvatar] = useState(persona?.avatar_url ?? "");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -602,6 +642,8 @@ function PersonaForm({
         temperature: temperature ? Number(temperature) : undefined,
         visibility,
         tags: tagList.length ? tagList : undefined,
+        // 编辑时始终带上：清空头像也能生效；新建时空值交由后端默认
+        avatar_url: avatar ? avatar : isEdit ? null : undefined,
       };
       const saved = isEdit
         ? await platformApi.updatePersona(persona!.id, body)
@@ -628,6 +670,28 @@ function PersonaForm({
     <div className="modal-mask" onClick={onClose}>
       <form className="modal" onClick={(e) => e.stopPropagation()} onSubmit={submit}>
         <h3>{isEdit ? "编辑人设" : "新建人设"}</h3>
+        <div className="avatar-picker">
+          <Avatar name={name || "人设"} url={avatar || null} size={56} />
+          <div className="avatar-picker-body">
+            <div className="emoji-grid">
+              {AVATAR_EMOJIS.map((e) => (
+                <button
+                  key={e}
+                  type="button"
+                  className={`emoji-opt${avatar === e ? " picked" : ""}`}
+                  onClick={() => setAvatar(avatar === e ? "" : e)}
+                >
+                  {e}
+                </button>
+              ))}
+            </div>
+            <input
+              value={avatar}
+              onChange={(e) => setAvatar(e.target.value)}
+              placeholder="或粘贴头像图片链接（https://…）"
+            />
+          </div>
+        </div>
         <label>
           名称 *
           <input value={name} onChange={(e) => setName(e.target.value)} placeholder="如：李白" required />

@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { platformApi, type MarketPersona } from "@/lib/api";
+import Avatar from "@/components/Avatar";
 
 export default function MarketPage() {
   const [all, setAll] = useState<MarketPersona[]>([]);
@@ -127,7 +128,7 @@ export default function MarketPage() {
             return (
               <div key={p.id} className="market-card">
                 <div className="market-card-head">
-                  <span className="avatar sm">{p.name[0]}</span>
+                  <Avatar name={p.name} url={p.avatar_url} size={28} />
                   <strong>{p.name}</strong>
                   {mine && <span className="tag mine">我发布的</span>}
                 </div>
