@@ -18,7 +18,7 @@
 - SSE 流式（两套 API 同构）、非流式、重新生成、会话级模型覆盖
 - 长期记忆：对话后自动提取事实 → 人设级记忆库 → 注入后续对话上下文（人设可开关）
 - LLM 网关：mock（零 Key 开发）/ litellm（真实模型）双后端；模型注册表支持为每个模型配独立 `api_base`/`api_key`（自部署 vLLM/Ollama 或第三方中转均可）
-- 计费与计量（开发中）：token 归因（人设/记忆/历史/输入拆分）、双阶段账本结算、费率规则与价格快照、充值钱包
+- 计费与计量：token 归因（人设/记忆/历史/输入拆分）、双阶段账本结算（幂等/价格快照）、费率规则、准入（月度配额 429 + 积分余额 402）、结算即扣钱包、注册赠送、RPM 限流、对账循环与毛利告警、管理端 `/admin/billing/*`
 
 **前端（Next.js 15 + React 19，深色精致主题）**
 
@@ -43,7 +43,7 @@ chatbot-platform/
 │   │   └── services/          # 业务逻辑（chat / persona / memory）
 │   ├── alembic/         # 数据库迁移
 │   ├── scripts/         # make_admin 等运维脚本
-│   └── tests/           # pytest（内存 SQLite，不依赖 .env）
+│   └── tests/           # pytest（每测独立临时 SQLite，不依赖 .env）
 ├── web/                 # 前端：Next.js 15 + React 19（手写深色主题 CSS）
 ├── deploy/              # docker-compose（PostgreSQL + Redis + server）
 └── docs/                # API 文档、部署手册（待写）
@@ -51,16 +51,16 @@ chatbot-platform/
 
 ## 当前状态
 
-进度快照（2026-10-05，里程碑规划见 DESIGN.md 第 11 节）：
+进度快照（2026-10-06，里程碑规划见 DESIGN.md 第 11 节）：
 
 - [x] M0 骨架 — 注册登录、人设 CRUD、会话、非流式对话、OpenAI 兼容层（mock LLM）、API Key
 - [x] M1 Web 可用 — SSE 流式（双 API 面）、Next.js 聊天界面、me/usage 用量接口
-- [x] M3 提前完成一部分 — 人设市场（发布/搜索/分类/fork）
+- [x] M3 提前完成一部分 — 人设市场（发布/搜索/分类/fork）；配额与限流（配额准入 429、余额准入 402、RPM 限流）
 - [x] M4 提前完成一部分 — 长期记忆（自动提取/注入/管理）；聊天记录蒸馏流水线已设计（DESIGN.md §13.2）待实现
 - [x] 聊天增强 — 会话级模型切换、模型注册表、停止/重新生成、Markdown、局域网访问（同源代理）
-- [ ] 计费与计量 — 进行中：归因/账本/费率/钱包的模型与服务层已落，收尾中
+- [x] 计费与计量 — 归因/双阶段账本/费率/钱包扣费/准入/对账与毛利监控（`docs/compose/spec/billing-wiring.md`）；用户侧充值与余额展示未做
 - [ ] M2 机器人接入 — AstrBot + NapCat 部署（兼容层已就位）
-- [ ] M3 剩余 — 配额限流、管理后台、小程序端
+- [ ] M3 剩余 — 管理后台、小程序端
 - [ ] M4 剩余 — 蒸馏流水线、RAG 知识库、工具调用
 
 ## 快速开始（后端）
@@ -79,7 +79,7 @@ cp .env.example .env
 # 起服务（http://127.0.0.1:8000，文档在 /docs）
 .venv/Scripts/uvicorn app.main:app --reload
 
-# 跑测试（61 个用例，内存 SQLite，不依赖 .env）
+# 跑测试（101 个用例，每测独立临时 SQLite，不依赖 .env）
 .venv/Scripts/pytest
 ```
 
