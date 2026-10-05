@@ -1,0 +1,205 @@
+/** 平台 API 客户端：token 管理、401 自动刷新重试、SSE 解析。 */
+
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000";
+
+export type Tokens = { access_token: string; refresh_token: string };
+
+const ACCESS_KEY = "cp_access_token";
+const REFRESH_KEY = "cp_refresh_token";
+
+export function getAccessToken(): string | null {
+  if (typeof window === "undefined") return null;
+  return localStorage.getItem(ACCESS_KEY);
+}
+
+export function saveTokens(t: Tokens) {
+  localStorage.setItem(ACCESS_KEY, t.access_token);
+  localStorage.setItem(REFRESH_KEY, t.refresh_token);
+}
+
+export function clearTokens() {
+  localStorage.removeItem(ACCESS_KEY);
+  localStorage.removeItem(REFRESH_KEY);
+}
+
+export class ApiError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
+async function refreshTokens(): Promise<boolean> {
+  const refresh_token = localStorage.getItem(REFRESH_KEY);
+  if (!refresh_token) return false;
+  const resp = await fetch(`${API_BASE}/api/v1/auth/refresh`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ refresh_token }),
+  });
+  if (!resp.ok) return false;
+  saveTokens(await resp.json());
+  return true;
+}
+
+export async function api<T = unknown>(path: string, init: RequestInit = {}, retried = false): Promise<T> {
+  const headers = new Headers(init.headers);
+  headers.set("Content-Type", "application/json");
+  const token = getAccessToken();
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+
+  const resp = await fetch(`${API_BASE}${path}`, { ...init, headers });
+
+  if (resp.status === 401 && !retried && token) {
+    if (await refreshTokens()) {
+      return api<T>(path, init, true); // 换新 token 重试一次
+    }
+    clearTokens();
+    window.location.href = "/login";
+    throw new ApiError(401, "登录已过期");
+  }
+  if (!resp.ok) {
+    let detail = `请求失败 (${resp.status})`;
+    try {
+      const body = await resp.json();
+      detail = body.detail ?? JSON.stringify(body);
+    } catch {
+      /* 保留默认消息 */
+    }
+    throw new ApiError(resp.status, detail);
+  }
+  if (resp.status === 204) return undefined as T;
+  return resp.json();
+}
+
+/** 解析 SSE 流（OpenAI chunk 格式），逐个产出 content 增量；[DONE] 结束。 */
+export async function streamSSE(resp: Response, onDelta: (text: string) => void): Promise<void> {
+  const reader = resp.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const frames = buffer.split("\n\n");
+    buffer = frames.pop() ?? "";
+    for (const frame of frames) {
+      const line = frame.trim();
+      if (!line.startsWith("data: ")) continue;
+      const payload = line.slice(6);
+      if (payload === "[DONE]") return;
+      try {
+        const obj = JSON.parse(payload);
+        const content = obj?.choices?.[0]?.delta?.content;
+        if (typeof content === "string" && content) onDelta(content);
+      } catch {
+        /* 跳过无法解析的帧 */
+      }
+    }
+  }
+}
+
+// ---------- 类型 ----------
+
+export interface User {
+  id: string;
+  email: string;
+  display_name: string | null;
+  role: string;
+}
+
+export interface Persona {
+  id: string;
+  slug: string;
+  name: string;
+  system_prompt: string;
+  opening_message: string | null;
+  model: string | null;
+  temperature: number | null;
+  visibility: string;
+  owner_id: string;
+}
+
+export interface Conversation {
+  id: string;
+  persona_id: string;
+  title: string | null;
+  pinned: boolean;
+  last_message_at: string | null;
+  created_at: string;
+}
+
+export interface Message {
+  id: string;
+  role: "user" | "assistant" | "system";
+  content: string;
+  model: string | null;
+  created_at: string;
+}
+
+// ---------- 业务封装 ----------
+
+export const authApi = {
+  async register(email: string, password: string, display_name?: string) {
+    const t = await api<Tokens>("/api/v1/auth/register", {
+      method: "POST",
+      body: JSON.stringify({ email, password, display_name: display_name || undefined }),
+    });
+    saveTokens(t);
+    return t;
+  },
+  async login(email: string, password: string) {
+    const t = await api<Tokens>("/api/v1/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ email, password }),
+    });
+    saveTokens(t);
+    return t;
+  },
+};
+
+export const platformApi = {
+  me: () => api<User>("/api/v1/auth/me"),
+  personas: () => api<Persona[]>("/api/v1/personas"),
+  createPersona: (body: Record<string, unknown>) =>
+    api<Persona>("/api/v1/personas", { method: "POST", body: JSON.stringify(body) }),
+  deletePersona: (id: string) => api<void>(`/api/v1/personas/${id}`, { method: "DELETE" }),
+  conversations: () => api<Conversation[]>("/api/v1/conversations"),
+  createConversation: (persona_id: string) =>
+    api<Conversation>("/api/v1/conversations", { method: "POST", body: JSON.stringify({ persona_id }) }),
+  deleteConversation: (id: string) => api<void>(`/api/v1/conversations/${id}`, { method: "DELETE" }),
+  messages: (conversationId: string) =>
+    api<Message[]>(`/api/v1/conversations/${conversationId}/messages`),
+};
+
+/** 发送消息并消费 SSE 流。 */
+export async function sendMessageStream(
+  conversationId: string,
+  content: string,
+  onDelta: (text: string) => void
+): Promise<void> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const token = getAccessToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const resp = await fetch(`${API_BASE}/api/v1/conversations/${conversationId}/messages`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ content, stream: true }),
+  });
+  if (resp.status === 401) {
+    clearTokens();
+    window.location.href = "/login";
+    throw new ApiError(401, "登录已过期");
+  }
+  if (!resp.ok) {
+    let detail = `发送失败 (${resp.status})`;
+    try {
+      detail = (await resp.json()).detail ?? detail;
+    } catch {
+      /* keep */
+    }
+    throw new ApiError(resp.status, detail);
+  }
+  await streamSSE(resp, onDelta);
+}

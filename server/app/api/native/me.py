@@ -1,15 +1,16 @@
-"""我的 API Key 管理：创建（明文只返回一次）/ 列表 / 吊销。"""
+"""我的 API Key 管理（创建/列表/吊销）与用量统计。"""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.api.deps import CurrentUser, DbSession
 from app.core.security import generate_api_key
-from app.models import ApiKey
+from app.models import ApiKey, UsageLog
 from app.schemas.api_key import ApiKeyCreatedOut, ApiKeyCreate, ApiKeyOut
+from app.schemas.usage import UsageByModel, UsageOut
 
 router = APIRouter(prefix="/api/v1/me", tags=["me"])
 
@@ -58,3 +59,31 @@ async def revoke_api_key(key_id: UUID, user: CurrentUser, db: DbSession):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "API Key 不存在")
     api_key.revoked = True
     await db.commit()
+
+
+@router.get("/usage", response_model=UsageOut)
+async def my_usage(user: CurrentUser, db: DbSession, days: int = 30):
+    """我的 token 消耗（按模型分组），统计窗口 days 天（1-365，默认 30）。"""
+    days = min(max(days, 1), 365)
+    since = datetime.now(UTC) - timedelta(days=days)
+    rows = (
+        await db.execute(
+            select(
+                UsageLog.model,
+                func.count().label("requests"),
+                func.coalesce(func.sum(UsageLog.prompt_tokens), 0).label("prompt_tokens"),
+                func.coalesce(func.sum(UsageLog.completion_tokens), 0).label("completion_tokens"),
+            )
+            .where(UsageLog.user_id == user.id, UsageLog.created_at >= since)
+            .group_by(UsageLog.model)
+            .order_by(func.sum(UsageLog.prompt_tokens + UsageLog.completion_tokens).desc())
+        )
+    ).all()
+    by_model = [UsageByModel(model=r.model, requests=r.requests, prompt_tokens=r.prompt_tokens, completion_tokens=r.completion_tokens) for r in rows]
+    return UsageOut(
+        days=days,
+        total_requests=sum(m.requests for m in by_model),
+        total_prompt_tokens=sum(m.prompt_tokens for m in by_model),
+        total_completion_tokens=sum(m.completion_tokens for m in by_model),
+        by_model=by_model,
+    )

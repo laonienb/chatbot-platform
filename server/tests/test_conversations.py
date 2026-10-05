@@ -58,18 +58,85 @@ async def test_send_message_full_loop(client, auth_headers, persona):
     assert [m["role"] for m in messages] == ["assistant", "user", "assistant"]
 
 
-async def test_send_message_stream_unsupported(client, auth_headers, persona):
+async def read_sse_events(resp) -> list[str]:
+    """收集 SSE 流中所有 data: 负载。"""
+    events = []
+    async for line in resp.aiter_lines():
+        if line.startswith("data: "):
+            events.append(line[len("data: "):])
+    return events
+
+
+async def test_send_message_stream(client, auth_headers, persona, db_engine):
+    """M1 核心：SSE 流式返回 OpenAI chunk 格式，结束后落库消息与用量。"""
+    import json
+    from uuid import UUID
+
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from app.models import UsageLog
+
     conv = (
         await client.post(
             "/api/v1/conversations", json={"persona_id": persona["id"]}, headers=auth_headers
         )
     ).json()
-    resp = await client.post(
+
+    async with client.stream(
+        "POST",
         f"/api/v1/conversations/{conv['id']}/messages",
-        json={"content": "hello", "stream": True},
+        json={"content": "流式写诗", "stream": True},
         headers=auth_headers,
+    ) as resp:
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/event-stream")
+        events = await read_sse_events(resp)
+
+    assert events[-1] == "[DONE]"
+    import json
+
+    contents = [json.loads(e)["choices"][0]["delta"]["content"] for e in events[:-1]]
+    full = "".join(contents)
+    assert "[persona:libai]" in full
+    assert "流式写诗" in full
+    assert len(contents) > 1  # 确实是分块到达
+
+    # 流结束后消息已落库：开场白 + user + assistant
+    messages = (
+        await client.get(f"/api/v1/conversations/{conv['id']}/messages", headers=auth_headers)
+    ).json()
+    assert [m["role"] for m in messages] == ["assistant", "user", "assistant"]
+    assert messages[-1]["content"] == full  # 分块拼接 == 落库全文
+    assert messages[-1]["completion_tokens"] > 0
+
+    # 用量账本记录了会话归属
+    async with async_sessionmaker(db_engine, expire_on_commit=False)() as session:
+        logs = (
+            await session.execute(
+                select(UsageLog).where(UsageLog.conversation_id == UUID(conv["id"]))
+            )
+        ).scalars().all()
+    assert len(logs) == 1
+    assert logs[0].persona_id is not None
+
+
+async def test_send_message_stream_requires_owner(client, auth_headers, persona):
+    conv = (
+        await client.post(
+            "/api/v1/conversations", json={"persona_id": persona["id"]}, headers=auth_headers
+        )
+    ).json()
+    other = await client.post(
+        "/api/v1/auth/register", json={"email": "stream-thief@test.dev", "password": "password123"}
     )
-    assert resp.status_code == 400
+    async with client.stream(
+        "POST",
+        f"/api/v1/conversations/{conv['id']}/messages",
+        json={"content": "hi", "stream": True},
+        headers={"Authorization": f"Bearer {other.json()['access_token']}"},
+    ) as resp:
+        assert resp.status_code == 404
 
 
 async def test_message_history_pagination(client, auth_headers, persona):

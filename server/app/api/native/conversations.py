@@ -1,11 +1,14 @@
-"""会话：创建（注入开场白）/ 列表 / 改名置顶 / 删除 / 发消息（M0 非流式）/ 翻历史。"""
+"""会话：创建（注入开场白）/ 列表 / 改名置顶 / 删除 / 发消息（非流式 + SSE 流式）/ 翻历史。"""
 
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy import delete, select
 
 from app.api.deps import CurrentUser, DbSession
+from app.core.sse import SSE_DONE, SSE_HEADERS, format_sse
+from app.llm.gateway import StreamDone
 from app.models import Conversation, Message, Persona
 from app.schemas.conversation import (
     ConversationCreate,
@@ -15,7 +18,7 @@ from app.schemas.conversation import (
     MessageSendIn,
     SendMessageOut,
 )
-from app.services.chat import send_message
+from app.services.chat import send_message, send_message_stream
 from app.services.persona import can_view_persona
 
 router = APIRouter(prefix="/api/v1/conversations", tags=["conversations"])
@@ -85,15 +88,22 @@ async def delete_conversation(conversation_id: UUID, user: CurrentUser, db: DbSe
     await db.commit()
 
 
-@router.post("/{conversation_id}/messages", response_model=SendMessageOut)
+@router.post("/{conversation_id}/messages")
 async def send(
     conversation_id: UUID, body: MessageSendIn, user: CurrentUser, db: DbSession
 ):
-    if body.stream:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST, "流式输出将在 M1 支持，当前请使用 stream=false"
-        )
     conv = await _get_owned_conversation(conversation_id, user.id, db)
+    if body.stream:
+
+        async def event_stream():
+            async for piece in send_message_stream(db, conv, body.content):
+                if isinstance(piece, StreamDone):
+                    continue  # 结束标记不外发，落库已在服务层完成
+                yield format_sse({"choices": [{"index": 0, "delta": {"content": piece}}]})
+            yield SSE_DONE
+
+        return StreamingResponse(event_stream(), media_type="text/event-stream", headers=SSE_HEADERS)
+
     user_message, assistant_message = await send_message(db, conv, body.content)
     return SendMessageOut(
         user_message=MessageOut.model_validate(user_message),

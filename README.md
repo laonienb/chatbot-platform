@@ -38,8 +38,8 @@ chatbot-platform/
 M0 后端骨架完成。里程碑规划见 DESIGN.md 第 11 节：
 
 - [x] M0 骨架 — 脚手架、注册登录、人设 CRUD、会话、非流式对话、OpenAI 兼容层（mock LLM）、API Key
-- [ ] M1 Web 可用 — SSE 流式、会话管理、LiteLLM 多模型
-- [ ] M2 机器人接入 — AstrBot + NapCat 部署（兼容层 M0 已就位）
+- [x] M1 Web 可用 — SSE 流式（双 API 面）、Next.js 聊天界面、me/usage 用量接口
+- [ ] M2 机器人接入 — AstrBot + NapCat 部署（兼容层已就位）
 - [ ] M3 平台化 — 人设市场、配额限流、管理后台、小程序端
 - [ ] M4 增强 — RAG 知识库、长期记忆、工具调用
 
@@ -88,6 +88,19 @@ Docker 方式（PostgreSQL + Redis + server）：
 ```bash
 cd deploy && docker compose up --build
 ```
+
+## Web 前端
+
+依赖 Node.js 20+（开发时用 Node 24 验证）：
+
+```bash
+cd web
+npm install
+npm run dev     # http://localhost:3000
+```
+
+功能：注册/登录（JWT 自动刷新）、人设管理（弹窗创建）、会话列表、SSE 流式聊天（OpenAI chunk 格式）。
+后端地址默认 `http://127.0.0.1:8000`，可用 `NEXT_PUBLIC_API_BASE` 覆盖。
 
 ## 参与贡献
 
