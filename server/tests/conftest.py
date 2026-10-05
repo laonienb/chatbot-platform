@@ -13,7 +13,6 @@ os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite://")  # 仅占位，实�
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-from sqlalchemy.pool import StaticPool
 
 from app.database import Base, _json_serializer, get_db
 from app.main import app as fastapi_app
@@ -21,11 +20,17 @@ import app.models  # noqa: F401
 
 
 @pytest.fixture
-async def db_engine():
+async def db_engine(tmp_path):
+    """每测独立的临时文件 SQLite + 默认连接池。
+
+    不用 StaticPool 单连接：请求会话与 fire-and-forget 后台任务（记忆提取）
+    共享同一 DBAPI 连接时，请求收尾的 rollback 会把后台任务未提交的 INSERT
+    一并回滚（表现为写入报成功、随后读不到）。文件库多连接池下两会话各有
+    独立事务，隔离语义与生产（文件 SQLite / Postgres）一致。
+    """
     engine = create_async_engine(
-        "sqlite+aiosqlite://",
+        f"sqlite+aiosqlite:///{tmp_path.as_posix()}/test.db",
         connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
         json_serializer=_json_serializer,  # 与应用引擎一致：中文不转义，市场标签过滤才可用
     )
     async with engine.begin() as conn:
@@ -43,6 +48,10 @@ async def client(db_engine):
             yield session
 
     fastapi_app.dependency_overrides[get_db] = override_get_db
+    # 限流是进程级单例 —— 每个测试重置，避免跨测试泄漏 429
+    from app.billing.ratelimit import limiter
+
+    limiter.reset()
     transport = ASGITransport(app=fastapi_app)
     async with AsyncClient(transport=transport, base_url="http://testserver") as c:
         yield c
