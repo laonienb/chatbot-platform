@@ -501,12 +501,17 @@ a {
   font-size: 11px;
 }
 .persona-actions {
-  display: none;
+  display: inline-flex;
   align-items: center;
   padding-right: 4px;
+  /* 常驻占位、透明渐显：避免 display 切换引起的行内容重排跳动 */
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--t) var(--ease);
 }
 .persona-item:hover .persona-actions {
-  display: inline-flex;
+  opacity: 1;
+  pointer-events: auto;
 }
 
 .conv-item {
@@ -539,12 +544,18 @@ a {
   font-size: 13.5px;
 }
 .conv-actions {
-  display: none;
+  display: inline-flex;
   align-items: center;
   flex: none;
+  /* 常驻占位、透明渐显：避免 display 切换引起的行内容重排跳动 */
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--t) var(--ease);
 }
-.conv-item:hover .conv-actions {
-  display: inline-flex;
+.conv-item:hover .conv-actions,
+.conv-item.active .conv-actions {
+  opacity: 1;
+  pointer-events: auto;
 }
 
 .sidebar-footer {
