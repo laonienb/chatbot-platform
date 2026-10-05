@@ -4,7 +4,7 @@ from datetime import datetime
 from decimal import Decimal
 from uuid import UUID, uuid4
 
-from sqlalchemy import DateTime, ForeignKey, Numeric, String, Text
+from sqlalchemy import DateTime, ForeignKey, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base, utcnow
@@ -25,6 +25,8 @@ class WalletEntry(Base):
     """余额变动流水：append-only，与 usage_logs 账本互为镜像。"""
 
     __tablename__ = "wallet_entries"
+    # 幂等的最后防线：一条账行最多一笔扣款流水（NULL 不受约束限制，充值/赠送不受影响）
+    __table_args__ = (UniqueConstraint("usage_log_id", name="uq_wallet_entries_usage_log"),)
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
     user_id: Mapped[UUID] = mapped_column(ForeignKey("users.id"), index=True)

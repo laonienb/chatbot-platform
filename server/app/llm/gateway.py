@@ -5,6 +5,11 @@
 - litellm：经 LiteLLM 调真实模型（OpenAI / DeepSeek / Claude / Gemini…）。
 由环境变量 LLM_BACKEND 选择。lazy import，未装 litellm 时 mock 后端仍可用。
 
+⚠️ 导入顺序约束：litellm 的首次 import 若 `LITELLM_LOCAL_MODEL_COST_MAP` 尚未置位，
+会去远程拉取价格表（实测 ConnectTimeout + 3 次重试 ≈ 9.6s，离线环境必现）。
+该变量由 `app.config` 在任何 litellm 导入之前设置 —— 所以**不要在本模块顶层
+import litellm**，也不要绕过 `app.config` 直接使用本模块。
+
 流式协议：chat_stream 返回异步迭代器，逐个 yield 内容增量（str），
 结束时 yield 一个 StreamDone 携带记账所需信息。
 
@@ -18,8 +23,10 @@
 """
 
 import asyncio
+import os
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from app.config import get_settings
@@ -63,15 +70,54 @@ def _estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+# ---------- tiktoken 本地计数（计费步1：精确计量的核心） ----------
+# 关键约束：tiktoken.get_encoding 首次调用会**联网下载 BPE 文件**（实测
+# 36s，离线环境直接超时挂住）。因此只在「本地缓存已命中」时用 tiktoken，
+# 否则返回 None 让调用方回退字符估算 —— 计量标记 metering_source 会如实
+# 记成 estimated，绝不能为了精确把请求挂死在一次网络下载上。
+_TIKTOKEN_ENCODING = None  # 惰性缓存：None=未探, False=不可用, 对象=可用
+_ENCODING_NAME = "cl100k_base"
+
+
+def _get_encoding() -> Any:
+    """返回 tiktoken 编码；**绝不触发联网下载**。缓存缺失 / tiktoken 缺失 → None。
+
+    tiktoken.get_encoding 在 BPE 文件未落盘时会联网下载（实测 36s，离线
+    环境挂住），因此先查 data-gym 缓存目录，命中才加载（本地 IO，~0s）。
+    """
+    global _TIKTOKEN_ENCODING
+    if _TIKTOKEN_ENCODING is not False:
+        return _TIKTOKEN_ENCODING
+    try:
+        import tiktoken
+
+        # 缓存目录：TIKTOKEN_CACHE_DIR > LOCALAPPDATA/data-gym-cache > ~/.cache/data-gym-cache
+        if os.environ.get("TIKTOKEN_CACHE_DIR"):
+            cache_dir = Path(os.environ["TIKTOKEN_CACHE_DIR"])
+        elif os.name == "nt" and os.environ.get("LOCALAPPDATA"):
+            cache_dir = Path(os.environ["LOCALAPPDATA"]) / "data-gym-cache"
+        else:
+            cache_dir = Path.home() / ".cache" / "data-gym-cache"
+        if not cache_dir.is_dir() or not any(cache_dir.iterdir()):
+            _TIKTOKEN_ENCODING = False  # 无缓存 → 禁用（避免联网）
+            return None
+        enc = tiktoken.get_encoding(_ENCODING_NAME)  # 缓存命中 → 本地 IO
+        _TIKTOKEN_ENCODING = enc
+        return enc
+    except Exception:
+        _TIKTOKEN_ENCODING = False
+        return None
+
+
 def _tiktoken_count(text: str, model: str | None) -> int | None:
-    """tiktoken 实际计数；未装 litellm 或计数失败返回 None，让调用方回退估算。"""
+    """tiktoken 实际计数。本地缓存未命中 / tiktoken 缺失时返回 None（回退估算）。"""
     if not text:
         return 0
+    enc = _get_encoding()
+    if enc is None:
+        return None
     try:
-        import litellm
-
-        n = litellm.token_counter(model=model or "", text=text)
-        return int(n) if n else None
+        return len(enc.encode(text, disallowed_special=()))
     except Exception:
         return None
 
