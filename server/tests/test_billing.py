@@ -2,6 +2,7 @@
 
 from decimal import Decimal
 
+import pytest
 from sqlalchemy import select
 
 from app.billing.pricing import normalize_model_string, quote_upstream_cost
@@ -456,3 +457,91 @@ async def test_me_usage_excludes_pending_rows(client, auth_headers, db_engine):
     # 只算 settled + abandoned + failed = 3 条；pending 的 999999 必须被排除
     assert usage["total_requests"] == 3, usage
     assert usage["total_prompt_tokens"] == 60, usage
+
+
+# ---------- 断流结算（shield）与钱包扣费唯一约束 ----------
+
+
+async def test_stream_disconnect_still_settles(
+    client, auth_headers, persona, db_engine, monkeypatch
+):
+    """客户端中途断流：pending 行仍必须收敛为终态并扣费。
+
+    断流时请求任务被取消，取消作用域下每个 await 都会再抛 CancelledError ——
+    若结算不放在 CancelScope(shield=True) 里，结算会被打断，账行永远停在
+    pending：上游跑了、钱花了，平台却收不到（且永久占额度）。
+    """
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    import app.services.chat as chat_service
+    from app.llm.gateway import StreamDone
+
+    class MultiChunkBackend:
+        async def chat_stream(self, messages, model, **kw):
+            for i in range(6):
+                yield f"块{i}"
+            yield StreamDone(model=model, prompt_tokens=12, completion_tokens=6)
+
+    conv = (
+        await client.post(
+            "/api/v1/conversations", json={"persona_id": persona["id"]}, headers=auth_headers
+        )
+    ).json()
+
+    monkeypatch.setattr(chat_service, "get_llm_backend", lambda: MultiChunkBackend())
+
+    chunks = 0
+    async with client.stream(
+        "POST", f"/api/v1/conversations/{conv['id']}/messages",
+        json={"content": "断流测试", "stream": True}, headers=auth_headers,
+    ) as resp:
+        assert resp.status_code == 200
+        async for _line in resp.aiter_lines():
+            chunks += 1
+            if chunks >= 2:
+                break  # 只读两行就断开，模拟用户关页面/网络断
+
+    async with async_sessionmaker(db_engine, expire_on_commit=False)() as s:
+        logs = (await s.execute(select(UsageLog))).scalars().all()
+    assert len(logs) == 1, f"应恰好一行账，实为 {len(logs)}"
+    assert logs[0].status in ("settled", "failed"), f"断流后不得停在 {logs[0].status}"
+    assert logs[0].settled_at is not None
+
+
+async def test_wallet_entry_usage_log_id_is_unique(client, auth_headers, db_engine):
+    """钱包扣费幂等靠**数据库唯一约束**，不能只靠应用层查询。
+
+    并发下两个请求可能同时查不到已有流水而各扣一次 —— 只有 DB 约束能兜住。
+    该测试直接打 DB，证明约束在模型与迁移里都真实存在。
+    """
+    from decimal import Decimal
+    from uuid import UUID, uuid4
+
+    from sqlalchemy.exc import IntegrityError
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from app.billing.wallet import WalletEntry
+
+    me = (await client.get("/api/v1/auth/me", headers=auth_headers)).json()
+    uid = UUID(me["id"])
+    log_id = uuid4()
+
+    async with async_sessionmaker(db_engine, expire_on_commit=False)() as s:
+        s.add(
+            WalletEntry(
+                user_id=uid, entry_type="consume", amount=Decimal("-1"),
+                balance_after=Decimal("999"), usage_log_id=log_id,
+            )
+        )
+        await s.commit()
+
+    async with async_sessionmaker(db_engine, expire_on_commit=False)() as s:
+        s.add(
+            WalletEntry(
+                user_id=uid, entry_type="consume", amount=Decimal("-1"),
+                balance_after=Decimal("998"), usage_log_id=log_id,  # 同一账行再扣
+            )
+        )
+        with pytest.raises(IntegrityError):
+            await s.commit()
+

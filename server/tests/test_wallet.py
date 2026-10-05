@@ -220,3 +220,56 @@ async def test_admin_margin_endpoint(client, auth_headers, persona, db_engine):
     # 手动对账入口可调用
     rc = await client.post("/api/v1/admin/billing/reconcile", headers=auth_headers)
     assert rc.status_code == 200 and rc.json()["abandoned"] == 0
+
+
+async def test_margin_uses_credit_to_usd_rate(client, auth_headers, db_engine, monkeypatch):
+    """毛利比较必须经 credit_to_usd 换算 —— 默认值 1 会掩盖这个 bug。
+
+    billed 是 credit、upstream 是 USD，直接相减在兑换率非 1 时结论会反向。
+    构造一行「按 USD 直比是亏、按真实汇率是赚」的账：监控必须按汇率判为正常。
+    """
+    from uuid import UUID
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from app.config import get_settings
+    from app.models import UsageLog
+
+    settings = get_settings()
+    # 1 积分 = 0.5 USD（远低于默认 1，专门暴露「忘了换算」的实现）
+    monkeypatch.setattr(settings, "credit_to_usd", Decimal("0.5"))
+
+    me = (await client.get("/api/v1/auth/me", headers=auth_headers)).json()
+    uid = UUID(me["id"])
+
+    async with async_sessionmaker(db_engine, expire_on_commit=False)() as s:
+        s.add(
+            UsageLog(
+                user_id=uid,
+                model="gpt-4o-mini",
+                status="settled",
+                currency="credit",
+                cost_billed=Decimal("100"),  # 100 积分 × 0.5 = 50 USD 收入
+                cost_upstream=Decimal("30"),  # 成本 30 USD → 实际赚 20
+                prompt_tokens=10,
+                completion_tokens=5,
+                idempotency_key="margin-rate-test",
+            )
+        )
+        await s.commit()
+
+        # 按汇率：50 > 30，无违规。若实现忘了乘 rate（100 > 30 也成立，看不出）
+        # 或漏乘后判断出错，这里会失败。
+        summary = await summarize_margin(s)
+        assert summary["billed_total"] == Decimal("100")  # 原始积分不改
+        assert summary["revenue_usd"] == Decimal("50")  # 换算后收入
+        assert summary["upstream_total"] == Decimal("30")
+        assert summary["margin"] == Decimal("20"), summary
+        assert summary["violations"] == 0, "换算后应无负毛利"
+        assert await count_margin_violations(s) == 0
+
+        # 反证：同一行在默认汇率（1.0）下确实会被判为违规 —— 证明
+        # 上面的「无违规」是汇率生效的结果，而不是这行数据本来就无害。
+        monkeypatch.setattr(settings, "credit_to_usd", Decimal("0.1"))  # 100 × 0.1 = 10 < 30
+        assert await count_margin_violations(s) == 1, "低汇率下应收紧为违规"
+

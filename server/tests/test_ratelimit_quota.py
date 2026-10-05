@@ -95,6 +95,33 @@ async def test_admit_request_blocks_over_quota(client, auth_headers, db_engine):
         ok, *_ = await admit_request(s, uid, 100, allowance_tokens=1000)
         assert ok is True
 
+        # 额度 0 = 不限额（与 settings 的 None/0 语义一致）→ 必须放行。
+        # 回归：若只判 `is None`，配 0 会变成 used + est > 0 恒真 —— 全量 429。
+        for zero in (0, -1):
+            ok, used, allowance = await admit_request(s, uid, 10**9, allowance_tokens=zero)
+            assert ok is True, f"额度 {zero} 应视为不限额，实为拒绝"
+            assert allowance == 0
+
+
+async def test_quota_zero_allows_message(client, auth_headers, persona, monkeypatch):
+    """端到端：quota_monthly_tokens=0 时对话正常（不是全量 429）。"""
+    from app.config import get_settings
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "quota_monthly_tokens", 0)
+
+    conv = (
+        await client.post(
+            "/api/v1/conversations", json={"persona_id": persona["id"]}, headers=auth_headers
+        )
+    ).json()
+    resp = await client.post(
+        f"/api/v1/conversations/{conv['id']}/messages",
+        json={"content": "quota 配 0 也该放行"},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+
 
 async def test_reconcile_pending_abandoned(client, auth_headers, persona, db_engine, monkeypatch):
     """对账任务：残留 pending 行被收编（needs_review，不永久占额度）。"""
