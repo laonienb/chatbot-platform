@@ -2,7 +2,7 @@
 
 from typing import Annotated
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,6 +15,7 @@ bearer_scheme = HTTPBearer(auto_error=False)
 
 
 async def get_current_user(
+    request: Request,
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> User:
@@ -26,6 +27,7 @@ async def get_current_user(
     user = await db.get(User, user_id)
     if user is None or user.status != "active":
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "用户不存在或已被禁用")
+    request.state.user = user  # 供限流依赖读取（不重复查库）
     return user
 
 
@@ -43,6 +45,7 @@ AdminUser = Annotated[User, Depends(get_admin_user)]
 
 
 async def get_api_key_principal(
+    request: Request,
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> tuple[ApiKey, User]:
@@ -71,4 +74,5 @@ async def get_api_key_principal(
 
     api_key.last_used_at = datetime.now(UTC)
     await db.commit()
+    request.state.principal = (api_key, user)  # 供限流依赖读取
     return api_key, user

@@ -5,12 +5,14 @@
 """
 
 import time
+from typing import Annotated
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Header
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.api.deps import DbSession, get_api_key_principal
+from app.billing.ratelimit import rate_limit_compat
 from app.core.sse import SSE_DONE, SSE_HEADERS, format_sse
 from app.llm.gateway import StreamDone
 from app.models import ApiKey, User
@@ -20,7 +22,13 @@ from app.schemas.openai_compat import (
     Usage,
     build_completion_response,
 )
-from app.services.chat import resolve_model, run_completion, run_completion_stream
+from app.services.chat import (
+    ensure_admitted,
+    persona_system_prompt,
+    resolve_model,
+    run_completion,
+    run_completion_stream,
+)
 
 router = APIRouter(prefix="/v1", tags=["openai-compat"])
 
@@ -35,8 +43,10 @@ def openai_error(status_code: int, message: str, err_type: str = "invalid_reques
 @router.post("/chat/completions", response_model=ChatCompletionResponse)
 async def chat_completions(
     body: ChatCompletionRequest,
+    _rl: Annotated[None, Depends(rate_limit_compat)],
+    db: DbSession = None,  # Annotated 内含 Depends(get_db)；默认值仅占位
     principal: tuple[ApiKey, User] = Depends(get_api_key_principal),
-    db: DbSession = None,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ):
     api_key, user = principal
 
@@ -46,11 +56,21 @@ async def chat_completions(
         )
 
     # persona 解析在开流之前完成，model_not_found 仍以标准 404 返回
-    if body.model.startswith("persona:"):
-        try:
-            await resolve_model(db, body.model)
-        except LookupError:
-            return openai_error(404, f"The model `{body.model}` does not exist", code="model_not_found")
+    # （非 persona 模型由 resolve_model 原样返回，永不抛）
+    try:
+        persona, model = await resolve_model(db, body.model)
+    except LookupError:
+        return openai_error(404, f"The model `{body.model}` does not exist", code="model_not_found")
+
+    # 准入（配额 429 / 余额 402）在开流之前 —— 与原生面同一套异常，由全局
+    # 异常处理器按 /v1 路径渲染成 OpenAI 错误格式
+    raw_messages = [m.model_dump() for m in body.messages]
+    llm_messages = (
+        [{"role": "system", "content": persona_system_prompt(persona)}] + raw_messages
+        if persona
+        else raw_messages
+    )
+    await ensure_admitted(db, user_id=user.id, llm_messages=llm_messages, model=model)
 
     if body.stream:
         completion_id = f"chatcmpl-{uuid4().hex[:24]}"
@@ -77,6 +97,8 @@ async def chat_completions(
                     temperature=body.temperature,
                     top_p=body.top_p,
                     max_tokens=body.max_tokens,
+                    source_uid=body.user,
+                    idempotency_key=idempotency_key,
                 ):
                     if isinstance(piece, StreamDone):
                         continue  # usage 记账已在服务层完成
@@ -98,6 +120,8 @@ async def chat_completions(
             temperature=body.temperature,
             top_p=body.top_p,
             max_tokens=body.max_tokens,
+            source_uid=body.user,
+            idempotency_key=idempotency_key,
         )
     except LookupError:
         return openai_error(

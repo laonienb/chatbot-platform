@@ -63,7 +63,13 @@ async def revoke_api_key(key_id: UUID, user: CurrentUser, db: DbSession):
 
 @router.get("/usage", response_model=UsageOut)
 async def my_usage(user: CurrentUser, db: DbSession, days: int = 30):
-    """我的 token 消耗（按模型分组），统计窗口 days 天（1-365，默认 30）。"""
+    """我的 token 消耗（按模型分组），统计窗口 days 天（1-365，默认 30）。
+
+    只统计**终态**账行（settled/failed/abandoned），与配额口径（`quota.py`）一致：
+    pending 是「已预扣但尚未结算」的在飞行，把它算进来会让用量在本请求尚未完成时
+    就虚增（并发下更明显）；abandoned 是进程被 kill 后由对账收编的残留，按预扣
+    估算计入（保守）。
+    """
     days = min(max(days, 1), 365)
     since = datetime.now(UTC) - timedelta(days=days)
     rows = (
@@ -74,7 +80,11 @@ async def my_usage(user: CurrentUser, db: DbSession, days: int = 30):
                 func.coalesce(func.sum(UsageLog.prompt_tokens), 0).label("prompt_tokens"),
                 func.coalesce(func.sum(UsageLog.completion_tokens), 0).label("completion_tokens"),
             )
-            .where(UsageLog.user_id == user.id, UsageLog.created_at >= since)
+            .where(
+                UsageLog.user_id == user.id,
+                UsageLog.created_at >= since,
+                UsageLog.status.in_(("settled", "failed", "abandoned")),
+            )
             .group_by(UsageLog.model)
             .order_by(func.sum(UsageLog.prompt_tokens + UsageLog.completion_tokens).desc())
         )

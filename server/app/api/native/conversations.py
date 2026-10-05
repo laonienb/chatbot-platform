@@ -2,11 +2,12 @@
 
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import delete, select
 
 from app.api.deps import CurrentUser, DbSession
+from app.billing.ratelimit import rate_limit_native
 from app.core.sse import SSE_DONE, SSE_HEADERS, format_sse
 from app.llm.gateway import StreamDone
 from app.models import Conversation, Message, Persona
@@ -18,7 +19,12 @@ from app.schemas.conversation import (
     MessageSendIn,
     SendMessageOut,
 )
-from app.services.chat import regenerate_stream, send_message, send_message_stream
+from app.services.chat import (
+    ensure_native_admitted,
+    regenerate_stream,
+    send_message,
+    send_message_stream,
+)
 from app.services.persona import can_view_persona
 
 router = APIRouter(prefix="/api/v1/conversations", tags=["conversations"])
@@ -93,13 +99,19 @@ async def delete_conversation(conversation_id: UUID, user: CurrentUser, db: DbSe
 
 @router.post("/{conversation_id}/messages")
 async def send(
-    conversation_id: UUID, body: MessageSendIn, user: CurrentUser, db: DbSession
+    conversation_id: UUID,
+    body: MessageSendIn,
+    user: CurrentUser,
+    db: DbSession,
+    _rl: None = Depends(rate_limit_native),  # noqa: ARG001 — 限流依赖（无返回值）
 ):
     conv = await _get_owned_conversation(conversation_id, user.id, db)
+    # 准入（配额 429 / 余额 402）必须在开流之前 —— 200 之后无法再回错误状态码
+    await ensure_native_admitted(db, conv, body.content)
     if body.stream:
 
         async def event_stream():
-            async for piece in send_message_stream(db, conv, body.content):
+            async for piece in send_message_stream(db, conv, body.content, source="native"):
                 if isinstance(piece, StreamDone):
                     continue  # 结束标记不外发，落库已在服务层完成
                 yield format_sse({"choices": [{"index": 0, "delta": {"content": piece}}]})
@@ -107,7 +119,12 @@ async def send(
 
         return StreamingResponse(event_stream(), media_type="text/event-stream", headers=SSE_HEADERS)
 
-    user_message, assistant_message = await send_message(db, conv, body.content)
+    try:
+        user_message, assistant_message = await send_message(db, conv, body.content, source="native")
+    except HTTPException:
+        raise
+    except Exception as e:  # 上游 LLM 异常 → 与兼容层对齐的 502（预扣行已在服务层结算为 failed）
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"LLM upstream error: {e}")
     return SendMessageOut(
         user_message=MessageOut.model_validate(user_message),
         assistant_message=MessageOut.model_validate(assistant_message),
@@ -116,13 +133,17 @@ async def send(
 
 @router.post("/{conversation_id}/regenerate")
 async def regenerate(
-    conversation_id: UUID, user: CurrentUser, db: DbSession
+    conversation_id: UUID,
+    user: CurrentUser,
+    db: DbSession,
+    _rl: None = Depends(rate_limit_native),  # noqa: ARG001
 ):
     """重新生成最后一条助手回复（替换而非追加）。仅 SSE 流式返回。"""
     conv = await _get_owned_conversation(conversation_id, user.id, db)
+    await ensure_native_admitted(db, conv)  # content=None：历史末尾已是该用户消息
 
     async def event_stream():
-        async for piece in regenerate_stream(db, conv):
+        async for piece in regenerate_stream(db, conv, source="native"):
             if isinstance(piece, StreamDone):
                 continue
             yield format_sse({"choices": [{"index": 0, "delta": {"content": piece}}]})

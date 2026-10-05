@@ -4,6 +4,8 @@ from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import select
 
 from app.api.deps import CurrentUser, DbSession
+from app.billing.charge import grant
+from app.config import get_settings
 from app.core.security import (
     create_access_token,
     create_refresh_token,
@@ -36,6 +38,11 @@ async def register(body: RegisterIn, db: DbSession):
         display_name=body.display_name,
     )
     db.add(user)
+    await db.flush()
+    # 注册赠送积分：余额准入（402）的启动资金；0 = 不送
+    grant_credits = get_settings().signup_grant_credits
+    if grant_credits > 0:
+        await grant(db, user.id, grant_credits, note="注册赠送")
     await db.commit()
     await db.refresh(user)
     return _tokens_for(user)
