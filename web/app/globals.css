@@ -173,6 +173,17 @@ select {
 }
 select {
   cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+  border-radius: 10px;
+  padding-right: 34px;
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 4.5L6 8l3.5-3.5' fill='none' stroke='%238a93aa' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  background-size: 12px;
+}
+select:hover:not(:disabled) {
+  border-color: rgba(120, 136, 255, 0.55);
 }
 select option {
   background: var(--bg-panel-solid);
@@ -451,18 +462,28 @@ a {
 
 .sidebar-footer {
   border-top: 1px solid var(--border);
-  padding: 10px 16px;
+  padding: 10px 12px;
   display: flex;
-  gap: 18px;
+  flex-direction: column;
+  gap: 4px;
 }
 .sidebar-link {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  border: 1px solid transparent;
   color: var(--text-dim);
   text-decoration: none;
   font-size: 13px;
-  transition: color var(--t) var(--ease);
+  transition: all var(--t) var(--ease);
 }
 .sidebar-link:hover {
   color: var(--text);
+  background: var(--bg-hover);
+  border-color: rgba(120, 136, 255, 0.28);
+  transform: translateY(-1px);
 }
 
 .sidebar-mask {
@@ -507,22 +528,9 @@ a {
   display: none;
 }
 .model-select {
-  font-family: inherit;
   font-size: 13px;
-  color: var(--text);
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  padding: 6px 14px;
   max-width: 200px;
   width: auto;
-  outline: none;
-  cursor: pointer;
-  transition: all var(--t) var(--ease);
-}
-.model-select:hover,
-.model-select:focus {
-  border-color: rgba(120, 136, 255, 0.55);
 }
 
 /* ---------- 消息区 ---------- */
