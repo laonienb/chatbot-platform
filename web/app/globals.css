@@ -847,6 +847,86 @@ button.stop {
   }
 }
 
+/* ---------- 记忆管理 ---------- */
+
+.memory-modal {
+  width: 520px;
+}
+.memory-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+  color: var(--text);
+}
+.switch {
+  width: 44px;
+  height: 24px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  position: relative;
+  padding: 0;
+}
+.switch .knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  transition: all 0.15s;
+}
+.switch.on {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.switch.on .knob {
+  left: 22px;
+  background: #fff;
+}
+.memory-add {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.memory-add input {
+  flex: 1;
+  margin: 0;
+}
+.memory-list {
+  max-height: 320px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.memory-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.memory-content {
+  flex: 1;
+  font-size: 13px;
+  word-break: break-word;
+}
+.memory-meta {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+}
+.memory-meta small {
+  color: var(--text-dim);
+  margin-right: 4px;
+}
+
 /* ---------- 弹窗 ---------- */
 
 .modal-mask {

@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.config import get_settings
+from app.core.constants import MEMORY_MARKER
 
 
 @dataclass
@@ -75,6 +76,17 @@ class MockBackend:
         if system.startswith("[persona:"):
             persona_tag = system.split("]", 1)[0] + "] "
         content = f"{persona_tag}[mock:{model}] 收到：{last_user}"
+        if MEMORY_MARKER in "\n".join(m["content"] for m in messages if m["role"] == "system"):
+            # 回显第一条记忆，便于测试注入链路
+            facts = [
+                line[2:]
+                for m in messages
+                if m["role"] == "system"
+                for line in m["content"].splitlines()
+                if line.startswith("- ")
+            ]
+            if facts:
+                content += f" |已知:{facts[0]}"
         return LLMResult(
             content=content,
             model=model,

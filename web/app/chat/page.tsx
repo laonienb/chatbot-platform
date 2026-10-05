@@ -16,6 +16,7 @@ import {
   type Persona,
   type User,
 } from "@/lib/api";
+import MemoryModal from "@/components/MemoryModal";
 
 const PAGE_SIZE = 20;
 
@@ -36,6 +37,7 @@ export default function ChatPage() {
     { mode: "create" } | { mode: "edit"; persona: Persona } | null
   >(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [memoryModalFor, setMemoryModalFor] = useState<Persona | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -420,6 +422,18 @@ export default function ChatPage() {
                 <strong>{activeConv.title ?? personaOf(activeConv.persona_id)?.name ?? "会话"}</strong>
                 <small>{personaOf(activeConv.persona_id)?.name}</small>
               </div>
+              {personaOf(activeConv.persona_id)?.owner_id === me.id && (
+                <button
+                  className="icon-btn"
+                  title="长期记忆"
+                  onClick={() => {
+                    const p = personaOf(activeConv.persona_id);
+                    if (p) setMemoryModalFor(p);
+                  }}
+                >
+                  🧠
+                </button>
+              )}
               <select
                 className="model-select"
                 value={activeConv.model ?? ""}
@@ -513,6 +527,14 @@ export default function ChatPage() {
             setPersonas((prev) => prev.filter((p) => p.id !== id));
             setPersonaModal(null);
           }}
+        />
+      )}
+
+      {memoryModalFor && (
+        <MemoryModal
+          persona={memoryModalFor}
+          onClose={() => setMemoryModalFor(null)}
+          onPersonaUpdated={(p) => setPersonas((prev) => prev.map((x) => (x.id === p.id ? p : x)))}
         />
       )}
 

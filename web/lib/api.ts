@@ -123,6 +123,16 @@ export interface Persona {
   forked_from: string | null;
   tags: string[] | null;
   avatar_url: string | null;
+  memory_enabled: boolean;
+}
+
+export interface Memory {
+  id: string;
+  persona_id: string;
+  content: string;
+  category: string;
+  source: string; // chat=自动提取 / manual=手动
+  created_at: string;
 }
 
 export interface Conversation {
@@ -253,6 +263,12 @@ export const platformApi = {
     api<LlmModel>(`/api/v1/admin/models/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   deleteModel: (id: string) => api<void>(`/api/v1/admin/models/${id}`, { method: "DELETE" }),
   forkPersona: (id: string) => api<Persona>(`/api/v1/personas/${id}/fork`, { method: "POST" }),
+  memories: (personaId: string) => api<Memory[]>(`/api/v1/personas/${personaId}/memories`),
+  addMemory: (personaId: string, content: string) =>
+    api<Memory>(`/api/v1/personas/${personaId}/memories`, { method: "POST", body: JSON.stringify({ content }) }),
+  updateMemory: (id: string, content: string) =>
+    api<Memory>(`/api/v1/memories/${id}`, { method: "PATCH", body: JSON.stringify({ content }) }),
+  deleteMemory: (id: string) => api<void>(`/api/v1/memories/${id}`, { method: "DELETE" }),
   market: (params?: { q?: string; tag?: string }) => {
     const sp = new URLSearchParams();
     if (params?.q) sp.set("q", params.q);

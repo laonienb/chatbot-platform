@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app.api.native import auth, conversations, me, models, personas
+from app.api.native import auth, conversations, me, memories, models, personas
 from app.api.openai_compat import chat as openai_chat
 from app.config import Settings, get_settings
 
@@ -56,6 +56,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(me.router)
     app.include_router(models.router)
     app.include_router(models.admin_router)
+    app.include_router(memories.router)
     app.include_router(openai_chat.router)
 
     @app.get("/healthz", tags=["meta"])

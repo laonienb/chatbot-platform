@@ -1,5 +1,6 @@
 """对话服务：有状态（第一方客户端）与无状态（OpenAI 兼容层）两条链路的共用核心。"""
 
+import asyncio
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from uuid import UUID
@@ -10,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.llm.gateway import LLMResult, StreamDone, chat_stream, get_llm_backend
 from app.models import ApiKey, Conversation, LlmModel, Message, Persona, UsageLog, User
+from app.services.memory import build_memory_block, get_recent_memories, schedule_extraction
 
 # 上下文窗口：最多回看的历史消息条数（超长截断策略 M1 细化为滚动摘要）
 CONTEXT_WINDOW = 50
@@ -20,10 +22,14 @@ def persona_system_prompt(persona: Persona) -> str:
     return f"[persona:{persona.slug}] {persona.system_prompt}"
 
 
-def build_llm_messages(persona: Persona | None, history: list[Message]) -> list[dict[str, str]]:
+def build_llm_messages(
+    persona: Persona | None, history: list[Message], memory_block: str | None = None
+) -> list[dict[str, str]]:
     messages: list[dict[str, str]] = []
     if persona and persona.system_prompt:
         messages.append({"role": "system", "content": persona_system_prompt(persona)})
+    if memory_block:
+        messages.append({"role": "system", "content": memory_block})
     messages.extend({"role": m.role, "content": m.content} for m in history)
     return messages
 
@@ -128,7 +134,8 @@ async def send_message(db: AsyncSession, conversation: Conversation, content: st
     await db.flush()
 
     history = await _history(db, conversation.id)
-    llm_messages = build_llm_messages(persona, history)
+    memory_block = await _memory_block(db, conversation, persona)
+    llm_messages = build_llm_messages(persona, history, memory_block)
     model, api_base, api_key = await resolve_chat_model(db, conversation, persona)
     result = await get_llm_backend().chat(
         llm_messages,
@@ -141,6 +148,9 @@ async def send_message(db: AsyncSession, conversation: Conversation, content: st
     )
     done = StreamDone(model=result.model, prompt_tokens=result.prompt_tokens, completion_tokens=result.completion_tokens)
     assistant_message = await _save_reply(db, conversation, persona, done, result.content)
+    schedule_extraction(
+        db, conversation.id, conversation.user_id, conversation.persona_id, content, result.content
+    )
     await db.refresh(user_message)
     await db.refresh(assistant_message)
     return user_message, assistant_message
@@ -199,7 +209,8 @@ async def _stream_reply(
 ) -> AsyncIterator[str | StreamDone]:
     """基于当前历史（应已含最新用户消息）流式生成并落库助手回复。"""
     history = await _history(db, conversation.id)
-    llm_messages = build_llm_messages(persona, history)
+    memory_block = await _memory_block(db, conversation, persona)
+    llm_messages = build_llm_messages(persona, history, memory_block)
     model, api_base, api_key = await resolve_chat_model(db, conversation, persona)
     parts: list[str] = []
     async for piece in chat_stream(
@@ -213,10 +224,22 @@ async def _stream_reply(
     ):
         if isinstance(piece, StreamDone):
             await _save_reply(db, conversation, persona, piece, "".join(parts))
+            user_text = next((m.content for m in reversed(history) if m.role == "user"), "")
+            schedule_extraction(
+                db, conversation.id, conversation.user_id, conversation.persona_id, user_text, "".join(parts)
+            )
             yield piece
         else:
             parts.append(piece)
             yield piece
+
+
+async def _memory_block(db: AsyncSession, conversation: Conversation, persona: Persona | None) -> str | None:
+    """取该会话（用户+人设）的长期记忆注入块；人设关闭记忆则返回 None。"""
+    if persona is not None and not persona.memory_enabled:
+        return None
+    memories = await get_recent_memories(db, conversation.user_id, conversation.persona_id)
+    return build_memory_block(memories)
 
 
 async def run_completion(

@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import JSON, DateTime, Float, ForeignKey, Integer, String
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy import Uuid
 
@@ -29,4 +29,5 @@ class Persona(Base):
     status: Mapped[str] = mapped_column(String(16), default="active")  # active / reviewing / banned
     forked_from: Mapped[UUID | None] = mapped_column(Uuid)
     tags: Mapped[list[str] | None] = mapped_column(JSON)
+    memory_enabled: Mapped[bool] = mapped_column(Boolean, default=True)  # 长期记忆开关
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

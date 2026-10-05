@@ -16,6 +16,7 @@ class PersonaCreate(BaseModel):
     visibility: str = Field(default="private", pattern=r"^(private|public)$")
     tags: list[str] | None = None
     avatar_url: str | None = Field(default=None, max_length=512)
+    memory_enabled: bool = True
 
 
 class PersonaUpdate(BaseModel):
@@ -29,6 +30,7 @@ class PersonaUpdate(BaseModel):
     visibility: str | None = Field(default=None, pattern=r"^(private|public)$")
     tags: list[str] | None = None
     avatar_url: str | None = Field(default=None, max_length=512)
+    memory_enabled: bool | None = None
 
 
 class PersonaOut(BaseModel):
@@ -47,6 +49,7 @@ class PersonaOut(BaseModel):
     status: str
     forked_from: UUID | None
     tags: list[str] | None
+    memory_enabled: bool
     created_at: datetime
 
     model_config = {"from_attributes": True}
