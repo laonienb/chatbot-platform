@@ -34,3 +34,4 @@ Thumbs.db
 logs/
 data/
 *.sqlite3
+*.db

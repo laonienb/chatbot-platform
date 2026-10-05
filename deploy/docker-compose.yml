@@ -1,0 +1,45 @@
+# M0 开发环境：postgres + redis + server
+# napcat / astrbot / litellm / web 在 M1-M2 里程碑加入
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: chatbot
+      POSTGRES_PASSWORD: chatbot-dev-password
+      POSTGRES_DB: chatbot
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chatbot"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+
+  server:
+    build: ../server
+    environment:
+      DATABASE_URL: postgresql+asyncpg://chatbot:chatbot-dev-password@postgres:5432/chatbot
+      LLM_BACKEND: ${LLM_BACKEND:-mock}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      SECRET_KEY: ${SECRET_KEY:-dev-insecure-secret-change-me}
+      CORS_ORIGINS: http://localhost:3000
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ../server/app:/app/app  # 开发热重载
+
+volumes:
+  pgdata:
+  redisdata:
