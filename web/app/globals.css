@@ -189,6 +189,93 @@ select option {
   background: var(--bg-panel-solid);
   color: var(--text);
 }
+
+/* 自绘下拉（components/Select.tsx）：触发按钮 + 展开面板。
+   原生 <select> 的展开面板由操作系统绘制（Windows 直角），无法定制，
+   需要统一展开风格的地方一律用该组件。 */
+.select-trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  font: inherit;
+  font-size: 14px;
+  color: var(--text);
+  text-align: left;
+  background-color: rgba(10, 13, 20, 0.55);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 9px 34px 9px 14px;
+  cursor: pointer;
+  outline: none;
+  transition: all var(--t) var(--ease);
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 4.5L6 8l3.5-3.5' fill='none' stroke='%238a93aa' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 13px center;
+  background-size: 12px;
+}
+.select-trigger:hover {
+  border-color: rgba(120, 136, 255, 0.55);
+}
+.select-trigger:focus-visible {
+  border-color: rgba(120, 136, 255, 0.65);
+  box-shadow: 0 0 0 3px rgba(100, 116, 240, 0.18);
+}
+.select-trigger-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.select-pop {
+  position: fixed;
+  z-index: 60;
+  margin: 0;
+  padding: 6px;
+  list-style: none;
+  background: var(--bg-panel-solid);
+  border: 1px solid var(--border-strong);
+  border-radius: 14px;
+  box-shadow: var(--shadow-lg);
+  max-height: 300px;
+  overflow-y: auto;
+  animation: select-pop-in 0.18s var(--ease);
+}
+@keyframes select-pop-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.select-opt {
+  display: flex;
+  align-items: center;
+  padding: 8px 12px;
+  border-radius: 9px;
+  font-size: 13px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  cursor: pointer;
+  transition: all 0.15s var(--ease);
+}
+.select-opt.active {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+.select-opt.selected {
+  color: var(--text);
+  font-weight: 600;
+}
+.select-opt.selected::after {
+  content: "✓";
+  margin-left: auto;
+  padding-left: 14px;
+  color: var(--accent-hover);
+}
 input::placeholder,
 textarea::placeholder {
   color: var(--text-faint);

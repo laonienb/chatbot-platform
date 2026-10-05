@@ -17,6 +17,7 @@ import {
   type User,
 } from "@/lib/api";
 import MemoryModal from "@/components/MemoryModal";
+import Select from "@/components/Select";
 
 const PAGE_SIZE = 20;
 
@@ -443,19 +444,17 @@ export default function ChatPage() {
                   🧠
                 </button>
               )}
-              <select
+              <Select
                 className="model-select"
-                value={activeConv.model ?? ""}
-                onChange={(e) => switchModel(activeConv, e.target.value)}
+                ariaLabel="切换本会话使用的模型"
                 title="切换本会话使用的模型"
-              >
-                <option value="">默认模型</option>
-                {models.map((m) => (
-                  <option key={m.id} value={m.model}>
-                    {m.name}
-                  </option>
-                ))}
-              </select>
+                value={activeConv.model ?? ""}
+                onChange={(v) => switchModel(activeConv, v)}
+                options={[
+                  { value: "", label: "默认模型" },
+                  ...models.map((m) => ({ value: m.model, label: m.name })),
+                ]}
+              />
             </header>
             <div className="messages" ref={scrollRef} onScroll={onScroll}>
               {hasMore && (
@@ -681,10 +680,15 @@ function PersonaForm({
           </label>
           <label>
             可见性
-            <select value={visibility} onChange={(e) => setVisibility(e.target.value)}>
-              <option value="private">私有</option>
-              <option value="public">公开（发布到人设市场）</option>
-            </select>
+            <Select
+              ariaLabel="可见性"
+              value={visibility}
+              onChange={setVisibility}
+              options={[
+                { value: "private", label: "私有" },
+                { value: "public", label: "公开（发布到人设市场）" },
+              ]}
+            />
           </label>
         </div>
         {error && <p className="auth-error">{error}</p>}
