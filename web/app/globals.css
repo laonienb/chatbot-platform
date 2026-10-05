@@ -41,6 +41,10 @@
   --shadow-md: 0 8px 28px rgba(0, 0, 0, 0.35);
   --shadow-sm: 0 2px 10px rgba(0, 0, 0, 0.25);
 
+  /* 动效：统一时长与缓动（easeOutQuart 类曲线，收尾柔和） */
+  --t: 0.26s;
+  --ease: cubic-bezier(0.22, 0.8, 0.3, 1);
+
   --font: "Segoe UI Variable Display", "Segoe UI", "PingFang SC", "Microsoft YaHei UI",
     "Microsoft YaHei", system-ui, -apple-system, sans-serif;
 }
@@ -107,7 +111,7 @@ button {
   border-radius: var(--radius-sm);
   padding: 7px 16px;
   cursor: pointer;
-  transition: background 0.15s, border-color 0.15s, transform 0.1s, box-shadow 0.15s;
+  transition: all var(--t) var(--ease);
 }
 button:hover:not(:disabled) {
   border-color: rgba(120, 136, 255, 0.55);
@@ -115,6 +119,7 @@ button:hover:not(:disabled) {
 }
 button:active:not(:disabled) {
   transform: translateY(1px);
+  transition-duration: 0.08s;
 }
 button.primary {
   background: var(--grad-accent);
@@ -153,8 +158,10 @@ button.icon-btn.danger:hover {
 }
 
 input,
-textarea {
-  font: inherit;
+textarea,
+select {
+  font-family: inherit;
+  font-size: 14px;
   color: var(--text);
   background: rgba(10, 13, 20, 0.55);
   border: 1px solid var(--border);
@@ -162,20 +169,24 @@ textarea {
   padding: 9px 12px;
   width: 100%;
   outline: none;
-  transition: border-color 0.15s, box-shadow 0.15s;
+  transition: all var(--t) var(--ease);
+}
+select {
+  cursor: pointer;
+}
+select option {
+  background: var(--bg-panel-solid);
+  color: var(--text);
 }
 input::placeholder,
 textarea::placeholder {
   color: var(--text-faint);
 }
 input:focus,
-textarea:focus {
+textarea:focus,
+select:focus {
   border-color: rgba(120, 136, 255, 0.65);
   box-shadow: 0 0 0 3px rgba(100, 116, 240, 0.18);
-}
-
-select {
-  font: inherit;
 }
 
 label {
@@ -363,7 +374,7 @@ a {
   display: flex;
   align-items: center;
   border-radius: 10px;
-  transition: background 0.12s;
+  transition: all var(--t) var(--ease);
 }
 .persona-item:hover {
   background: var(--bg-hover);
@@ -408,7 +419,7 @@ a {
   border-radius: 10px;
   cursor: pointer;
   border: 1px solid transparent;
-  transition: background 0.12s, border-color 0.12s;
+  transition: all var(--t) var(--ease);
 }
 .conv-item:hover {
   background: var(--bg-hover);
@@ -448,7 +459,7 @@ a {
   color: var(--text-dim);
   text-decoration: none;
   font-size: 13px;
-  transition: color 0.12s;
+  transition: color var(--t) var(--ease);
 }
 .sidebar-link:hover {
   color: var(--text);
@@ -496,7 +507,7 @@ a {
   display: none;
 }
 .model-select {
-  font: inherit;
+  font-family: inherit;
   font-size: 13px;
   color: var(--text);
   background: var(--bg-elevated);
@@ -504,9 +515,10 @@ a {
   border-radius: 999px;
   padding: 6px 14px;
   max-width: 200px;
+  width: auto;
   outline: none;
   cursor: pointer;
-  transition: border-color 0.15s;
+  transition: all var(--t) var(--ease);
 }
 .model-select:hover,
 .model-select:focus {
@@ -747,7 +759,7 @@ button.stop {
   color: var(--text-dim);
   text-decoration: none;
   font-size: 13px;
-  transition: color 0.12s;
+  transition: color var(--t) var(--ease);
 }
 .back-link:hover {
   color: var(--text);
@@ -910,7 +922,7 @@ button.stop {
   background: var(--bg-elevated);
   position: relative;
   padding: 0;
-  transition: background 0.18s, border-color 0.18s;
+  transition: all var(--t) var(--ease);
 }
 .switch .knob {
   position: absolute;
@@ -920,7 +932,7 @@ button.stop {
   height: 20px;
   border-radius: 50%;
   background: var(--text-dim);
-  transition: all 0.18s;
+  transition: all var(--t) var(--ease);
 }
 .switch.on {
   background: var(--grad-accent);
@@ -1000,6 +1012,7 @@ button.stop {
   border-radius: 999px;
   background: transparent;
   color: var(--text-dim);
+  transition: all var(--t) var(--ease);
 }
 .chip:hover {
   color: var(--text);
@@ -1028,7 +1041,7 @@ button.stop {
   display: flex;
   flex-direction: column;
   gap: 11px;
-  transition: transform 0.15s, border-color 0.15s, box-shadow 0.15s;
+  transition: all 0.3s var(--ease);
 }
 .market-card:hover {
   transform: translateY(-2px);
@@ -1068,7 +1081,7 @@ button.stop {
 .tag.link {
   border: none;
   cursor: pointer;
-  transition: filter 0.12s;
+  transition: all var(--t) var(--ease);
 }
 .tag.link:hover {
   filter: brightness(1.3);
