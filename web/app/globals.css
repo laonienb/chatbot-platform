@@ -628,6 +628,8 @@ a {
   font-size: 13px;
   max-width: 200px;
   width: auto;
+  /* 宽度不随选中项文字长短跳动：以最长的模型名（DeepSeek Chat）为基准 */
+  min-width: 176px;
 }
 
 /* ---------- 消息区 ---------- */
