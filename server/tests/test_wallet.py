@@ -273,3 +273,44 @@ async def test_margin_uses_credit_to_usd_rate(client, auth_headers, db_engine, m
         monkeypatch.setattr(settings, "credit_to_usd", Decimal("0.1"))  # 100 × 0.1 = 10 < 30
         assert await count_margin_violations(s) == 1, "低汇率下应收紧为违规"
 
+
+async def test_charge_partial_payment_when_balance_runs_out(client, auth_headers, db_engine):
+    """结算时余额不足：扣光剩余（部分支付）+ 账行标 needs_review，余额不为负。"""
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    from uuid import UUID, uuid4
+
+    from app.billing.charge import charge_settled_log, consume, topup
+    from app.models import UsageLog, User
+
+    me = (await client.get("/api/v1/auth/me", headers=auth_headers)).json()
+    uid = UUID(me["id"])
+
+    async with async_sessionmaker(db_engine, expire_on_commit=False)() as s:
+        # 清空注册赠送，只留 1 积分
+        bal = await balance(s, uid)
+        await consume(s, uid, bal)
+        await topup(s, uid, Decimal("1"))
+
+        log = UsageLog(
+            user_id=uid,
+            model="gpt-4o-mini",
+            status="settled",
+            currency="credit",
+            cost_billed=Decimal("5"),  # 应扣 5，只有 1
+            prompt_tokens=100,
+            completion_tokens=50,
+            idempotency_key=str(uuid4()),
+        )
+        s.add(log)
+        await s.commit()
+
+        e = await charge_settled_log(s, log)
+        assert e is not None
+        assert e.amount == Decimal("-1")  # 扣光剩余，不是 5
+        assert await balance(s, uid) == 0  # 归零，绝不为负
+        assert log.needs_review is True  # 缺口交对账
+
+        # 幂等：再调不重复扣
+        e2 = await charge_settled_log(s, log)
+        assert e2 is not None and e2.id == e.id
+        assert await balance(s, uid) == 0

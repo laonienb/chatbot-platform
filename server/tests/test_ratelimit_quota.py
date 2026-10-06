@@ -86,6 +86,10 @@ async def test_admit_request_blocks_over_quota(client, auth_headers, db_engine):
         ok, used, allowance = await admit_request(s, uid, 100, allowance_tokens=None)
         assert ok is True
 
+        # allowance=0 同样是「不限额」（settings 语义 None/0=不限，不能反向全量 429）
+        ok, *_ = await admit_request(s, uid, 100, allowance_tokens=0)
+        assert ok is True
+
         # 额度 50，已用 0，估算 100 → 拒绝（预检）
         ok, used, allowance = await admit_request(s, uid, 100, allowance_tokens=50)
         assert ok is False
@@ -220,3 +224,35 @@ async def test_monthly_quota_exceeded_429_native_and_compat(client, auth_headers
     async with async_sessionmaker(db_engine, expire_on_commit=False)() as s:
         n = (await s.execute(select(func.count()).select_from(UsageLog))).scalar_one()
     assert n == 0  # 准入零副作用
+
+
+async def test_billing_watch_tick_reconciles_and_summarizes(client, auth_headers, db_engine):
+    """对账循环一轮（billing_watch_tick）：收编残留 pending + 返回毛利摘要。"""
+    from datetime import UTC, datetime, timedelta
+    from decimal import Decimal
+    from uuid import UUID
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from app.main import billing_watch_tick
+    from app.models import UsageLog
+
+    me = (await client.get("/api/v1/auth/me", headers=auth_headers)).json()
+
+    async with async_sessionmaker(db_engine, expire_on_commit=False)() as s:
+        s.add(
+            UsageLog(
+                user_id=UUID(me["id"]),
+                model="gpt-4o-mini",
+                status="pending",
+                reserved_tokens=500,
+                reserved_cost=Decimal("0.5"),
+                started_at=datetime.now(UTC) - timedelta(minutes=20),
+            )
+        )
+        await s.commit()
+
+        result = await billing_watch_tick(s)
+
+    assert result["abandoned"] == 1  # stale pending 被收编
+    assert "violations" in result and "revenue_usd" in result  # 毛利摘要可用

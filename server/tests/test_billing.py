@@ -86,6 +86,28 @@ def test_quote_cache_discount_applied():
     assert cached.upstream < full.upstream
 
 
+def test_compat_idem_key_has_time_window(monkeypatch):
+    """兼容层自动幂等键带 10 分钟窗：窗内同 body 相同（重发不双扣），
+    窗外不同（合法重复请求照常计费，不给永久免单开口子）。"""
+    import time as _time
+    from uuid import uuid4
+
+    from app.models import ApiKey
+    from app.services.chat import _compat_idem_key
+
+    key = ApiKey(id=uuid4(), user_id=uuid4(), name="k")
+    msgs = [{"role": "user", "content": "hi"}]
+
+    monkeypatch.setattr(_time, "time", lambda: 1_000_000.0)
+    k1 = _compat_idem_key(key, "gpt-4o", msgs)
+    k2 = _compat_idem_key(key, "gpt-4o", msgs)
+    assert k1 == k2  # 同窗同 body → 同键
+
+    monkeypatch.setattr(_time, "time", lambda: 1_000_000.0 + 601)  # 跨过一个窗
+    k3 = _compat_idem_key(key, "gpt-4o", msgs)
+    assert k3 != k1  # 窗外同 body → 新键（正常计费）
+
+
 # ---------- step 3：费率规则 ----------
 
 
