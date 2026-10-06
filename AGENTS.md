@@ -115,6 +115,10 @@
   迁移后，旧账行 `status` 落到默认值 `pending`，被新口径排除——开发库历史用量在
   界面上归零。属历史数据迁移遗留，dev 库无实际影响；若在意可将对账任务把旧 pending
   行收编为 abandoned，或保持现状。
+  **✅ 后端已处理（2026-10-06，commit `b7774c7`）**：数据迁移 `d4e5f6a7b8c9` 把
+  `idempotency_key IS NULL` 的遗留行直接恢复为 `settled`（而非收编为 abandoned——
+  它们本就是正常完结的历史，挂 needs_review 是对账噪音），token/时间戳无损、幂等
+  可重跑。dev.db 实测 20 行全部恢复、needs_review 归零，历史用量正常。前端无需改动。
 
 ## 四、冻结区
 
