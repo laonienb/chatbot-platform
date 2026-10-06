@@ -1,4 +1,4 @@
-"""我的 API Key 管理（创建/列表/吊销）与用量统计。"""
+"""我的 API Key 管理（创建/列表/吊销）、用量统计与钱包余额。"""
 
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
@@ -7,10 +7,11 @@ from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import func, select
 
 from app.api.deps import CurrentUser, DbSession
+from app.billing.wallet import Wallet
 from app.core.security import generate_api_key
 from app.models import ApiKey, UsageLog
 from app.schemas.api_key import ApiKeyCreatedOut, ApiKeyCreate, ApiKeyOut
-from app.schemas.usage import UsageByModel, UsageOut
+from app.schemas.usage import UsageByModel, UsageOut, WalletOut
 
 router = APIRouter(prefix="/api/v1/me", tags=["me"])
 
@@ -96,4 +97,18 @@ async def my_usage(user: CurrentUser, db: DbSession, days: int = 30):
         total_prompt_tokens=sum(m.prompt_tokens for m in by_model),
         total_completion_tokens=sum(m.completion_tokens for m in by_model),
         by_model=by_model,
+    )
+
+
+@router.get("/wallet", response_model=WalletOut)
+async def my_wallet(user: CurrentUser, db: DbSession):
+    """我的积分余额（需求单：402 拒绝后前端据此引导充值）。
+
+    结算即扣的真实余额，读 wallets 快写缓存（真源 wallet_entries 同事务维护）。
+    从未充值/未发放（如 signup_grant_credits=0 且无流水）的用户视为 0。
+    """
+    w = await db.get(Wallet, user.id)
+    return WalletOut(
+        balance=float(w.balance) if w else 0.0,
+        lifetime_topup=float(w.lifetime_topup) if w else 0.0,
     )

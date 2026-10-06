@@ -314,3 +314,50 @@ async def test_charge_partial_payment_when_balance_runs_out(client, auth_headers
         e2 = await charge_settled_log(s, log)
         assert e2 is not None and e2.id == e.id
         assert await balance(s, uid) == 0
+
+
+async def test_me_wallet_endpoint(client, auth_headers, persona, db_engine):
+    """需求单验收：登录用户可查余额；注册赠送可见；结算即扣后下降；未登录 401。"""
+    from app.config import get_settings
+
+    grant = float(get_settings().signup_grant_credits)
+
+    # 未登录 → 401（沿用 HTTPBearer 鉴权，无新鉴权行为）
+    assert (await client.get("/api/v1/me/wallet")).status_code == 401
+
+    r = await client.get("/api/v1/me/wallet", headers=auth_headers)
+    assert r.status_code == 200
+    data = r.json()
+    assert set(data) == {"balance", "lifetime_topup"}
+    assert data["balance"] == grant
+    # lifetime_topup 只统计充值(topup)，注册赠送(grant)按会计口径不算充值
+    assert data["lifetime_topup"] == 0.0
+
+    # 充值后 lifetime_topup 增加、balance 同步
+    from decimal import Decimal
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    from app.billing.charge import topup
+    from app.models import User
+    from uuid import UUID
+
+    uid = UUID((await client.get("/api/v1/auth/me", headers=auth_headers)).json()["id"])
+    async with async_sessionmaker(db_engine, expire_on_commit=False)() as s:
+        await topup(s, uid, Decimal("50"))
+        await s.commit()
+    topped = (await client.get("/api/v1/me/wallet", headers=auth_headers)).json()
+    assert topped["lifetime_topup"] == 50.0
+    assert topped["balance"] == grant + 50.0
+
+    # 对话一次（结算即扣）→ 余额下降、累计入账不变
+    conv = (
+        await client.post(
+            "/api/v1/conversations", json={"persona_id": persona["id"]}, headers=auth_headers
+        )
+    ).json()
+    resp = await client.post(
+        f"/api/v1/conversations/{conv['id']}/messages", json={"content": "hi"}, headers=auth_headers
+    )
+    assert resp.status_code == 200
+    after = (await client.get("/api/v1/me/wallet", headers=auth_headers)).json()
+    assert after["balance"] < grant + 50.0  # 结算即扣
+    assert after["lifetime_topup"] == 50.0  # 消费不减少累计充值
