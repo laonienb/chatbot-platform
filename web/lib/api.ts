@@ -23,12 +23,52 @@ export function clearTokens() {
   localStorage.removeItem(REFRESH_KEY);
 }
 
+export type ApiErrorKind = "balance" | "rate_limit" | "quota";
+
 export class ApiError extends Error {
   status: number;
-  constructor(status: number, message: string) {
+  /** 计费拒绝语义（402/429），按 AGENTS.md「三」的通告约定 */
+  kind?: ApiErrorKind;
+  /** 仅 rate_limit：限流退避秒数（来自 Retry-After） */
+  retryAfter?: number;
+  constructor(status: number, message: string, opts?: { kind?: ApiErrorKind; retryAfter?: number }) {
     super(message);
     this.status = status;
+    this.kind = opts?.kind;
+    this.retryAfter = opts?.retryAfter;
   }
+}
+
+/**
+ * 把非 2xx 响应翻译成可展示的错误。
+ * 计费拒绝语义（见 AGENTS.md「三」通告，commit d7a132c）：
+ * - 402 余额不足 → 引导充值，禁止自动重试
+ * - 429 带 Retry-After → 限流，按秒退避
+ * - 429 不带 Retry-After → 月度配额用尽，重试无用
+ * 注意：401 的刷新重试逻辑不在此处，且绝不扩展到其他 4xx。
+ */
+async function interpretError(resp: Response): Promise<ApiError> {
+  let detail = `请求失败 (${resp.status})`;
+  try {
+    detail = (await resp.json()).detail ?? detail;
+  } catch {
+    /* keep */
+  }
+  if (resp.status === 402) {
+    return new ApiError(402, `${detail}，请充值或联系管理员`, { kind: "balance" });
+  }
+  if (resp.status === 429) {
+    const ra = resp.headers.get("Retry-After");
+    const secs = ra !== null ? Number(ra) : NaN;
+    if (Number.isFinite(secs) && secs > 0) {
+      return new ApiError(429, `操作过于频繁，请 ${Math.round(secs)} 秒后再试`, {
+        kind: "rate_limit",
+        retryAfter: Math.round(secs),
+      });
+    }
+    return new ApiError(429, "本月额度已用尽，请充值或联系管理员（重试无效）", { kind: "quota" });
+  }
+  return new ApiError(resp.status, detail);
 }
 
 async function refreshTokens(): Promise<boolean> {
@@ -61,14 +101,7 @@ export async function api<T = unknown>(path: string, init: RequestInit = {}, ret
     throw new ApiError(401, "登录已过期");
   }
   if (!resp.ok) {
-    let detail = `请求失败 (${resp.status})`;
-    try {
-      const body = await resp.json();
-      detail = body.detail ?? JSON.stringify(body);
-    } catch {
-      /* 保留默认消息 */
-    }
-    throw new ApiError(resp.status, detail);
+    throw await interpretError(resp);
   }
   if (resp.status === 204) return undefined as T;
   return resp.json();
@@ -308,13 +341,7 @@ async function postSSE(
     throw new ApiError(401, "登录已过期");
   }
   if (!resp.ok) {
-    let detail = `请求失败 (${resp.status})`;
-    try {
-      detail = (await resp.json()).detail ?? detail;
-    } catch {
-      /* keep */
-    }
-    throw new ApiError(resp.status, detail);
+    throw await interpretError(resp);
   }
   await streamSSE(resp, onDelta);
 }

@@ -82,7 +82,7 @@ export default function KeysPage() {
       {error && <div className="toast error">{error}</div>}
 
       <section className="keys-card">
-        <h2>用量（近 30 天）</h2>
+        <h2>用量（近 30 天 · 已结算）</h2>
         {usage ? (
           usage.total_requests === 0 ? (
             <p className="empty">还没有任何调用记录</p>
