@@ -437,6 +437,12 @@ export default function ChatPage() {
             </svg>
             <span>密钥与用量</span>
           </Link>
+          {me.role === "admin" && (
+            <Link href="/models" className="sidebar-link">
+              <IconGear size={15} />
+              <span>模型管理</span>
+            </Link>
+          )}
         </footer>
       </aside>
 

@@ -265,6 +265,7 @@ export const platformApi = {
   updateMe: (body: { display_name?: string; new_password?: string; current_password?: string }) =>
     api<User>("/api/v1/auth/me", { method: "PATCH", body: JSON.stringify(body) }),
   usage: (days = 30) => api<Usage>(`/api/v1/me/usage?days=${days}`),
+  wallet: () => api<{ balance: number; lifetime_topup: number }>("/api/v1/me/wallet"),
   personas: () => api<Persona[]>("/api/v1/personas"),
   createPersona: (body: Record<string, unknown>) =>
     api<Persona>("/api/v1/personas", { method: "POST", body: JSON.stringify(body) }),

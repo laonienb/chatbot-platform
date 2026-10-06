@@ -7,6 +7,7 @@ import { platformApi, type ApiKey, type ApiKeyCreated, type Usage } from "@/lib/
 export default function KeysPage() {
   const [keys, setKeys] = useState<ApiKey[]>([]);
   const [usage, setUsage] = useState<Usage | null>(null);
+  const [wallet, setWallet] = useState<{ balance: number; lifetime_topup: number } | null>(null);
   const [name, setName] = useState("");
   const [whitelist, setWhitelist] = useState("");
   const [created, setCreated] = useState<ApiKeyCreated | null>(null);
@@ -16,9 +17,10 @@ export default function KeysPage() {
 
   const load = useCallback(async () => {
     try {
-      const [ks, us] = await Promise.all([platformApi.keys(), platformApi.usage(30)]);
+      const [ks, us, w] = await Promise.all([platformApi.keys(), platformApi.usage(30), platformApi.wallet()]);
       setKeys(ks);
       setUsage(us);
+      setWallet(w);
     } catch (err) {
       setError(err instanceof Error ? err.message : "加载失败");
     }
@@ -80,6 +82,24 @@ export default function KeysPage() {
       </header>
 
       {error && <div className="toast error">{error}</div>}
+
+      <section className="keys-card wallet-card">
+        <h2>积分余额</h2>
+        {wallet ? (
+          <div className="wallet-row">
+            <div>
+              <strong className="wallet-balance">{wallet.balance.toLocaleString("zh-CN")}</strong>
+              <small>积分</small>
+            </div>
+            <div className="wallet-sub">
+              <small>累计充值 {wallet.lifetime_topup.toLocaleString("zh-CN")}</small>
+              <small>对话按 token 实时扣减，余额不足时对话将被拒绝（402）</small>
+            </div>
+          </div>
+        ) : (
+          <p className="empty">加载中…</p>
+        )}
+      </section>
 
       <section className="keys-card">
         <h2>用量（近 30 天 · 已结算）</h2>

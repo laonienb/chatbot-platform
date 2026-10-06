@@ -589,6 +589,130 @@ a {
 .conv-pin .pinned {
   color: var(--accent-hover);
 }
+
+/* ---------- 积分余额卡片 ---------- */
+
+.wallet-row {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.wallet-balance {
+  font-size: 34px;
+  font-weight: 700;
+  background: var(--grad-accent);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  margin-right: 6px;
+}
+.wallet-row > div:first-child small {
+  color: var(--text-dim);
+}
+.wallet-sub {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  align-items: flex-end;
+  text-align: right;
+}
+.wallet-sub small {
+  color: var(--text-faint);
+  font-size: 12px;
+}
+
+/* ---------- 模型管理 ---------- */
+
+.model-create .field-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.check-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  cursor: pointer;
+}
+.check-row input {
+  width: auto;
+  accent-color: var(--accent);
+}
+.model-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.model-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: rgba(22, 26, 36, 0.5);
+  transition: all var(--t) var(--ease);
+}
+.model-row:hover {
+  border-color: rgba(120, 136, 255, 0.35);
+}
+.model-row.disabled {
+  opacity: 0.55;
+}
+.model-row-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.model-row-main strong {
+  font-size: 14px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.model-row-main code {
+  font-size: 12.5px;
+  color: var(--accent-hover);
+  font-family: ui-monospace, Consolas, monospace;
+}
+.model-row-main small {
+  color: var(--text-faint);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.model-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+.tag.default {
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+  font-weight: 600;
+}
+.tag.off {
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: rgba(240, 91, 98, 0.12);
+  color: var(--danger);
+}
+.hint {
+  color: var(--text-faint);
+  font-size: 12.5px;
+  margin: 12px 0 0;
+}
 .conv-title {
   flex: 1;
   white-space: nowrap;
