@@ -79,7 +79,7 @@ cp .env.example .env
 # 起服务（http://127.0.0.1:8000，文档在 /docs）
 .venv/Scripts/uvicorn app.main:app --reload
 
-# 跑测试（101 个用例，每测独立临时 SQLite，不依赖 .env）
+# 跑测试（104 个用例，每测独立临时 SQLite，不依赖 .env）
 .venv/Scripts/pytest
 ```
 

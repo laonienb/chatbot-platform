@@ -1,9 +1,9 @@
 ---
 feature: billing-wiring
-status: done
+status: delivered
 updated: 2026-10-06
 branch: main
-commits: ce5e2d2, d7a132c, 2b0135d, d8bd939
+commits: ef4316e..0d145aa
 ---
 
 # 计费接线：准入、钱包扣费、对账与监控落地
@@ -11,6 +11,38 @@ commits: ce5e2d2, d7a132c, 2b0135d, d8bd939
 > Workspace override：用户明确选择**就地在 main** 完成（不建 .worktrees）。
 
 ## Report
+
+**What was built** — 计费系统从"地基"变成"通电"：两条对话链路在响应开始前做准入
+（月度配额 429、积分余额 402，原生面 `{"detail"}`、兼容面 OpenAI 错误格式，零副作用）；
+`settle_usage` 成为唯一结算收口，结算即扣钱包（credit 币种守卫、`usage_log_id` 唯一约束 +
+savepoint 幂等、余额不足部分支付归零并标 needs_review）；注册发放 1000 积分、迁移对存量
+用户补发；lifespan 对账循环收编残留 pending 并对负毛利告警，管理端提供
+`/admin/billing/margin` 与 `/reconcile`。评审发现的 critical/major 全部修复：regen 改
+每次调用独立计行、quota=0 语义、断流 `CancelScope(shield)` 结算、compat 幂等 10 分钟
+桶窗、毛利监控按 `credit_to_usd` 换算。测试夹具由 StaticPool 单连接改为每测独立文件
+SQLite，消除了记忆提取后台任务与请求会话共享连接导致的 ~50% 抖动（根因：请求收尾
+rollback 会吞掉后台任务未提交的 INSERT）。协作 agent 并行补了 `/me/usage` 终态口径、
+persona 计价短路与 litellm 导入顺序约束（S4），已集成并在 AGENTS.md「三」通告。
+
+**Verification** — `server/.venv/Scripts/python -m pytest -q` → **104 passed**
+（0d145aa 后最终新鲜运行；此前 92→101→104 随用例增加）；原抖动测试连续 10 次 0 失败、
+全量多轮一致；CI 口径迁移循环 upgrade→downgrade→upgrade 两轮 PASS；dev.db
+head=`c2b3d4e5f6a7`、`uq_wallet_entries_usage_log` 在、4 存量用户 ×1000 补发且
+流水和==余额。两轮独立评审：首轮 REQUEST_CHANGES（1 critical + 4 major）→ 修复后
+复审 **APPROVE**（7/7 修复有效、T7 验收 6/6、必须修清单为空）。
+
+**Journey log** —
+1. 记忆提取测试 50% 抖动：先用 stash 对照证明是基线问题，再靠"任务报 committed 但
+   count=0"的插桩定位到 StaticPool 共享连接被请求收尾 rollback 吞写入 —— 修测试环境
+   而非生产代码。
+2. 断流结算在 anyio 取消作用域下每个 await 都会再抛，靠 `CancelScope(shield=True)` 保证
+   settle 落库；普通 asyncio cancel 测试不足以覆盖，需 shield + 专属回归测试。
+3. 幂等键设计的两个反直觉坑：会话级 regen 键会让重复生成永久免单；无时间窗的 body
+   指纹同理 —— 幂等必须绑定"一次意图"，窗口/uuid 就是意图边界。
+4. credit 与 USD 两种口径不能直接相减：毛利监控统一经 `credit_to_usd`（默认 1 保持
+   数值兼容），修复用"反证换算率"测试锁定。
+5. 多 agent 同仓协作：对方分钟级写入我方目录时先向用户求证再集成；对方按 spec 分类
+   提交并补测试，最终按 AGENTS.md 协议互发通告 —— 集成成本远低于各写各的分叉。
 
 ## [S1] Problem
 
@@ -117,6 +149,7 @@ commits: ce5e2d2, d7a132c, 2b0135d, d8bd939
       该类实际在 `app.billing.wallet` —— 此前未真正跑过该用例）。
       遗留 2 个 `PytestUnhandledThreadExceptionWarning`（Event loop is closed）：
       已归属为既有夹具问题（排除新增用例后仍复现），非本轮引入。
+      最终（0d145aa 后）：**104 passed**，新鲜全量运行。
 - [x] T5: 更新进度文档 — acceptance: DESIGN §11.1 与 README 的计费进度反映"接线完成"现状 (covers: S1; S2)
 - [x] T6: 分主题提交 — acceptance: 工作区干净；至少区分计费接线 / 测试夹具修复 / 文档三类提交 (covers: S2; depends: T1, T2, T3, T4, T5)
       实测：ce5e2d2 计费地基 / d7a132c 计费接线 / 2b0135d 测试夹具 / d8bd939 T7 验收测试
