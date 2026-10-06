@@ -115,10 +115,13 @@ GET    /api/v1/conversations/{id}/messages  # 翻历史
 用量与管理：
 
 ```
-GET  /api/v1/me/usage                       # 我的 token 消耗
+GET  /api/v1/me/usage                       # 我的 token 消耗（仅终态账行）
+GET  /api/v1/me/wallet                      # 我的积分余额（balance / lifetime_topup）
 GET  /api/v1/me/keys                        # 管理 API Key（生成/吊销）
 GET  /api/v1/admin/users                    # 管理员：用户管理
 GET  /api/v1/admin/stats                    # 管理员：全站用量/成本
+GET  /api/v1/admin/billing/margin           # 管理员：毛利汇总与负毛利明细
+POST /api/v1/admin/billing/reconcile        # 管理员：手动触发对账收编
 ```
 
 **流式协议**：SSE，数据块格式直接复用 OpenAI 的 chunk 格式（`data: {"choices":[{"delta":{"content":"..."}}]}\n\n`，以 `data: [DONE]` 结束）。第一方客户端与兼容层同构，客户端解析代码可复用；小程序用 `enableChunked: true` + `onChunkReceived` 消费同一格式。
