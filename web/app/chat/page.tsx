@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
+import { createPortal } from "react-dom";
 import Markdown from "@/components/Markdown";
 import {
   clearTokens,
@@ -16,12 +17,15 @@ import {
   type Persona,
   type User,
 } from "@/lib/api";
+import { downloadText, fetchAllMessages, safeFilename, toJson, toMarkdown } from "@/lib/export";
+import { applyTheme, getTheme, type Theme } from "@/lib/theme";
 import MemoryModal from "@/components/MemoryModal";
 import Select from "@/components/Select";
 import Avatar from "@/components/Avatar";
 import {
   IconBrain,
   IconCopy,
+  IconDownload,
   IconGear,
   IconMenu,
   IconPencil,
@@ -59,6 +63,11 @@ export default function ChatPage() {
   const [showSettings, setShowSettings] = useState(false);
   const [memoryModalFor, setMemoryModalFor] = useState<Persona | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [exportOpen, setExportOpen] = useState(false);
+  const [exportBusy, setExportBusy] = useState(false);
+  const [exportPos, setExportPos] = useState<{ left: number; top: number } | null>(null);
+  const exportBtnRef = useRef<HTMLButtonElement>(null);
+  const exportRootRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -92,6 +101,28 @@ export default function ChatPage() {
     }
     loadData();
   }, [loadData, router]);
+
+  // 导出菜单打开期间：点击外部 / 滚动 / 缩放 / Esc 关闭（面板 portal 到 body，与 Select 同策略）
+  useEffect(() => {
+    if (!exportOpen) return;
+    const onDown = (e: MouseEvent) => {
+      const t = e.target;
+      if (t instanceof Element && t.closest(".export-pop")) return;
+      if (!exportRootRef.current?.contains(t as Node)) setExportOpen(false);
+    };
+    const close = () => setExportOpen(false);
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setExportOpen(false);
+    window.addEventListener("mousedown", onDown);
+    window.addEventListener("scroll", close, true);
+    window.addEventListener("resize", close);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", onDown);
+      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("resize", close);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [exportOpen]);
 
   const openConversation = useCallback(
     async (id: string) => {
@@ -165,6 +196,30 @@ export default function ChatPage() {
 
   function stopStreaming() {
     abortRef.current?.abort();
+  }
+
+  /** 导出当前会话全量记录：分页拉完 → 组装 → 浏览器下载。 */
+  async function exportConversation(format: "md" | "json") {
+    if (!activeConv || exportBusy) return;
+    setExportOpen(false);
+    setExportBusy(true);
+    setError(null);
+    try {
+      const all = await fetchAllMessages(activeConv.id);
+      const persona = personaOf(activeConv.persona_id);
+      const title = activeConv.title ?? persona?.name ?? "会话";
+      const stamp = new Date().toISOString().slice(0, 10);
+      const base = `${safeFilename(title)}_${stamp}`;
+      if (format === "md") {
+        downloadText(`${base}.md`, toMarkdown(activeConv, persona, all), "text/markdown");
+      } else {
+        downloadText(`${base}.json`, toJson(activeConv, persona, all), "application/json");
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "导出失败");
+    } finally {
+      setExportBusy(false);
+    }
   }
 
   async function send() {
@@ -476,6 +531,40 @@ export default function ChatPage() {
                   <IconBrain />
                 </button>
               )}
+              <div ref={exportRootRef} className="export-wrap">
+                <button
+                  ref={exportBtnRef}
+                  className="icon-btn"
+                  title="导出聊天记录"
+                  aria-haspopup="menu"
+                  aria-expanded={exportOpen}
+                  disabled={exportBusy}
+                  onClick={() => {
+                    if (exportOpen) {
+                      setExportOpen(false);
+                      return;
+                    }
+                    const r = exportBtnRef.current!.getBoundingClientRect();
+                    setExportPos({ left: Math.max(8, r.right - 180), top: r.bottom + 6 });
+                    setExportOpen(true);
+                  }}
+                >
+                  <IconDownload />
+                </button>
+                {exportOpen &&
+                  exportPos &&
+                  createPortal(
+                    <div className="export-pop" role="menu" style={{ left: exportPos.left, top: exportPos.top }}>
+                      <button role="menuitem" onClick={() => exportConversation("md")}>
+                        导出为 Markdown
+                      </button>
+                      <button role="menuitem" onClick={() => exportConversation("json")}>
+                        导出为 JSON
+                      </button>
+                    </div>,
+                    document.body
+                  )}
+              </div>
               <Select
                 className="model-select"
                 ariaLabel="切换本会话使用的模型"
@@ -803,9 +892,14 @@ function SettingsModal({
   const [displayName, setDisplayName] = useState(me.display_name ?? "");
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
+  const [theme, setTheme] = useState<Theme>("dark");
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
   const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    setTheme(getTheme());
+  }, []);
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -836,6 +930,33 @@ function SettingsModal({
         <label>
           昵称
           <input value={displayName} onChange={(e) => setDisplayName(e.target.value)} placeholder="显示名称" />
+        </label>
+        <label>
+          外观
+          <div className="theme-switch" role="group" aria-label="主题外观">
+            <button
+              type="button"
+              className={theme === "dark" ? "on" : ""}
+              aria-pressed={theme === "dark"}
+              onClick={() => {
+                setTheme("dark");
+                applyTheme("dark");
+              }}
+            >
+              深色
+            </button>
+            <button
+              type="button"
+              className={theme === "light" ? "on" : ""}
+              aria-pressed={theme === "light"}
+              onClick={() => {
+                setTheme("light");
+                applyTheme("light");
+              }}
+            >
+              浅色
+            </button>
+          </div>
         </label>
         <div className="field-row">
           <label>

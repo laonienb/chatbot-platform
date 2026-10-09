@@ -7,6 +7,8 @@ import Avatar from "@/components/Avatar";
 
 export default function MarketPage() {
   const [all, setAll] = useState<MarketPersona[]>([]);
+  // 全量快照：chips 分类统计始终基于它，不随搜索/过滤收缩
+  const [base, setBase] = useState<MarketPersona[]>([]);
   const [meId, setMeId] = useState<string | null>(null);
   const [activeTag, setActiveTag] = useState<string | null>(null);
   const [search, setSearch] = useState("");
@@ -22,6 +24,7 @@ export default function MarketPage() {
     try {
       const [me, ps] = await Promise.all([platformApi.me(), platformApi.market()]);
       setMeId(me.id);
+      setBase(ps);
       setAll(ps);
     } catch (err) {
       setError(err instanceof Error ? err.message : "加载失败");
@@ -53,9 +56,9 @@ export default function MarketPage() {
 
   const tags = useMemo(() => {
     const counts = new Map<string, number>();
-    for (const p of all) for (const t of p.tags ?? []) counts.set(t, (counts.get(t) ?? 0) + 1);
+    for (const p of base) for (const t of p.tags ?? []) counts.set(t, (counts.get(t) ?? 0) + 1);
     return [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([t]) => t);
-  }, [all]);
+  }, [base]);
 
   async function submitSearch(e: React.FormEvent) {
     e.preventDefault();

@@ -279,6 +279,46 @@ select option {
   padding-left: 14px;
   color: var(--accent-hover);
 }
+
+/* 导出菜单（chat 头部下载按钮）：portal 到 body 的固定定位小面板 */
+.export-pop {
+  position: fixed;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 180px;
+  padding: 6px;
+  background: var(--bg-panel-solid);
+  border: 1px solid var(--border-strong);
+  border-radius: 14px;
+  box-shadow: var(--shadow-lg);
+  animation: select-pop-in 0.18s var(--ease);
+}
+.export-pop button {
+  width: 100%;
+  text-align: left;
+  padding: 8px 12px;
+  border: none;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.2s var(--ease);
+}
+.export-pop button:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+.export-pop button:active:not(:disabled) {
+  transform: none;
+}
+.export-wrap {
+  position: relative;
+  display: inline-flex;
+}
+
 input::placeholder,
 textarea::placeholder {
   color: var(--text-faint);
@@ -1514,3 +1554,117 @@ button.stop {
     grid-template-columns: 1fr;
   }
 }
+
+/* ---------- 外观切换（账号设置 → 深色/浅色） ---------- */
+.theme-switch {
+  display: flex;
+  gap: 6px;
+}
+.theme-switch button {
+  flex: 1;
+  padding: 7px 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-dim);
+}
+.theme-switch button.on {
+  background: var(--grad-accent);
+  border-color: transparent;
+  color: #fff;
+  font-weight: 600;
+}
+
+/* ============================================================
+   浅色主题（data-theme="light"）
+   结构：先整套覆盖 CSS 变量，再定点覆盖少数硬编码深色的位置
+   （inputs / 面板 / code 块等——它们没走变量，直接改量会漏）。
+   切换入口：账号设置 → 外观；持久化在 localStorage cp_theme，
+   首屏由 layout.tsx 内联脚本提前应用，避免闪黑。
+   ============================================================ */
+
+html[data-theme="light"] {
+  color-scheme: light;
+
+  --bg: #f2f4fa;
+  --bg-panel: rgba(255, 255, 255, 0.86);
+  --bg-panel-solid: #ffffff;
+  --bg-elevated: #edf0f8;
+  --bg-hover: rgba(90, 105, 235, 0.08);
+  --bg-active: rgba(90, 105, 235, 0.14);
+
+  --border: rgba(45, 55, 90, 0.14);
+  --border-strong: rgba(45, 55, 90, 0.26);
+
+  --text: #1b2133;
+  --text-dim: #58617a;
+  --text-faint: #939bb0;
+
+  --accent: #4f5ee6;
+  --accent-hover: #3f4ed8;
+  --accent-soft: rgba(85, 100, 230, 0.12);
+  --grad-accent: linear-gradient(135deg, #5566e8, #8b5cf0);
+
+  --user-bubble: linear-gradient(135deg, #4e63e8, #6b5be0);
+  --assistant-bubble: rgba(255, 255, 255, 0.92);
+
+  --shadow-lg: 0 18px 50px rgba(30, 40, 80, 0.16);
+  --shadow-md: 0 8px 28px rgba(30, 40, 80, 0.12);
+  --shadow-sm: 0 2px 10px rgba(30, 40, 80, 0.08);
+}
+
+/* 深空柔光 → 浅色下的淡彩晕染（同位置、更低浓度） */
+html[data-theme="light"] body::before {
+  background:
+    radial-gradient(900px 500px at 12% -8%, rgba(100, 116, 240, 0.10), transparent 60%),
+    radial-gradient(800px 520px at 95% 8%, rgba(154, 108, 245, 0.07), transparent 60%),
+    radial-gradient(700px 500px at 55% 110%, rgba(63, 207, 142, 0.05), transparent 60%);
+}
+
+/* 滚动条：深色值在浅底上几乎不可见 */
+html[data-theme="light"] ::-webkit-scrollbar-thumb {
+  background: rgba(45, 55, 90, 0.28);
+}
+html[data-theme="light"] ::-webkit-scrollbar-thumb:hover {
+  background: rgba(45, 55, 90, 0.45);
+}
+
+/* 输入类控件：原本 rgba(10,13,20,.55) 深色实底 */
+html[data-theme="light"] input,
+html[data-theme="light"] textarea,
+html[data-theme="light"] select {
+  background: rgba(255, 255, 255, 0.85);
+}
+html[data-theme="light"] .select-trigger {
+  background-color: rgba(255, 255, 255, 0.85);
+}
+html[data-theme="light"] .auth-tabs {
+  background: rgba(20, 26, 50, 0.06);
+}
+
+/* 结构面板/行 */
+html[data-theme="light"] .model-row {
+  background: rgba(255, 255, 255, 0.75);
+}
+html[data-theme="light"] .sidebar-link {
+  background: rgba(255, 255, 255, 0.65);
+}
+html[data-theme="light"] .chat-header,
+html[data-theme="light"] .composer {
+  background: rgba(255, 255, 255, 0.78);
+}
+html[data-theme="light"] .memory-item {
+  background: rgba(255, 255, 255, 0.7);
+}
+
+/* 代码底色：黑底 → 浅灰底 */
+html[data-theme="light"] .md-body code {
+  background: rgba(20, 26, 50, 0.08);
+}
+html[data-theme="light"] .md-body pre {
+  background: rgba(20, 26, 50, 0.06);
+}
+html[data-theme="light"] .key-row code,
+html[data-theme="light"] .keys-table code {
+  background: rgba(20, 26, 50, 0.08);
+}
+
