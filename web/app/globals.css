@@ -1704,7 +1704,6 @@ html[data-theme="light"] {
   --grad-accent: linear-gradient(135deg, #5566e8, #8b5cf0);
   --grad-accent-solid: linear-gradient(135deg, #5566e8, #8655ef);
   --grad-accent-solid-hover: linear-gradient(135deg, #4b5de7, #7c47ee);
-  --grad-accent-solid: linear-gradient(135deg, #5566e8, #8655ef);
 
   --user-bubble: linear-gradient(135deg, #4e63e8, #6b5be0);
   --assistant-bubble: rgba(255, 255, 255, 0.92);

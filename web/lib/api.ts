@@ -454,6 +454,12 @@ const MAX_AUTO_BACKOFF_SECONDS = 60;
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
+    // 已经 abort 的 signal 不会再发第二次 "abort" 事件，所以必须先查当前状态：
+    // 只挂监听会让"用户在退避等待期间点停止"变成"白等满 60 秒，然后照样重发一次"。
+    if (signal?.aborted) {
+      reject(new DOMException("Aborted", "AbortError"));
+      return;
+    }
     const onAbort = () => {
       clearTimeout(timer);
       reject(new DOMException("Aborted", "AbortError"));

@@ -1,0 +1,4 @@
+# 构建产物与生成物不审计（.next 里是编译出来的 JS，报出来的都是工具自己的噪音）
+.next/
+node_modules/
+next-env.d.ts

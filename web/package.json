@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint",
+    "lint": "eslint . --ext .js,.jsx,.mjs,.cjs,.ts,.tsx",
+    "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test \"tests/**/*.test.mjs\"",
     "typecheck": "tsc --noEmit",
     "audit:contrast": "node scripts/contrast-audit.mjs"
   },
@@ -21,6 +22,8 @@
     "@types/node": "^22.0.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
+    "eslint": "^8.57.1",
+    "eslint-config-next": "^15.5.27",
     "typescript": "^5.6.0"
   }
 }
