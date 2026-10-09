@@ -27,6 +27,7 @@ import {
   IconCopy,
   IconDownload,
   IconGear,
+  IconGauge,
   IconMenu,
   IconPencil,
   IconPin,
@@ -492,6 +493,12 @@ export default function ChatPage() {
             </svg>
             <span>密钥与用量</span>
           </Link>
+          {me.role === "admin" && (
+            <Link href="/admin" className="sidebar-link">
+              <IconGauge size={15} />
+              <span>管理后台</span>
+            </Link>
+          )}
           {me.role === "admin" && (
             <Link href="/models" className="sidebar-link">
               <IconGear size={15} />

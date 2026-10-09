@@ -239,6 +239,28 @@ export interface AdminModelCreate {
   sort?: number;
 }
 
+/** 负毛利明细行。cost_billed 是积分、cost_upstream 是 USD，两者不可直接相减。 */
+export interface MarginViolationRow {
+  id: string;
+  user_id: string;
+  model: string | null;
+  cost_billed: number;
+  cost_upstream: number;
+  created_at: string | null;
+}
+
+export interface MarginSummary {
+  requests: number;
+  violations: number;
+  billed_total: number;
+  revenue_usd: number;
+  upstream_total: number;
+  margin: number;
+  /** 上游成本为 0 时后端返回 null（无分母），不可当 0 渲染。 */
+  margin_ratio: number | null;
+  violations_detail: MarginViolationRow[];
+}
+
 // ---------- 业务封装 ----------
 
 export const authApi = {
@@ -296,6 +318,10 @@ export const platformApi = {
   updateModel: (id: string, body: Record<string, unknown>) =>
     api<LlmModel>(`/api/v1/admin/models/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   deleteModel: (id: string) => api<void>(`/api/v1/admin/models/${id}`, { method: "DELETE" }),
+  adminMargin: (limit = 20) =>
+    api<MarginSummary>(`/api/v1/admin/billing/margin?limit=${encodeURIComponent(String(limit))}`),
+  adminReconcile: () =>
+    api<{ abandoned: number }>("/api/v1/admin/billing/reconcile", { method: "POST" }),
   forkPersona: (id: string) => api<Persona>(`/api/v1/personas/${id}/fork`, { method: "POST" }),
   memories: (personaId: string) => api<Memory[]>(`/api/v1/personas/${personaId}/memories`),
   addMemory: (personaId: string, content: string) =>

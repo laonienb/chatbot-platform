@@ -117,3 +117,12 @@ export function IconDownload({ size = 15, className }: P) {
     </svg>
   );
 }
+
+export function IconGauge({ size = 15, className }: P) {
+  return (
+    <svg {...base(size)} className={className}>
+      <path d="m12 14 4-4" />
+      <path d="M3.34 19a10 10 0 1 1 17.32 0" />
+    </svg>
+  );
+}
