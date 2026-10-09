@@ -27,6 +27,14 @@
   --accent-hover: #7686ff;
   --accent-soft: rgba(100, 116, 240, 0.14);
   --grad-accent: linear-gradient(135deg, #6474f0, #9a6cf5);
+  /* 同一条渐变的两种用途必须分开：上面那条是「渐变当文字墨色」（background-clip:text，
+     压暗会让字更闷），下面这条是「渐变承载白字」——色标按 WCAG 1.4.3 压到最差端仍 ≥4.5:1。
+     混用一个令牌时，改哪头都会伤另一头。 */
+  --grad-accent-solid: linear-gradient(135deg, #5567ef, #8852f3);
+  --grad-accent-solid-hover: linear-gradient(135deg, #485bed, #8046f2);
+  /* 亮色渐变底上的墨色：#fff 在首字母头像的 8 条人名哈希渐变里最差只有 1.53:1，
+     换成深墨后 8 条全部达标。 */
+  --gradient-ink: #0b0e16;
 
   /* 语义色 */
   --danger: #f05b62;
@@ -123,15 +131,19 @@ button:active:not(:disabled) {
   transition-duration: 0.08s;
 }
 button.primary {
-  background: var(--grad-accent);
+  background: var(--grad-accent-solid);
   border: none;
   color: #fff;
   font-weight: 600;
   box-shadow: 0 4px 16px rgba(100, 116, 240, 0.35);
 }
+/* 两条都得写：通用 button:hover:not(:disabled) 的特异性 (0,2,1) 高于 button.primary
+   (0,1,1)，会把渐变底换成半透明 --bg-hover —— 悬停时白字直接压在页面底色上。
+   hover 反馈改用「更深的渐变」而不是原来的 filter: brightness(1.08)：filter 会连文字
+   一起缩放，白字被压暗后比值不升反降（实测 4.6 → 4.4，掉到 4.5 线下）。 */
 button.primary:hover:not(:disabled) {
+  background: var(--grad-accent-solid-hover);
   box-shadow: 0 6px 22px rgba(100, 116, 240, 0.5);
-  filter: brightness(1.08);
 }
 button.primary:disabled {
   opacity: 0.45;
@@ -459,7 +471,9 @@ a {
   min-width: 36px;
   border-radius: 12px;
   background: var(--grad-accent);
-  color: #fff;
+  /* 首字母头像的底由 Avatar.tsx 按名字哈希从 8 条亮渐变里取，白字最差只有 1.53:1；
+     深墨在同一批底色上最差 4.87:1（第 5 条的紫色端点已在组件侧提亮）。 */
+  color: var(--gradient-ink);
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -1459,10 +1473,15 @@ a.copy-btn {
   color: var(--text);
 }
 .chip.active {
-  background: var(--grad-accent);
+  background: var(--grad-accent-solid);
   border: none;
   color: #fff;
   box-shadow: 0 3px 12px rgba(100, 116, 240, 0.35);
+}
+/* 同 button.primary：不写这条，悬停会被通用 button:hover 换成半透明底，白字失效 */
+.chip.active:hover {
+  background: var(--grad-accent-solid);
+  color: #fff;
 }
 .market-empty {
   text-align: center;
@@ -1525,7 +1544,10 @@ a.copy-btn {
   transition: all var(--t) var(--ease);
 }
 .tag.link:hover {
-  filter: brightness(1.3);
+  /* 原来是 filter: brightness(1.3)。filter 会把白底截断在 255 却把字提亮，浅色主题下
+     --accent-hover(#3f4ed8) 的比值从达标被拉到 4.49 —— 提亮一个本来就偏亮的字，方向就错了。
+     链接类元素用下划线给可点反馈，不碰取色。 */
+  text-decoration: underline;
 }
 .tag.mine {
   background: rgba(63, 207, 142, 0.14);
@@ -1641,10 +1663,14 @@ a.copy-btn {
   color: var(--text-dim);
 }
 .theme-switch button.on {
-  background: var(--grad-accent);
+  background: var(--grad-accent-solid);
   border-color: transparent;
   color: #fff;
   font-weight: 600;
+}
+.theme-switch button.on:hover {
+  background: var(--grad-accent-solid);
+  color: #fff;
 }
 
 /* ============================================================
@@ -1676,6 +1702,9 @@ html[data-theme="light"] {
   --accent-hover: #3f4ed8;
   --accent-soft: rgba(85, 100, 230, 0.12);
   --grad-accent: linear-gradient(135deg, #5566e8, #8b5cf0);
+  --grad-accent-solid: linear-gradient(135deg, #5566e8, #8655ef);
+  --grad-accent-solid-hover: linear-gradient(135deg, #4b5de7, #7c47ee);
+  --grad-accent-solid: linear-gradient(135deg, #5566e8, #8655ef);
 
   --user-bubble: linear-gradient(135deg, #4e63e8, #6b5be0);
   --assistant-bubble: rgba(255, 255, 255, 0.92);

@@ -5,6 +5,8 @@ import { useEffect, useState } from "react";
 /**
  * 头像：三层降级 —— 图片 URL → emoji（直接存在 avatar_url 里的非 URL 字符串）→ 首字母渐变。
  * 渐变颜色由名字哈希决定，同名同色、异名大概率异色。
+ * ⚠️ 底色承载首字母文字（`.avatar` 用 --gradient-ink 深墨），色标不能随意改亮：
+ * 深墨在这批底色上最差需 ≥4.5:1，第 5 条的紫色端点因此从 #7a5cf0 提到 #8164f1（4.63）。
  */
 
 function hashName(name: string): number {
@@ -18,7 +20,7 @@ const GRADIENTS = [
   "linear-gradient(135deg, #e8618c, #f08a5d)",
   "linear-gradient(135deg, #22b8a6, #4e8fe8)",
   "linear-gradient(135deg, #f0784a, #e8b64e)",
-  "linear-gradient(135deg, #7a5cf0, #4ecf8e)",
+  "linear-gradient(135deg, #8164f1, #4ecf8e)",
   "linear-gradient(135deg, #4a8af0, #22c1dc)",
   "linear-gradient(135deg, #e85d5d, #e85dcf)",
   "linear-gradient(135deg, #5d9ce8, #5de8c0)",
