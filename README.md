@@ -121,7 +121,7 @@ npm install
 npm run dev     # http://localhost:3000
 ```
 
-功能：登录注册（JWT 自动刷新）、聊天（流式/停止/重新生成/模型切换/记忆管理）、人设市场、密钥与用量。
+功能：登录注册（JWT 自动刷新）、聊天（流式/停止/重新生成/模型切换/记忆管理/记录导出 Markdown·JSON）、人设市场、密钥与用量、模型管理（admin）、深浅双主题（账号设置切换，localStorage 持久化）。
 
 前端默认走 Next.js 同源反向代理访问后端（`next.config.mjs` 里的 rewrites，`BACKEND_URL` 可覆盖，默认 `http://127.0.0.1:8000`）——因此局域网内其他设备直接访问 `http://<电脑IP>:3000` 即可，无需配跨域。若前后端分开部署，用 `NEXT_PUBLIC_API_BASE` 指向后端地址。
 
