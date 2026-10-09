@@ -30,10 +30,29 @@ class Settings(BaseSettings):
     refresh_token_expire_days: int = 30
 
     # LLM 网关：mock 用于本地开发/测试（无需任何真实 API Key）
-    llm_backend: str = "mock"  # mock | litellm
+    llm_backend: str = "mock"  # mock | litellm | remote
     llm_default_model: str = "gpt-4o-mini"
     llm_api_key: str = ""  # LiteLLM 后端使用的上游 Key（或由各模型 env 提供）
     llm_base_url: str = ""  # 可选：统一指向自建 LiteLLM 代理
+
+    # 模型服务（S3/S4，契约见 docs/model-service-protocol.md v1）。仅 LLM_BACKEND=remote 时生效。
+    model_service_mode: str = "native"  # proxy | native（协议 §8.3）。默认 native：版本不符即拒启动（红线7）
+    model_service_base_url: str = ""  # 集群内网地址（不暴露公网），如 http://model-service:8000
+    model_service_token: str = ""  # 服务间静态 Bearer（§3）；env 注入，不落库、不进 git
+    model_service_version: int = 1  # X-Model-Service-Version 客户端声明值
+    model_service_timeout_total: float = 120.0  # 平台总超时（§8.1，必须 > 模型服务上游超时）
+    model_service_timeout_connect: float = 5.0  # 建连超时
+    model_service_timeout_first_byte: float = 15.0  # 平台读超时：任一 chunk 间隔（§8.1）
+    # §8.1 流式空闲上限：无**任何**字节（含心跳）超过此时长 → 断开并按 §8.4 降级。
+    # httpx 的 total 超时对流式不适用，故必须显式实现空闲计时（审计缺口 K）。
+    # 必须 > 模型服务上游总超时（60s），满足红线 8「内层 < 外层」。
+    model_service_stream_idle_timeout: float = 90.0
+    # 生产环境守卫（§8.4 尾句 / 红线 9）：APP_ENV=prod 且 LLM_BACKEND=mock → 拒绝启动
+    app_env: str = "dev"  # dev | prod
+    model_service_fallback_direct: str = ""  # §8.4 可选直连降级模型；默认空 = 不降级，直接 503
+    model_service_catalog_sync_seconds: int = 300  # §9 目录同步周期（秒），0 = 关闭定期同步
+    model_service_cb_threshold: int = 5  # §11 熔断：滑动窗口连续 N 次 5xx/连接错 → 打开
+    model_service_cb_reset_seconds: float = 30.0  # 熔断打开后进入半开探测的冷却秒数
 
     # CORS
     cors_origins: str = "http://localhost:3000"

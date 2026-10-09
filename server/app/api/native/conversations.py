@@ -10,6 +10,7 @@ from app.api.deps import CurrentUser, DbSession
 from app.billing.ratelimit import rate_limit_native
 from app.core.sse import SSE_DONE, SSE_HEADERS, format_sse
 from app.llm.gateway import StreamDone
+from app.llm.remote import ModelServiceError
 from app.models import Conversation, Message, Persona
 from app.schemas.conversation import (
     ConversationCreate,
@@ -123,6 +124,8 @@ async def send(
         user_message, assistant_message = await send_message(db, conv, body.content, source="native")
     except HTTPException:
         raise
+    except ModelServiceError:
+        raise  # 交给全局处理器按协议 §7 映射状态码/Retry-After
     except Exception as e:  # 上游 LLM 异常 → 与兼容层对齐的 502（预扣行已在服务层结算为 failed）
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"LLM upstream error: {e}")
     return SendMessageOut(

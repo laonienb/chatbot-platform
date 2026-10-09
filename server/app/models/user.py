@@ -108,6 +108,9 @@ class UsageLog(Base):
     cost_billed: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))  # 用户付的（rate unit）
     currency: Mapped[str | None] = mapped_column(String(3))  # credit / usd / cny
     cost: Mapped[float | None] = mapped_column(Numeric(12, 6))  # 兼容旧字段：= cost_billed
+    # cost_upstream 的来源（协议 §5.1）：service_exact | service_estimated | price_table | none。
+    # 与 metering_source（token 计量来源）是两条独立轴，别混。历史行留 NULL。
+    cost_source: Mapped[str | None] = mapped_column(String(16))
 
     # --- 生命周期状态机 ---
     status: Mapped[str] = mapped_column(String(16), default="pending")  # pending/settled/failed/abandoned

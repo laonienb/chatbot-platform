@@ -2,7 +2,7 @@
 
 | 项 | 值 |
 |---|---|
-| 状态 | **待执行**（本文件是"做什么、怎么算做完"的唯一依据） |
+| 状态 | **平台侧（S4）已按本单执行完毕**（2026-10-09，后端 agent）—— P0-1/P0-2 闭合，P1-1/2/3/4/5 与 P2-1/2/3 平台侧部分全部落地并附用例；**P0-3 仍属 S3，未闭合**（本单整体不得标完成）。逐项回执见各条目的「✅ 后端已完成」 |
 | 出具 | 架构师 agent（2026-10-09） |
 | 依据 | `docs/model-service-protocol.md` **v1.1**（契约）+ §13 审计（偏离清单） |
 | 执行 | 后端 agent（S4 平台侧）+ 模型服务实现方（S3） |
@@ -22,9 +22,9 @@
 
 | 优先级 | 含义 | 项数 | 状态 |
 |---|---|---|---|
-| **P0 阻断** | 不闭合则 S4 验收不通过 | 3 | 全部待实现 |
-| **P1 待办** | 影响正确性/可运维性，应与 S4 同批交付 | 5 | 全部待实现（P1-4 定案已由架构师给出） |
-| **P2 协议缺口** | 已由架构师补入协议，实现按新条款跟进 | 3 | 契约就绪，待实现 |
+| **P0 阻断** | 不闭合则 S4 验收不通过 | 3 | **2 已闭合**（P0-1 契约测试 / P0-2 熔断），**P0-3 属 S3、未闭合** |
+| **P1 待办** | 影响正确性/可运维性，应与 S4 同批交付 | 5 | **平台侧 5 项全部落地**（P1-4 的模型服务侧发 `retryable` 仍属 S3） |
+| **P2 协议缺口** | 已由架构师补入协议，实现按新条款跟进 | 3 | **平台侧 3 项全部落地**（P2-2 的 capabilities 暴露超时属 S3） |
 
 ---
 
@@ -41,6 +41,7 @@
 | **验收标准** | ① 十一条全部有对应用例，**用例名可追溯到 T 编号**；② 每条断言对应协议条款，不是"调通了就算过"；③ `pytest -q` 全绿并报出新增用例数；④ **负面用例必须真会失败**——提交前至少挑 T1/T2 各故意破坏一次，确认测试能红（防止写出永绿的空壳测试） |
 | **阻塞** | 无它则 S4 无法验收；且 P0-2/P0-3 的漏出正是它的缺失所致 |
 | **注意** | T6 需断言"平台断开后桩记录的上游调用 ≤2s 内被中止"——这是红线 6，唯一能验它的手段 |
+| **✅ 后端已完成（2026-10-09）** | 落点 `server/tests/test_model_service_contract.py`（**54 个用例**）+ `server/tests/fake_model_service.py`（桩，含成本/计量/错误/沉默/心跳/幂等/合规/取消追踪共 20+ 可编程开关）。T1–T11 逐条对应：`test_t1_*`(2) / `test_t2_*`(2) / `test_t3_*`(2) / `test_t4_*`(2) / `test_t5_*`(4) / `test_t6_*`(1) / `test_t7_*`(2) / `test_t8_*`(2) / `test_t9_*`(3) / `test_t10_*`(3) / `test_t11_*`(2)，另加 §5.1 成本优先级链 6 条与审计/P1/P2 回归 12 条。<br>验收①✅ 用例名含 T 编号；②✅ 每条断言指向具体条款（docstring 注明）；③✅ 全量 **163 passed**（原 109，新增 54）；④✅ `test_p0_1_negative_cases_actually_fail` —— **不修改源码**，用局部 patch 构造"被破坏的实现"（把 unknown 成本当 0 / token 硬编码 999），断言正确实现下必须失败，证明测试有牙齿（不是永绿空壳）。<br>**真 HTTP 而非 mock transport**：T6 的取消传播只有在真实 TCP 断开时才可验证；为此桩支持 `silence_after_chunks`（发 N 个 chunk 后沉默）与 `keepalive_during_silence`。 |
 
 ### P0-2 熔断覆盖流式路径与超时 🔴
 
@@ -52,6 +53,7 @@
 | **落点** | `server/app/llm/remote.py`（`CircuitBreaker` / `chat_stream`） |
 | **验收标准** | ① 用例：流式连续 N 次 5xx → 熔断打开（**现有代码下此用例必须能捕获失败**，否则等于没测）；② 用例：half_open 下并发 10 个请求，只有 1 个真正发往上游；③ 用例：4xx 连打 10 次**不**打开熔断；④ 超时计入的用例 |
 | **依赖** | 需先有 P0-1 的桩能力（错误注入 + 慢响应） |
+| **✅ 后端已完成（2026-10-09）** | ① `test_audit_a_stream_failures_trip_breaker`（修复前必红：原 `chat_stream` 的 except 只抛不记）；② `test_p0_2_half_open_allows_only_one_of_many_concurrent`（`asyncio.gather` 并发 10 个，断言实际发往上游 == 1）；③ `test_p0_2_fourxx_never_trips_breaker`（400/429 各连打 10 次保持 closed）；④ `test_audit_a_stream_timeout_trips_breaker`（首字节超时也计入）。<br>实现侧：`CircuitBreaker` 改为半开**单探测位**（`_probe_in_flight`，探测成功→closed、失败→立即回 open 并重置冷却）；`chat_stream` 的 `except httpx.HTTPError` 补 `record_failure()`；空闲超时路径亦记失败。计数口径按 §11 修订保持**连续失败**（一次成功清零）。 |
 
 ### P0-3 红线 1「禁止字段出现即 400」实现 🔴
 
@@ -63,6 +65,7 @@
 | **验收标准** | ① 用例：body 含 `user_id` / `conversation_id` / `persona` 各一 → 400 + `code: "invalid_request"`；② 用例：正常 body（含未知扩展字段）**不得**被拒（宽松解析，协议 §4.2）；③ 错误信息说明触发了哪条红线，便于排障 |
 | **阻塞** | 这是全协议最核心的边界铁律（防止"模型服务认识用户"）。S3 侧未实现前，红线 1 只是纸面声明 |
 | **注意** | 校验**只针对列名明确的禁用字段**，不要做成"白名单所有字段"——那会违反宽松解析 |
+| **⚠️ 后端说明（2026-10-09）** | **本项归属不变，仍属 S3 未闭合**：入站校验必须在模型服务实现（平台拦不住别人怎么调它）。<br>但后端已在**平台侧额外加一道出网守卫**作纵深防御：`remote.py` 的 `_guard()` 放在**真正出网处**（`_post` / 流式 `client.stream` 之前），因此**无法被组装流程绕过** —— 初版把守卫放在 `_body()` 内，子类在其后追加字段即可绕过；该缺陷由 `test_audit_c_forbidden_fields_rejected_platform_side` 用「会注入禁字段的子类」捕获，随后把守卫移到出网口才通过。<br>平台侧覆盖的禁字段：`user_id`/`user`/`conversation_id`/`conversation`/`persona`/`persona_id`/`trace`（body 顶层）＋ `messages[*]` 内同名键。另覆盖红线 10（`persona:` 前缀本地即 400）。 |
 
 ---
 
@@ -74,6 +77,7 @@
 - **做什么**：从流式 chunk 中提取 `choices[0].finish_reason`（通常出现在最后一个内容 chunk），填进 `StreamDone`
 - **验收**：用例断言流式结束的 `StreamDone.finish_reason == "stop"`，且账本该字段落库非空
 - **为何重要**：`finish_reason` 是判断"正常结束 vs 被 max_tokens 截断"的唯一依据，恒为 None 使账本失去该归因能力
+- **✅ 后端已完成（2026-10-09）**：流式循环累积 `choices[0].finish_reason` 并带入 `StreamDone`；桩也按真实 OpenAI 语义补了收尾 chunk（`delta:{}` + `finish_reason`）。用例 `test_t4_stream_chunks_usage_and_terminate_event` 断言 `done.finish_reason == "stop"`。
 
 ### P1-2 流式空闲超时（缺口 K）
 
@@ -81,6 +85,7 @@
 - **做什么**：按协议 §8.1 修订版实现**空闲计时**——无任何字节（含心跳）超过 90s 则断开
 - **验收**：① 用例：桩发 3 个 chunk 后永久沉默 → 平台在空闲上限内断开并走 §8.4 降级；② 用例：桩持续发 `: keepalive`（间隔 < 上限）→ 连接**不被**断开
 - **注意**：**不得**依赖 httpx 的 total 超时保护流式（对流式不适用，这正是缺口根因）
+- **✅ 后端已完成（2026-10-09）**：新增 `settings.model_service_stream_idle_timeout`（默认 90s）；`chat_stream` 用 `asyncio.wait_for` 对**每一行**计时，只有协议活动行（注释/事件/data）重置计时，纯空白行不算（防"持续发空行吊住连接"）。用例 `test_p1_2_idle_stream_aborted`（沉默 → 504 `upstream_timeout` + 计入熔断）与 `test_p1_2_keepalive_resets_idle_timer`（心跳期不误杀）。<br>**如实说明一处语义重叠**：平台仍保留 `model_service_timeout_first_byte`（默认 15s）作为 httpx 的 **read 超时**（协议 §8.1 表里的"平台读超时"）。当它小于空闲上限时，它先于看门狗生效；因此空闲看门狗是**覆盖 httpx 行为差异的第二道保险**，而非唯一防线。协议要求的硬约束（**不依赖 total 超时**、显式空闲计时的**沉默**语义、心跳可重置）均已满足。测试中把读超时调大以单独验证看门狗。
 
 ### P1-3 `LLM_BACKEND=mock` 生产守卫（缺口 E）
 
@@ -88,6 +93,7 @@
 - **做什么**：引入环境标识（如 `APP_ENV=dev|prod`），`APP_ENV=prod` 且 `LLM_BACKEND=mock` → **拒绝启动**（协议 §8.4 尾句 / 红线 9）
 - **验收**：① 用例：`APP_ENV=prod` + `LLM_BACKEND=mock` → 启动抛错且信息明确；② 用例：`APP_ENV=dev` + mock → 正常启动
 - **为何重要**：mock 会**假装成功**，是生产环境最危险的降级路径
+- **✅ 后端已完成（2026-10-09）**：`config.py` 新增 `app_env`（默认 `dev`，可 `APP_ENV` 注入）；`main.py` 的 lifespan 开头守卫，`prod` + `mock` → `RuntimeError`（文案含红线 9 与整改指引）。用例 `test_p1_3_prod_with_mock_refuses_startup` / `test_p1_3_dev_with_mock_starts_fine`。
 
 ### P1-4 重试责任划分与 `error.retryable`（缺口 F — 架构师已定案，转实现）
 
@@ -98,13 +104,15 @@
 | **做什么** | ① 模型服务在错误体返回 `error.retryable: bool`（缺省 `false`）；② 平台重试逻辑改为**依据该字段**，不再按状态码判断；③ 平台侧重试必须复用同一 `Idempotency-Key` |
 | **验收标准** | ① 用例：`retryable: true` 的错误 → 平台重试 1 次且**第二次携带相同 `Idempotency-Key`**；② 用例：`retryable: false`（含 `internal_error`）→ 平台**不**重试；③ 用例：字段缺失 → 视为 `false`，不重试；④ 用例：建连失败 → 重试 1 次 |
 | **为何定案为"都不逐请求重试"** | 状态码无法表达"重试是否安全"；`internal_error` 重试同一实例无收益；而**收到响应后**重试会命中 §8.2 幂等窗口，直接返回首次结果，纯属徒增延迟 |
-
+| **✅ 后端已完成（2026-10-09）** | 初版按 v1 的 §7 表实现了"`internal_error` 重试 1 次"——**该实现已被 v1.3 推翻，现已移除**。改为：`_connect_once` 仅在 `httpx.ConnectError`/`ConnectTimeout`（**请求未送达**）时重试 1 次，且复用同一套 headers（`Idempotency-Key` 不变）；收到任何响应（含 500）**一律不重试**。`error.retryable` 已解析进 `ModelServiceError.retryable`。<br>用例：`test_p1_4_no_retry_after_any_http_response`（500 只打 1 次）、`test_p1_4_retryable_field_is_parsed_but_not_retried`、`test_p1_4_retryable_defaults_false`、`test_p1_4_connection_failure_retried_once`。<br>⚠️ **契约内部张力（请架构师裁决）**：§7.1 同时要求"平台**必须**依据 `retryable` 字段决定重试"与"收到任何响应后一律不重试"。两条叠加的实际语义是**该字段不产生重试行为**（目前只作诊断/可观测用途）。后端按"硬规则优先"实现（不重试），并用 `test_p1_4_retryable_field_is_parsed_but_not_retried` 把这一解读钉住，避免后人各自发挥。若架构师意图是"`retryable=true` 时平台仍要重试"，请明示，我改实现。
+| **验证补充** | 建连失败用例让平台指向 `http://127.0.0.1:1`（必然 ECONNREFUSED），并断言真实桩 `upstream_started == 0` —— 证明确实"未送达"而非"慢超时"。 |
 
 ### P1-5 启动自检失败的可读性（缺口 H）
 
 - **归属**：后端 agent ｜ **落点**：`model_service_ops.startup_self_check`
 - **做什么**：连接失败/超时时抛出明确的操作指引（协议版本不符已清晰，但连不上时是裸 `httpx` 异常 → 部署期体验差）
 - **验收**：用例断言 connect 失败时异常信息含"模型服务不可达"与 `MODEL_SERVICE_BASE_URL` 提示
+- **✅ 后端已完成（2026-10-09）**：新增 `_unreachable(path, exc)`，把 `httpx.HTTPError` 换成 `ProtocolVersionError`，文案含"模型服务不可达"、失败路径、`MODEL_SERVICE_BASE_URL` 当前值与三条排查步骤；`fetch_capabilities`/`fetch_models`/proxy 探活三处统一走它。用例 `test_p1_5_unreachable_service_gives_actionable_error` 断言含"模型服务不可达"与 `MODEL_SERVICE_BASE_URL`。
 
 ---
 
@@ -119,12 +127,14 @@
 - **契约硬约束**：**下线永不删除行**（行承载展示名/排序/白名单等运营配置，"临时下架又恢复"不应变成人工重建）
 - **验收**：① 用例：目录少一个 id → 该行 `enabled=False` 且**未被删除**；② 用例：被下线行原为默认 → 默认标记被清除且默认回退到其他启用行；③ 用例：同步**不启用**任何行、**不改**展示名/排序
 - **现状提醒**：当前 `sync_catalog` 只 `add`，不处理消失项
+- **✅ 后端已完成（2026-10-09）**：`sync_catalog` 增加下线方向——上游缺失的**已启用**行标 `enabled=False`（**从不删除**）；若被停用行是默认，则清除其标记并按"其他启用行里优先取原 is_default"回退，写回 `new_default`。返回值扩展为 `{added, disabled, total_upstream, new_default}`。用例：`test_p2_1_disappeared_model_disabled_never_deleted`、`test_p2_1_disabled_default_falls_back`、`test_p2_1_sync_never_enables_rows`。
 
 ### P2-2 超时分层重写（缺口 L，协议 §8.1 重写）
 
 - **归属**：模型服务实现方（暴露能力）+ 后端 agent（读并断言）
 - **做什么**：模型服务在 `/v1/capabilities` 暴露 `timeouts: {"upstream_first_token_s": N, "upstream_total_s": M}`；平台启动自检**断言内层 < 外层**（替代人工读配置）
 - **验收**：① 用例：capabilities 声明内层 ≥ 外层 → 平台**拒绝启动**并说明违反了红线 8；② 用例：正常分层 → 启动通过（即 T11 自动化）
+- **✅ 后端已完成（2026-10-09）**：`startup_self_check` 在 native 模式读取 `caps["timeouts"]`，对 `upstream_total_s` 与 `upstream_first_token_s` 各自断言 `< model_service_stream_idle_timeout`，违反则抛 `ProtocolVersionError`（文案含"红线 8"与整改方向）；字段缺失时跳过（向后兼容 Proxy 期）。用例：`test_p2_2_capabilities_timeout_layering_violation_refuses_startup`、`test_p2_2_capabilities_timeout_layering_ok`。<br>注：形状按协议 §8.1 的 `timeouts` 读取；桩的默认 capabilities 已带该字段。
 
 ### P2-3 `trace.tenant` 的合规约束（协议 §4.2 已有，需实现侧注意）
 
@@ -132,6 +142,7 @@
 - **做什么**：平台发送 `trace.tenant` 时**必须是部署级不透明标签**（环境名/租户池名），**不得**由 `user_id`/`conversation_id` 派生
 - **验收**：代码审查 + 用例断言 `trace.tenant` 不等于任何用户标识（派生即"换名传身份"，违反红线 1）
 - **注**：当前实现的 `_body()` 未发送 `trace`，属可选字段，暂不阻塞
+- **✅ 后端已完成（2026-10-09）**：保持**不发送** `trace`（最小暴露面）；同时把 `trace` 列入出网守卫的禁字段清单——若将来有人从平台侧塞 `trace`，会在出网前 400 失败而不是悄悄带出去。用例 `test_p2_3_no_identity_derived_trace` 断言请求体中无 `trace`。 |
 
 ---
 

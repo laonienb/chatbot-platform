@@ -15,6 +15,7 @@ from app.api.deps import DbSession, get_api_key_principal
 from app.billing.ratelimit import rate_limit_compat
 from app.core.sse import SSE_DONE, SSE_HEADERS, format_sse
 from app.llm.gateway import StreamDone
+from app.llm.remote import ModelServiceError
 from app.models import ApiKey, User
 from app.schemas.openai_compat import (
     ChatCompletionRequest,
@@ -103,7 +104,12 @@ async def chat_completions(
                     if isinstance(piece, StreamDone):
                         continue  # usage 记账已在服务层完成
                     yield format_sse(chunk({"content": piece}))
-            except Exception as e:  # 开流后只能以事件形式报错（遵循 OpenAI 流式行为）
+            except ModelServiceError as e:  # 开流后无法改状态码，以事件透传 code（§7）
+                yield format_sse(
+                    {"error": {"message": e.message, "type": e.err_type, "param": None, "code": e.code}}
+                )
+                return
+            except Exception as e:  # 其余上游异常，遵循 OpenAI 流式行为以事件报错
                 yield format_sse({"error": {"message": f"LLM upstream error: {e}", "type": "api_error", "param": None, "code": None}})
                 return
             yield SSE_DONE
@@ -127,6 +133,8 @@ async def chat_completions(
         return openai_error(
             404, f"The model `{body.model}` does not exist", code="model_not_found"
         )
+    except ModelServiceError:
+        raise  # 交给全局处理器按协议 §7 渲染 OpenAI 错误体（含 code / Retry-After）
     except Exception as e:  # 上游 LLM 网关异常 → OpenAI 风格 502
         return openai_error(502, f"LLM upstream error: {e}", err_type="api_error")
 

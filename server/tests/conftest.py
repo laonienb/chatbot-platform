@@ -4,6 +4,7 @@
 """
 
 import os
+import time
 
 # 必须在导入 app 之前设置：mock LLM 无需真实 Key，隔离的 JWT 密钥
 os.environ.setdefault("LLM_BACKEND", "mock")
@@ -56,6 +57,86 @@ async def client(db_engine):
     async with AsyncClient(transport=transport, base_url="http://testserver") as c:
         yield c
     fastapi_app.dependency_overrides.clear()
+
+
+# ---------------------------------------------------------------- 模型服务（协议 §10 契约测试）
+
+
+def _wait_port(port: int, timeout: float = 10.0) -> None:
+    """轮询到 uvicorn 真正 accept 为止（避免测试抢跑）。"""
+    import socket
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with socket.socket() as s:
+            s.settimeout(0.2)
+            if s.connect_ex(("127.0.0.1", port)) == 0:
+                return
+        time.sleep(0.02)
+    raise RuntimeError(f"fake model-service 未在 {timeout}s 内就绪（端口 {port}）")
+
+
+@pytest.fixture
+def fake_service(request):
+    """启动 fake model-service（真实 uvicorn 线程 + 真实 TCP）。
+
+    用真 HTTP 而非 mock transport：取消传播（协议红线 6 / T6）只有在真实连接上
+    断连才可验证，mock 传输层验不出「平台断开 → 上游被中止」。
+
+    每个测试独立一个 Control（重置场景），测试内可自由改字段切换预设。
+    """
+    import threading
+
+    import uvicorn
+
+    from tests.fake_model_service import Control, build_app
+
+    control = Control()
+    request.node.fake_control = control
+    app = build_app(control)
+
+    config = uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning", lifespan="off")
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, daemon=True, name="fake-model-service")
+    thread.start()
+
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline and not server.started:
+        time.sleep(0.02)
+    if not server.started:
+        raise RuntimeError("fake model-service 启动失败")
+    port = server.servers[0].sockets[0].getsockname()[1]
+    _wait_port(port)
+
+    try:
+        yield control, f"http://127.0.0.1:{port}"
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5)
+
+
+@pytest.fixture
+def remote_mode(fake_service, monkeypatch):
+    """把平台切到 remote 模式并指向 fake 桩，同时重置进程级熔断单例。
+
+    通过改写 get_settings() 单例字段生效（与既有测试的 monkeypatch.setattr(settings, ...)
+    风格一致）；每个测试结束后由 monkeypatch 自动还原。
+    """
+    from app.config import get_settings
+    from app.llm.remote import breaker
+
+    control, base_url = fake_service
+    settings = get_settings()
+    monkeypatch.setattr(settings, "llm_backend", "remote")
+    monkeypatch.setattr(settings, "model_service_base_url", base_url)
+    monkeypatch.setattr(settings, "model_service_token", "test-service-token")
+    monkeypatch.setattr(settings, "model_service_version", 1)
+    monkeypatch.setattr(settings, "model_service_mode", "native")
+    monkeypatch.setattr(settings, "model_service_fallback_direct", "")
+    breaker.reset()
+    yield control, base_url
+    breaker.reset()
+
 
 
 @pytest.fixture

@@ -26,11 +26,15 @@ import asyncio
 import os
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from app.config import get_settings
 from app.core.constants import MEMORY_MARKER
+
+if TYPE_CHECKING:
+    from app.llm.remote import RemoteBackend
 
 
 @dataclass
@@ -45,6 +49,13 @@ class LLMResult:
     finish_reason: str | None = None
     metering_source: str = "provider"  # provider | tiktoken | estimated
     needs_review: bool = False  # 计量不可信 → 计价需复核
+    # 模型服务成本归因（S4，协议 §5）。仅 RemoteBackend 填；mock/litellm 保持 None，
+    # 结算层据 cost_status 走价格表回落。cost_usd 只影响 upstream 一侧，绝不用于扣积分。
+    provider: str | None = None  # 实际供应商 → usage_logs.provider
+    model_used: str | None = None  # 实际调用模型串 → usage_logs.model_upstream
+    cost_usd: Decimal | None = None  # 十进制；不可得为 None，绝不 0（红线2）
+    cost_status: str | None = None  # exact | estimated | unknown
+    fallback_used: bool = False
 
     @property
     def total_tokens(self) -> int:
@@ -63,11 +74,40 @@ class StreamDone:
     finish_reason: str | None = None
     metering_source: str = "provider"
     needs_review: bool = False
+    # 模型服务成本归因（S4，协议 §5/§6），语义同 LLMResult
+    provider: str | None = None
+    model_used: str | None = None
+    cost_usd: Decimal | None = None
+    cost_status: str | None = None
+    fallback_used: bool = False
 
 
 def _estimate_tokens(text: str) -> int:
     # 粗略估算（≈4 字符/token），仅 mock 与兜底记账用
     return max(1, len(text) // 4)
+
+
+def stream_done_from_result(r: LLMResult) -> StreamDone:
+    """LLMResult → StreamDone，逐字段对齐（含模型服务成本归因字段）。
+
+    非流式路径结算时用它，避免手写构造漏掉新增字段（cost_usd/provider 等）导致
+    settle_usage 拿不到上游成本、白白回落价格表。
+    """
+    return StreamDone(
+        model=r.model,
+        prompt_tokens=r.prompt_tokens,
+        completion_tokens=r.completion_tokens,
+        cache_read_tokens=r.cache_read_tokens,
+        reasoning_tokens=r.reasoning_tokens,
+        finish_reason=r.finish_reason,
+        metering_source=r.metering_source,
+        needs_review=r.needs_review,
+        provider=r.provider,
+        model_used=r.model_used,
+        cost_usd=r.cost_usd,
+        cost_status=r.cost_status,
+        fallback_used=r.fallback_used,
+    )
 
 
 # ---------- tiktoken 本地计数（计费步1：精确计量的核心） ----------
@@ -166,6 +206,7 @@ class MockBackend:
         max_tokens: int | None = None,
         api_base: str | None = None,
         api_key: str | None = None,
+        idempotency_key: str | None = None,  # noqa: ARG002 — 仅 remote 后端消费
     ) -> LLMResult:
         system = messages[0]["content"] if messages and messages[0]["role"] == "system" else ""
         last_user = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
@@ -205,6 +246,7 @@ class MockBackend:
         max_tokens: int | None = None,
         api_base: str | None = None,
         api_key: str | None = None,
+        idempotency_key: str | None = None,  # noqa: ARG002 — 仅 remote 后端消费
     ) -> AsyncIterator[str | StreamDone]:
         result = await self.chat(messages, model, temperature, top_p, max_tokens)
         chunk_size = 8
@@ -233,6 +275,7 @@ class LiteLLMBackend:
         max_tokens: int | None = None,
         api_base: str | None = None,
         api_key: str | None = None,
+        idempotency_key: str | None = None,  # noqa: ARG002 — 仅 remote 后端消费
     ) -> LLMResult:
         import litellm  # lazy import：mock 模式无需安装/加载
 
@@ -283,6 +326,7 @@ class LiteLLMBackend:
         max_tokens: int | None = None,
         api_base: str | None = None,
         api_key: str | None = None,
+        idempotency_key: str | None = None,  # noqa: ARG002 — 仅 remote 后端消费
     ) -> AsyncIterator[str | StreamDone]:
         import litellm  # lazy import：mock 模式无需安装/加载
 
@@ -341,10 +385,14 @@ class LiteLLMBackend:
         )
 
 
-def get_llm_backend() -> MockBackend | LiteLLMBackend:
+def get_llm_backend() -> "MockBackend | LiteLLMBackend | RemoteBackend":
     backend = get_settings().llm_backend.lower()
     if backend == "litellm":
         return LiteLLMBackend()
+    if backend == "remote":
+        from app.llm.remote import RemoteBackend  # lazy：非 remote 模式无需 httpx 客户端
+
+        return RemoteBackend()
     return MockBackend()
 
 
@@ -356,8 +404,11 @@ async def chat_stream(
     max_tokens: int | None = None,
     api_base: str | None = None,
     api_key: str | None = None,
+    idempotency_key: str | None = None,
 ) -> AsyncIterator[str | StreamDone]:
     """便捷入口：按配置选后端并开始流式输出。"""
     backend = get_llm_backend()
-    async for piece in backend.chat_stream(messages, model, temperature, top_p, max_tokens, api_base, api_key):
+    async for piece in backend.chat_stream(
+        messages, model, temperature, top_p, max_tokens, api_base, api_key, idempotency_key
+    ):
         yield piece

@@ -20,7 +20,7 @@ from app.billing.ledger import reserve_usage, settle_usage
 from app.billing.quota import QuotaExceeded, admit_request
 from app.billing.rating import compute_billed, load_rating_rule, rule_snapshot
 from app.config import get_settings
-from app.llm.gateway import LLMResult, StreamDone, chat_stream, get_llm_backend
+from app.llm.gateway import LLMResult, StreamDone, chat_stream, get_llm_backend, stream_done_from_result
 from app.models import ApiKey, Conversation, LlmModel, Message, Persona, UsageLog, User
 from app.services.memory import build_memory_block, get_recent_memories, schedule_extraction
 
@@ -265,6 +265,7 @@ async def send_message(db: AsyncSession, conversation: Conversation, content: st
             max_tokens=persona.max_tokens if persona else None,
             api_base=api_base,
             api_key=api_key,
+            idempotency_key=f"msg:{user_message.id}",
         )
     except Exception as exc:
         # 上游异常：预扣行以 error_code 结算（上游可能已耗 token，不可免单），
@@ -277,16 +278,7 @@ async def send_message(db: AsyncSession, conversation: Conversation, content: st
         )
         raise
     attribution = attribute_prompt_tokens(llm_messages, model=model, user_input=content)
-    done = StreamDone(
-        model=result.model,
-        prompt_tokens=result.prompt_tokens,
-        completion_tokens=result.completion_tokens,
-        cache_read_tokens=result.cache_read_tokens,
-        reasoning_tokens=result.reasoning_tokens,
-        finish_reason=result.finish_reason,
-        metering_source=result.metering_source,
-        needs_review=result.needs_review,
-    )
+    done = stream_done_from_result(result)
     assistant_message = await _save_reply(
         db, conversation, persona, done, result.content,
         reservation_id=reservation_id, attribution=attribution, source=source,
@@ -335,6 +327,7 @@ async def send_message_stream(
     async for piece in _stream_reply(
         db, conversation, persona, reservation_id=reservation_id, source=source,
         user_input=content, llm_messages=llm_messages,
+        idempotency_key=f"msg:{user_message.id}",
     ):
         yield piece
 
@@ -377,6 +370,7 @@ async def regenerate_stream(
     llm_messages = build_llm_messages(persona, history, memory_block)
     model, _, _ = await resolve_chat_model(db, conversation, persona)
 
+    regen_key = f"regen:{uuid4().hex}"  # 每次调用唯一：重复生成必须重复计费
     reservation_id = await reserve_usage(
         db,
         user_id=conversation.user_id,
@@ -386,13 +380,13 @@ async def regenerate_stream(
         conversation_id=conversation.id,
         persona_id=persona.id if persona else None,
         channel=conversation.channel,
-        idempotency_key=f"regen:{uuid4().hex}",  # 每次调用唯一：重复生成必须重复计费
+        idempotency_key=regen_key,
         estimated_prompt_tokens=prompt_total(llm_messages, model=model),
     )
 
     async for piece in _stream_reply(
         db, conversation, persona, reservation_id=reservation_id, source=source,
-        llm_messages=llm_messages,
+        llm_messages=llm_messages, idempotency_key=regen_key,
     ):
         yield piece
 
@@ -406,6 +400,7 @@ async def _stream_reply(
     source: str = "native",
     user_input: str | None = None,
     llm_messages: list[dict[str, str]] | None = None,
+    idempotency_key: str | None = None,
 ) -> AsyncIterator[str | StreamDone]:
     """基于当前历史（应已含最新用户消息）流式生成并结算（阶段B）。"""
     # 历史只加载一次：组装上下文 + 记忆提取时取末轮用户输入都用它
@@ -447,6 +442,7 @@ async def _stream_reply(
             max_tokens=persona.max_tokens if persona else None,
             api_base=api_base,
             api_key=api_key,
+            idempotency_key=idempotency_key,
         ):
             if isinstance(piece, StreamDone):
                 # 正常完成：落助手消息 + 用实测 done 结算（唯一产生账单的终态路径）
@@ -561,7 +557,7 @@ async def run_completion(
     try:
         result = await get_llm_backend().chat(
             llm_messages, model, temperature=temperature, top_p=top_p, max_tokens=max_tokens,
-            api_base=api_base, api_key=api_key_cfg,
+            api_base=api_base, api_key=api_key_cfg, idempotency_key=idempotency_key,
         )
     except Exception as exc:
         # 上游异常：按已消耗部分结算（阶段B），异常继续上抛给路由层转 502
@@ -576,16 +572,7 @@ async def run_completion(
     await settle_usage(
         db,
         reservation_id,
-        done=StreamDone(
-            model=result.model,
-            prompt_tokens=result.prompt_tokens,
-            completion_tokens=result.completion_tokens,
-            cache_read_tokens=result.cache_read_tokens,
-            reasoning_tokens=result.reasoning_tokens,
-            finish_reason=result.finish_reason,
-            metering_source=result.metering_source,
-            needs_review=result.needs_review,
-        ),
+        done=stream_done_from_result(result),
         attribution=attribute_prompt_tokens(llm_messages, model=model),
     )
     return result
@@ -659,7 +646,7 @@ async def run_completion_stream(
     try:
         async for piece in chat_stream(
             llm_messages, model, temperature=temperature, top_p=top_p, max_tokens=max_tokens,
-            api_base=api_base, api_key=api_key_cfg,
+            api_base=api_base, api_key=api_key_cfg, idempotency_key=idempotency_key,
         ):
             if isinstance(piece, StreamDone):
                 if not settled:

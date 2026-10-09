@@ -19,6 +19,13 @@ from app.billing.monitor import summarize_margin
 from app.billing.quota import QuotaExceeded, reconcile_pending
 from app.config import Settings, get_settings
 from app.database import SessionLocal
+from app.llm.model_service_ops import (
+    _catalog_sync_loop,
+    resync_catalog_background,
+    startup_self_check,
+    sync_catalog,
+)
+from app.llm.remote import ModelServiceError
 
 logger = logging.getLogger(__name__)
 
@@ -59,13 +66,39 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        # 红线 9 / §8.4 尾句：mock 后端会**假装成功**（返回确定性假回复），
+        # 是生产环境最危险的"降级路径"—— 用户以为在聊天，实际没有任何模型在跑，
+        # 账本还会记下 mock 的假成本。故生产环境**拒绝启动**而不是警告。
+        if settings.app_env.lower() == "prod" and settings.llm_backend.lower() == "mock":
+            raise RuntimeError(
+                "拒绝启动：APP_ENV=prod 时 LLM_BACKEND 不得为 mock（红线 9）。"
+                "mock 后端会返回假回复并污染账本；请配置 LLM_BACKEND=remote 或 litellm，"
+                "或改用 APP_ENV=dev 做本地开发。"
+            )
+
         interval = settings.reconcile_interval_seconds
         task = asyncio.create_task(_billing_watch(interval)) if interval > 0 else None
+
+        # 模型服务（remote）启动自检 + 目录同步（协议 §8.3/§9）。native 版本不符
+        # 会抛 ProtocolVersionError → 应用拒绝启动（红线7）。mock/litellm 模式早退。
+        catalog_task = None
+        if settings.llm_backend.lower() == "remote":
+            await startup_self_check()
+            try:
+                async with SessionLocal() as session:
+                    await sync_catalog(session)
+            except Exception:
+                logger.exception("启动目录同步失败（不阻断启动，定期任务会重试）")
+            sync_interval = settings.model_service_catalog_sync_seconds
+            if sync_interval > 0:
+                catalog_task = asyncio.create_task(_catalog_sync_loop(sync_interval))
+
         yield
-        if task is not None:
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
+        for t in (task, catalog_task):
+            if t is not None:
+                t.cancel()
+                with suppress(asyncio.CancelledError):
+                    await t
 
     app = FastAPI(
         title=f"{settings.app_name} API",
@@ -119,6 +152,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.exception_handler(InsufficientBalance)
     async def balance_handler(request: Request, exc: InsufficientBalance) -> JSONResponse:
         return billing_error(request, exc, 402, "insufficient_balance")
+
+    @app.exception_handler(ModelServiceError)
+    async def model_service_handler(request: Request, exc: ModelServiceError) -> JSONResponse:
+        """§7 错误契约 → 平台对外响应（Q5-B 加法演进）。
+
+        rate_limited → 429 带 Retry-After（前端退避重试）；budget_exhausted → 429 不带
+        （重试无用，兼容既有前端约定）；两者都透传 error.code。model_not_found 顺带触发
+        目录即时重同步（§9）。
+        """
+        if exc.code == "model_not_found":
+            asyncio.create_task(resync_catalog_background())
+        headers = {"Retry-After": str(exc.retry_after)} if exc.retry_after is not None else None
+        if is_openai_compat(request):
+            return JSONResponse(
+                status_code=exc.status,
+                content={
+                    "error": {
+                        "message": exc.message,
+                        "type": exc.err_type,
+                        "param": None,
+                        "code": exc.code,
+                    }
+                },
+                headers=headers,
+            )
+        return JSONResponse(
+            status_code=exc.status, content={"detail": exc.message, "code": exc.code}, headers=headers
+        )
 
     app.include_router(auth.router)
     app.include_router(personas.router)

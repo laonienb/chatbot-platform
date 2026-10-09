@@ -134,14 +134,34 @@ async def settle_usage(
     metering = getattr(done, "metering_source", "provider")
     needs_review = bool(getattr(done, "needs_review", False))
 
-    # 上游计价（毛利核算）—— 永不抛异常
-    quote = quote_upstream_cost(
-        entry.model_upstream or entry.model,
-        prompt_tokens=prompt,
-        completion_tokens=completion,
-        cache_read_tokens=cache_read,
-        reasoning_tokens=reasoning,
-    )
+    # 模型服务成本归因（协议 §5.1）。cost_usd **只替换 upstream 一侧**（毛利核算），
+    # 用户扣费（billed）始终走下面的 rating_rules 快照 —— 两条路径绝不混用。
+    svc_cost = getattr(done, "cost_usd", None)
+    svc_status = getattr(done, "cost_status", None)
+    model_used = getattr(done, "model_used", None)
+    svc_provider = getattr(done, "provider", None)
+
+    # 上游成本优先级链：service_exact > service_estimated > price_table > none。
+    # 价格表仅在服务未给可信成本时才跑（惰性，省掉 remote-exact 路径的 litellm 开销）。
+    if svc_status in ("exact", "estimated") and svc_cost is not None:
+        cost_upstream = svc_cost if isinstance(svc_cost, Decimal) else Decimal(str(svc_cost))
+        cost_source = "service_exact" if svc_status == "exact" else "service_estimated"
+        if svc_status == "estimated":
+            needs_review = True  # 采信但标复核
+    else:
+        # unknown / cost_usd 缺失 / 字段整体缺失（Proxy 期）→ 价格表回落。
+        # 价格表也查不到 → (0, needs_review)，cost_source=none，绝不把 unknown 当免费。
+        quote = quote_upstream_cost(
+            entry.model_upstream or entry.model,
+            prompt_tokens=prompt,
+            completion_tokens=completion,
+            cache_read_tokens=cache_read,
+            reasoning_tokens=reasoning,
+        )
+        cost_upstream = quote.upstream
+        cost_source = "none" if quote.needs_review else "price_table"
+        needs_review = needs_review or quote.needs_review
+
     snap = entry.rate_snapshot
     billed = compute_billed(
         snap,
@@ -154,16 +174,22 @@ async def settle_usage(
         cost_billed, currency = billed
     else:
         # 无费率规则（snap 为空/播种失败）→ billed=None → 兜底用 upstream（记一笔待对账）
-        cost_billed, currency = quote.upstream, "usd"
-        needs_review = needs_review or quote.needs_review
+        cost_billed, currency = cost_upstream, "usd"
 
     if error_code:
         status = "failed" if completion == 0 else "settled"  # 有部分生成仍记 settled
     else:
         status = "settled"
 
-    entry.model_upstream = entry.model_upstream or getattr(done, "model", None) or entry.model
-    if not entry.provider:
+    # 上游身份归因：模型服务如实回报的 model_used/provider 优先（红线3），
+    # 否则沿用现有归一化推导（非 remote 路径 model_used/svc_provider 均为 None）。
+    if model_used:
+        entry.model_upstream = model_used
+    else:
+        entry.model_upstream = entry.model_upstream or getattr(done, "model", None) or entry.model
+    if svc_provider:
+        entry.provider = svc_provider
+    elif not entry.provider:
         norm = normalize_model_string(entry.model_upstream)
         entry.provider = norm.split("/", 1)[0] if norm and "/" in norm else None
     entry.prompt_tokens = prompt
@@ -172,13 +198,14 @@ async def settle_usage(
     entry.reasoning_tokens = reasoning
     entry.metering_source = metering
     entry.attribution = attribution
-    entry.cost_upstream = quote.upstream
+    entry.cost_upstream = cost_upstream
+    entry.cost_source = cost_source
     entry.cost_billed = cost_billed
     entry.currency = currency
     entry.cost = float(cost_billed) if cost_billed is not None else None  # 兼容旧字段
     entry.finish_reason = finish
     entry.error_code = error_code
-    entry.needs_review = needs_review or quote.needs_review
+    entry.needs_review = needs_review
     entry.status = status
     entry.settled_at = datetime.now(UTC)
 
