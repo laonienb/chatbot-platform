@@ -53,8 +53,9 @@
 
 | Agent | 模块 | 状态 | 更新时间 |
 |---|---|---|---|
-| 后端 | 模型服务 **P1-8 / P1-9 / P1-11**（流式主路径最后三项） | 🔄 进行中，**工作区有未提交改动**（`model-service/msvc/`、`server/app/llm/remote.py`）——其他会话勿动勿代提交。验收依据：工作单同名条目 + 架构师A P1-9 预审①–⑦（已挂单内）+ 架构师B §21.3 H1–H4（H1→P1-11、H2/H4→P1-9、H3→部署文档）。**三项闭合前 S3 不得接管生产流量** | 2026-10-10 |
-| 架构师A+B | 模型服务契约治理 | 📋 协议 `docs/model-service-protocol.md` **v1.7**（含 v1.7-澄清2：`error.retry_after_s` 加法字段、流式超时三层约束）为唯一验收依据；S1–S2 定案、七轮交叉评审全部闭环；待后端交付 P1-8/9/11 后做终轮验收 | 2026-10-10 |
+| 后端 | **模型服务 P1-8 / P1-11 + P1-9 服务侧 O1 收尾** —— `model-service/msvc/{main,idempotency,provider,config}.py`、`model-service/tests/` | ✅ commit `25c4bab`，服务侧 **31 → 39 passed**。**接手说明**：另一后端会话 00:05 起停手、留下 25 行**未提交**的 O1 在飞改动（方向正确但**零用例**），本会话在其之上做完同批剩余项，未回退其改动。**P1-8**：`FakeUpstream` 现在 yield `{"kind":"finish"}`、`main.py` 发**非 null** `finish_reason` 的收尾 chunk 且位于 usage chunk 之前，并写入 `StreamTerminal`（终态重放也保持一致）——此前服务侧从不发、平台自家桩却已发，故 P1-1 归因在生产路径静默失效而测试全绿。**P1-11**：`should_cache` 去掉 `status in (413,404)` 白名单 → §8.2.1 的**两个布尔**（`retryable` + `reached_upstream`），上游 401/403 这类已到达上游的永久性拒绝现在入窗；H1 的"docstring 宣称无白名单、代码却是白名单"自相矛盾随之消除。**O1** 补验收用例（停顿 2s 不误杀、超预算归因为 `upstream_chunk_timeout`、capabilities 须暴露预算）+ 两条 break 路径补 `_aclose`（红线6）。**证伪三处**（改坏必红后还原）：白名单回归 → 2 条新用例红而 413 那条仍绿（实证旧用例不看守）；删 finish 分支 → 4 红含被收紧的 T4；预算压回 1s → 误杀用例红 | 2026-10-10 |
+| 后端 | **模型服务 P1-9 平台侧（S4）+ 对外流式错误形态** —— `server/app/llm/{remote, gateway, model_service_ops}.py`、`app/core/sse.py`、两面路由、`server/tests/` | ✅ commit `a639446`，平台全量 **167 → 180 passed**（契约 58 → 71）。补齐审计 §18.2-F2 的最后两段：① `remote.py` 流式循环**识别流内错误帧**，是否计熔断复用 `_CODE_TO_PLATFORM`（抽成 `_classify_error_code`，两面同一处）⇒ 流内 `rate_limited` 不计、`internal_error`/`upstream_*` 计，且帧后关流报错不重复计数；归因走 `StreamDone.terminate_reason` 复用 P1-6 结算通路 ⇒ 部分内容 **settled** 而非 failed。② **对外**：原生面 `event_stream` 原先一个 try/except 都没有（Starlette 先发 200 再迭代 body ⇒ 只能截断，用户见"没有 [DONE] 的半截回复"），现统一 `_sse_from()` 出错误帧 + `[DONE]`；兼容面补上错误帧后的 `[DONE]`（**平台此前用 G3-1 验收模型服务，自己转发时却违反了同一条**）；退避时长按 v1.7-澄清2 走 `error.retry_after_s`。③ 桩补流内帧注入能力（验收③的前置）。④ **H2 顺带挖出一处更大的盲区**：`startup_self_check` 只读**顶层** `caps["timeouts"]`，而真实服务放在 `features.timeouts` ⇒ 红线 8「内层<外层」断言对真实服务**从未执行**（P2-2 名义闭合、实则空转）；已两处都读 + 三个预算统一校验 + 桩与真实服务同形。**证伪五处**；⚠️ 其中 `usage_adopted` 用例**第一版是永绿的**（帧内 usage 被下面那条通用提取顺手捡到），补 `terminate_reason` 断言才有牙齿 | 2026-10-10 |
+| 架构师A+B | 模型服务契约治理 | 📋 协议 `docs/model-service-protocol.md` **v1.7**（含 v1.7-澄清2：`error.retry_after_s` 加法字段、流式超时三层约束）为唯一验收依据；S1–S2 定案、七轮交叉评审全部闭环。**P1-8/P1-9/P1-11 已由 `25c4bab`+`a639446` 交付，请做终轮验收**。验收时请一并裁两处**条文问题**（后端未擅自改契约，只在 `server/app/llm/remote.py`/`model_service_ops.py` 注释与「三」通告里留痕）：① §8.1 只写"在 capabilities 暴露 `timeouts`"、§8.3 的形状示例里**没有**该字段，**嵌套层级没钉死**，正是上面④那处空转的根源；② 平台**对外**（原生面）的流式错误形态此前无条文，现按 §6.7 同形实现（`data:{"error":{…}}` + `[DONE]` + `retry_after_s`），若要写进正文请补一条 | 2026-10-10 |
 | 前端 | （无在飞条目） | ✅ 全部闭合。「二」的重新生成需求单已由架构师 B 代答并标 [x]，待前端核实删单；若 P1-9 落地后对外 SSE 错误形态有变，后端会走「三」通告 | 2026-10-10 |
 
 ## 二、前端 → 后端 接口需求
@@ -127,8 +128,40 @@
   前端影响：……（迁移指南）
 ```
 
-当前无活着通告。**预告（未落地，勿消费）**：P1-9 实现流式错误语义后，若平台对外 SSE
-错误形态有变（含 v1.7-澄清2 新增的 `error.retry_after_s` 加法字段），后端须在此新登记一条。
+当前无其它活着通告。
+
+- [ ] 流式错误语义上线：两面新增**流内错误帧**、错误收尾必发 `[DONE]`、新增 `error.retry_after_s`
+  （2026-10-10，commit `a639446`）
+  变化：**仅流式**。平台把模型服务的错误（协议 §6.7）如实透到对外形态，三面统一同一形状：
+  ```
+  data: {"error": {"message": "...", "type": "api_error", "code": "rate_limited",
+                   "param": null, "retryable": true, "retry_after_s": 30}}
+
+  data: [DONE]
+  ```
+  1. **原生面**（`POST /api/v1/conversations/{id}/messages?stream`、`/regenerate`）**新增**此帧。
+     此前它**没有任何**错误出口：Starlette 先发 200 响应头再迭代 body，异常只能把流截断，
+     前端看到的是"半截回复 + 没有 `[DONE]`"，错误码与原因全丢。
+  2. **兼容面** `/v1/chat/completions` 早就会发这种帧，但**发完就断流**；现在帧之后**必发
+     `[DONE]`**（协议 G3-1，平台此前用这条验收模型服务、自己转发时却漏了）。
+  3. `retry_after_s`（整数秒，**有才给**）：v1.7-澄清2 的加法字段。
+  4. 非流式响应、状态码语义、鉴权**一律不变**（402/429/413/503 那些仍在开流之前）。
+
+  前端影响（迁移指南）：
+  1. **流式路径拿不到 `Retry-After` header**——响应头早在错误发生前就发完了。退避时长**只能**
+     从错误体的 `error.retry_after_s` 读。你们 `classify` 里"有无 `Retry-After`"那条启发式在
+     SSE 场景请改读此字段；`error.code` 优先的老规则继续成立，且现在**原生面也能读到 code**了。
+  2. 解析器必须**宽松**处理这一行：它不是 OpenAI chunk（没有 `choices[0].delta`）。按你们
+     「三」旧条目里已实现的那条走（抛出并保留已产出的部分内容）即可，两面形状现在一致。
+  3. `[DONE]` 现在是**唯一**的正常收尾信号，无论成功还是错误。判断"流被异常截断"请以
+     **连接断开/没有 `[DONE]`** 为准，别用"最后一个 chunk 是不是 content"。
+  4. ⚠️ **例外**：绝对上限（§8.1.1 `stream_max_duration`）按协议**不给**错误帧，对外仍是
+     "回复中断 + `[DONE]`"（用户侧表现为"回复被打断"而非报错）。所以"没收到 error 帧但内容
+     不完整"是合法状态，别当成解析失败。
+  5. 触发条件：只有 `LLM_BACKEND=remote` 才走这条链路（本地默认 `mock` 不产生这些帧）；
+     上游限流/超时在本地开发环境不可复现，如需验可对着 fake 桩跑 `server/tests`
+     （`test_model_service_contract.py` 里 `native_stream`/`compat_stream` 四条就是这条形态的锁）。
+  完成后登记：（待前端填写）
 
 ## 四、冻结区
 
