@@ -1189,3 +1189,345 @@ async def test_p1_6_absolute_cap_settles_partial_not_failed(
     assert log.error_code == "stream_max_duration", "§8.1.1-5：记 error_code 便于归因"
     assert log.completion_tokens == 20, "按已收 token 结算"
 
+
+# ============================================================ P1-9 / T12 流式错误语义（§6.7 + §11）
+
+
+async def test_t12_pre_first_byte_error_keeps_http_semantics(remote_mode):
+    """T12① / §6.7：首字节**前**的失败仍是一条 HTTP 错误响应，`code`/`Retry-After` 都在。
+
+    这正是 S3 把首字节前的错误改回 HTTP 状态码的意义：若它发成「200 + 流内帧」，平台就读不到
+    状态码与 header，限流退避、`error.code` 透传、熔断计数会全部失效。
+    """
+    control, _ = remote_mode
+    control.error = {"code": "rate_limited", "retry_after": 5, "retryable": True}
+    with pytest.raises(ModelServiceError) as ei:
+        await _drain_done(
+            RemoteBackend().chat_stream([{"role": "user", "content": "hi"}], "deepseek-chat")
+        )
+    assert ei.value.code == "rate_limited"
+    assert ei.value.status == 429
+    assert ei.value.retry_after == 5, "限流退避时长必须可读"
+    assert breaker._consecutive_failures == 0, "§11：429 不计熔断"
+
+
+async def test_p1_9_instream_rate_limited_frame_not_counted(remote_mode):
+    """P1-9 验收③ **方向 A**：流内 `rate_limited` 帧**不得**计熔断（§11 负列表）。
+
+    架构师 A 预裁决：是否计熔断由 **`error.code` 经 `_CODE_TO_PLATFORM`** 决定，不由
+    "是不是流内帧"决定。若实现写成"流内帧一律计入"，上游重复限流会把整条链路熔断——
+    正是 §11 要避免的误杀。
+
+    预置 3 次连续失败再跑：错误实现要么变 4（计入）、要么归零（当成功），两个方向都能被抓。
+    """
+    control, _ = remote_mode
+    for _ in range(3):
+        breaker.record_failure()
+    assert breaker._consecutive_failures == 3
+
+    control.stream_error = {"code": "rate_limited", "retry_after_s": 30, "retryable": True}
+    parts, done = await _drain_done(
+        RemoteBackend().chat_stream([{"role": "user", "content": "hi"}], "deepseek-chat")
+    )
+
+    assert done is not None
+    assert done.terminate_reason == "rate_limited", "§6.7：必须按 code 归因，不得当正常结束"
+    assert done.error_message is not None, "对外要能给出错误帧，不能只留一个 code"
+    assert done.retry_after_s == 30, "v1.7-澄清2：流内帧没有 header，退避只能走 retry_after_s"
+    assert parts, "错误帧之前已产出的部分内容必须保留"
+    assert breaker._consecutive_failures == 3, "限流帧既不记失败也不记成功（预审②）"
+
+
+async def test_p1_9_instream_internal_error_frame_counted_exactly_once(remote_mode):
+    """P1-9 验收②③ **方向 B**：流内 `internal_error` 帧 → 计熔断**恰好一次**。
+
+    与上一条成对：只测一个方向就会写出另一个方向的一刀切。
+    "恰好一次"同时看守预审③的防双计（帧计一次 + 关流再抛 httpx 错误又计一次）。
+    """
+    control, _ = remote_mode
+    breaker.reset()
+    control.stream_error = {"code": "internal_error"}
+    parts, done = await _drain_done(
+        RemoteBackend().chat_stream([{"role": "user", "content": "hi"}], "deepseek-chat")
+    )
+    assert done.terminate_reason == "internal_error"
+    assert breaker._consecutive_failures == 1, (
+        "§11：internal_error 计入熔断，且每请求至多记一次（双计会让熔断在 ⌈threshold/2⌉ 就打开）"
+    )
+
+
+async def test_p1_9_instream_error_usage_adopted_not_downgraded(remote_mode):
+    """P1-9 验收⑤（G3-2）：错误帧带实测 `usage` 时平台**采信**，不得无故降档估算。
+
+    错误终止时上游已产出的 token 是**已计费**的实测值，而服务侧明知其值；平台若丢掉它，
+    账本就降档到 tiktoken/estimated + `needs_review`（毛利数字跟着失真）。
+    """
+    control, _ = remote_mode
+    control.stream_error = {"code": "internal_error"}
+    control.stream_error_usage = True
+    _, done = await _drain_done(
+        RemoteBackend().chat_stream([{"role": "user", "content": "hi"}], "deepseek-chat")
+    )
+    # ⚠️ 必须**同时**断言归因：只断言 usage 数字的话，本用例会变成永绿用例——帧里的
+    # `usage` 会被下面那条通用的 usage 提取顺带捡到，即使"错误帧识别"整段被删掉也照样通过。
+    assert done.terminate_reason == "internal_error", "错误帧本身必须被识别"
+    assert done.prompt_tokens == control.prompt_tokens == 120
+    assert done.completion_tokens == control.completion_tokens == 80
+    assert done.metering_source == "provider", "帧内有实测值 → 不得降到 tiktoken/estimated"
+    assert done.needs_review is False
+
+
+async def test_p1_9_instream_error_settles_partial_as_settled(
+    remote_mode, client, auth_headers, db_engine
+):
+    """P1-9 验收②/§6.7 + §8.1.1：流内错误终止 → 部分内容按**已收 token 结算为 settled**。
+
+    不是 `failed`：上游确实产出并计费了。`error_code` = 帧内 code，归因与"整条请求失败"区分开
+    （§7.1：两类入窗结论相同、归因不同）。
+    """
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    control, _ = remote_mode
+    control.stream_error = {"code": "internal_error"}
+    control.stream_error_usage = True
+    _, done = await _drain_done(
+        RemoteBackend().chat_stream([{"role": "user", "content": "hi"}], "deepseek-chat")
+    )
+
+    async with async_sessionmaker(db_engine, expire_on_commit=False)() as s:
+        uid = await _any_user_id(s)
+        rid = await reserve_usage(
+            s, user_id=uid, model_requested="deepseek-chat", model_upstream="deepseek-chat"
+        )
+        # chat.py 的既有通路：terminate_reason → settle_usage(error_code=...)
+        await settle_usage(s, rid, done=done, error_code=done.terminate_reason)
+        log = (await s.execute(select(UsageLog))).scalars().one()
+
+    assert log.status == "settled", "§8.1.1-3：已产出的部分内容结算为 settled，不是 failed"
+    assert log.error_code == "internal_error", "按帧内 code 归因"
+    assert log.completion_tokens == 80
+
+
+async def test_p1_9_clean_stream_still_counts_as_success(remote_mode):
+    """回归锁：正常流仍是成功 —— 修 F2 不能把 happy path 一起改成"永远计失败"。
+
+    顺带把 P1-8 的平台侧消费钉住：服务侧（与桩同形）发的收尾 `finish_reason` 必须被解析进
+    `StreamDone`，否则 P1-1 的归因在生产路径恒为 None。
+    """
+    control, _ = remote_mode
+    for _ in range(2):
+        breaker.record_failure()
+    parts, done = await _drain_done(
+        RemoteBackend().chat_stream([{"role": "user", "content": "hi"}], "deepseek-chat")
+    )
+    assert parts and done is not None
+    assert done.terminate_reason is None and done.error_message is None
+    assert done.finish_reason == control.finish_reason == "stop", "P1-8：平台须解析收尾 chunk"
+    assert breaker._consecutive_failures == 0, "正常结束应清零连续失败数"
+
+
+# ============================================================ H2 / 红线8：中途空闲预算也要断言
+
+
+async def test_h2_chunk_idle_budget_violation_refuses_startup(remote_mode, monkeypatch):
+    """H2（随 P1-9）：`upstream_chunk_idle_s` ≥ 平台流式空闲上限 → 拒绝启动。
+
+    服务侧若把中途空闲预算配得比平台还大，平台会先按空闲超时断开，服务侧的
+    `upstream_chunk_timeout` 归因**永远看不到**（红线 8「内层 < 外层」）。
+    """
+    from app.config import get_settings
+    from app.llm.model_service_ops import ProtocolVersionError, startup_self_check
+
+    control, _ = remote_mode
+    monkeypatch.setattr(get_settings(), "model_service_stream_idle_timeout", 60.0)
+    control.capabilities = {
+        "protocol_version": 1,
+        "features": {
+            "timeouts": {
+                "upstream_first_token_s": 15,
+                "upstream_total_s": 50,
+                "upstream_chunk_idle_s": 120,  # ≥ 外层 60 → 违反
+            }
+        },
+    }
+    with pytest.raises(ProtocolVersionError) as ei:
+        await startup_self_check()
+    assert "中途空闲" in str(ei.value)
+
+
+async def test_p2_2_timeouts_read_from_real_service_nesting(remote_mode, monkeypatch):
+    """红线 8 断言必须读得到**真实服务**的形状：`features.timeouts`。
+
+    真实服务（`msvc/main.py` 的 capabilities）把 timeouts 放在 `features` 里，而平台此前只读
+    顶层 `caps["timeouts"]`；叠上"字段缺失即跳过"，红线 8 断言对真实服务**静默不执行**
+    （P2-2 名义闭合、实则从未触发，与 P1-8 同一类"两端各跑自家桩"盲区）。
+    本用例故意用嵌套形状注入违规 —— 顶层读法会当"没有该字段"直接放行。
+    """
+    from app.config import get_settings
+    from app.llm.model_service_ops import ProtocolVersionError, startup_self_check
+
+    control, _ = remote_mode
+    monkeypatch.setattr(get_settings(), "model_service_stream_idle_timeout", 60.0)
+    control.capabilities = {
+        "protocol_version": 1,
+        "features": {"timeouts": {"upstream_total_s": 120}},
+    }
+    with pytest.raises(ProtocolVersionError):
+        await startup_self_check()
+
+
+async def test_p2_2_default_stub_capabilities_pass(remote_mode, monkeypatch):
+    """桩默认 capabilities 与真实服务同形（`features.timeouts`，15/30/60）→ 自检须通过。
+
+    这一条保证"同形"没被写坏：如果谁把桩的形状改回顶层，上一条盲区就会重新出现。
+    """
+    from app.config import get_settings
+    from app.llm.model_service_ops import startup_self_check
+
+    control, _ = remote_mode
+    assert "timeouts" not in control.capabilities, "桩必须与真实服务同形（timeouts 在 features 内）"
+    monkeypatch.setattr(get_settings(), "model_service_stream_idle_timeout", 90.0)
+    await startup_self_check()  # 不抛即通过
+
+
+# ==================================================== P1-9 对外那一半：平台自己的 SSE 错误帧
+#
+# 上面那组测的是 RemoteBackend（对内）。这一组测**路由层**——前端与 AstrBot/QQ 实际看到的
+# 那一面。协议用 §6.7/G3-1 约束模型服务，平台对外必须守同一套形态，否则"对内修好了、
+# 错误照样吞"。
+
+
+def _sse_payloads(text: str) -> list[str]:
+    return [ln[len("data:") :].strip() for ln in text.splitlines() if ln.startswith("data:")]
+
+
+def _error_frames(payloads: list[str]) -> list[dict]:
+    import json
+
+    out = []
+    for p in payloads:
+        if p == "[DONE]":
+            continue
+        obj = json.loads(p)
+        if isinstance(obj.get("error"), dict):
+            out.append(obj["error"])
+    return out
+
+
+async def _post_sse(client, url, body, headers) -> list[str]:
+    text = ""
+    async with client.stream("POST", url, json=body, headers=headers) as r:
+        assert r.status_code == 200, r.text
+        async for ln in r.aiter_lines():
+            text += ln + "\n"
+    return _sse_payloads(text)
+
+
+async def test_p1_9_native_stream_surfaces_error_frame(remote_mode, client, auth_headers, persona):
+    """§6.7 对外那一半（原生面）：模型服务的流内错误帧必须让**前端**看得见。
+
+    此前原生面的 `event_stream` 里**一个 try/except 都没有**：Starlette 先 `send` 响应头
+    再迭代 body（`starlette/responses.py:251`）⇒ 状态码早已不可改，异常只能把流截断，
+    前端拿到的是"没有 `[DONE]` 的半截流"，既无 code 也无退避时长——上游限流/超时对用户
+    完全不可见（§18.2-F2 的最后一跳）。
+    """
+    control, _ = remote_mode
+    control.stream_error = {"code": "rate_limited", "retry_after_s": 30, "retryable": True}
+    conv = (
+        await client.post(
+            "/api/v1/conversations", json={"persona_id": persona["id"]}, headers=auth_headers
+        )
+    ).json()
+
+    payloads = await _post_sse(
+        client,
+        f"/api/v1/conversations/{conv['id']}/messages",
+        {"content": "hi", "stream": True},
+        auth_headers,
+    )
+
+    assert payloads[-1] == "[DONE]", "G3-1：错误帧之后仍须 [DONE]"
+    errs = _error_frames(payloads)
+    assert errs, "原生面必须把模型服务的错误透出，不能再隐身"
+    assert errs[-1]["code"] == "rate_limited"
+    assert errs[-1]["retry_after_s"] == 30, "帧没有 header，退避只能走 retry_after_s"
+    # 错误前的内容不得丢：至少有一个 delta chunk
+    assert any("delta" in p for p in payloads), "已产出的部分内容必须照常下发"
+
+
+async def test_p1_9_native_absolute_cap_gives_no_error_frame(remote_mode, client, auth_headers, persona, monkeypatch):
+    """§8.1.1 末句：绝对上限对外只表现为「回复中断」，**不给**错误提示。
+
+    这条专门看守判据：路由层用的是 `error_message` 有值，而不是 `terminate_reason` 有值。
+    若有人图省事改成后者，上限切断的流会莫名多出一个错误帧（用户看到报错，协议说不能）。
+    """
+    from app.config import get_settings
+
+    control, _ = remote_mode
+    control.silence_after_chunks = 1
+    control.keepalive_during_silence = True
+    control.silence_seconds = 3.0
+    monkeypatch.setattr(get_settings(), "model_service_stream_idle_timeout", 30.0)
+    monkeypatch.setattr(get_settings(), "model_service_stream_max_duration", 0.5)
+    conv = (
+        await client.post(
+            "/api/v1/conversations", json={"persona_id": persona["id"]}, headers=auth_headers
+        )
+    ).json()
+
+    payloads = await _post_sse(
+        client,
+        f"/api/v1/conversations/{conv['id']}/messages",
+        {"content": "hi", "stream": True},
+        auth_headers,
+    )
+    assert not _error_frames(payloads), "§8.1.1：绝对上限不该给对外错误帧"
+    assert payloads[-1] == "[DONE]"
+
+
+async def test_p1_9_compat_stream_relayed_frame_followed_by_done(remote_mode, client, auth_headers):
+    """G3-1 在平台**自己**的对外契约上同样成立（兼容面，转发模型服务的流内帧）。"""
+    key = await _compat_key(client, auth_headers)
+    control, _ = remote_mode
+    control.stream_error = {"code": "internal_error"}
+
+    payloads = await _post_sse(
+        client,
+        "/v1/chat/completions",
+        {"model": "deepseek-chat", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+        {"Authorization": f"Bearer {key}"},
+    )
+    errs = _error_frames(payloads)
+    assert errs and errs[-1]["code"] == "internal_error"
+    assert payloads[-1] == "[DONE]", "错误帧之后必须仍发 [DONE]"
+
+
+async def test_p1_9_compat_pre_first_byte_frame_followed_by_done(remote_mode, client, auth_headers):
+    """兼容面异常路径（首字节前的 HTTP 429 转成流内帧）此前 `return` 掉 `[DONE]` —— 现已补上。
+
+    协议用 G3-1 约束模型服务，而平台此前自己转发错误时 `yield` 完帧就 `return`：**自己违反
+    了自己拿去验收别人的条款**。OpenAI 兼容客户端（AstrBot 等）以 `[DONE]` 判正常收尾。
+    """
+    key = await _compat_key(client, auth_headers)
+    control, _ = remote_mode
+    control.error = {"code": "rate_limited", "retry_after": 9, "retryable": True}
+
+    payloads = await _post_sse(
+        client,
+        "/v1/chat/completions",
+        {"model": "deepseek-chat", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+        {"Authorization": f"Bearer {key}"},
+    )
+    errs = _error_frames(payloads)
+    assert errs and errs[-1]["code"] == "rate_limited"
+    assert errs[-1]["retry_after_s"] == 9, "HTTP 层的 Retry-After 在流内帧里须转成 retry_after_s"
+    assert payloads[-1] == "[DONE]"
+
+
+async def _compat_key(client, auth_headers) -> str:
+    resp = await client.post(
+        "/api/v1/me/keys", json={"name": "astrbot"}, headers=auth_headers
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()["key"]
+

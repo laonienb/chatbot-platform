@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.api.deps import DbSession, get_api_key_principal
 from app.billing.ratelimit import rate_limit_compat
-from app.core.sse import SSE_DONE, SSE_HEADERS, format_sse
+from app.core.sse import SSE_DONE, SSE_HEADERS, format_sse, stream_error_frame
 from app.llm.gateway import StreamDone
 from app.llm.remote import ModelServiceError
 from app.models import ApiKey, User
@@ -88,6 +88,7 @@ async def chat_completions(
 
         async def event_stream():
             yield format_sse(chunk({"role": "assistant"}))
+            done: StreamDone | None = None
             try:
                 async for piece in run_completion_stream(
                     db,
@@ -102,16 +103,41 @@ async def chat_completions(
                     idempotency_key=idempotency_key,
                 ):
                     if isinstance(piece, StreamDone):
+                        done = piece
                         continue  # usage 记账已在服务层完成
                     yield format_sse(chunk({"content": piece}))
             except ModelServiceError as e:  # 开流后无法改状态码，以事件透传 code（§7）
                 yield format_sse(
-                    {"error": {"message": e.message, "type": e.err_type, "param": None, "code": e.code}}
+                    stream_error_frame(
+                        e.code,
+                        e.message,
+                        err_type=e.err_type,
+                        retryable=e.retryable,
+                        retry_after_s=e.retry_after,
+                    )
                 )
+                # G3-1：错误帧之后**仍须** `[DONE]`。此前这里直接 return —— 平台自己
+                # 也拿 `[DONE]` 当唯一正常终止信号，却给客户端发一个"没有 [DONE] 的流"，
+                # 客户端无法区分「错误收尾」与「连接异常断开」。
+                yield SSE_DONE
                 return
             except Exception as e:  # 其余上游异常，遵循 OpenAI 流式行为以事件报错
-                yield format_sse({"error": {"message": f"LLM upstream error: {e}", "type": "api_error", "param": None, "code": None}})
+                yield format_sse(stream_error_frame(None, f"LLM upstream error: {e}"))
+                yield SSE_DONE
                 return
+            if done is not None and done.error_message is not None:
+                # §6.7：模型服务的**流内**错误帧已被 RemoteBackend 归因进 StreamDone
+                # （terminate_reason = 帧内 code）。这里翻成对外错误帧，别让它再次隐身。
+                # 判据用 error_message 而非 terminate_reason：§8.1.1 的绝对上限对外只表现为
+                # 「回复中断」，不给错误提示。
+                yield format_sse(
+                    stream_error_frame(
+                        done.terminate_reason,
+                        done.error_message,
+                        retryable=done.error_retryable,
+                        retry_after_s=done.retry_after_s,
+                    )
+                )
             yield SSE_DONE
 
         return StreamingResponse(event_stream(), media_type="text/event-stream", headers=SSE_HEADERS)

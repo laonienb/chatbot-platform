@@ -8,7 +8,7 @@ from sqlalchemy import delete, select
 
 from app.api.deps import CurrentUser, DbSession
 from app.billing.ratelimit import rate_limit_native
-from app.core.sse import SSE_DONE, SSE_HEADERS, format_sse
+from app.core.sse import SSE_DONE, SSE_HEADERS, format_sse, stream_error_frame
 from app.llm.gateway import StreamDone
 from app.llm.remote import ModelServiceError
 from app.models import Conversation, Message, Persona
@@ -29,6 +29,55 @@ from app.services.chat import (
 from app.services.persona import can_view_persona
 
 router = APIRouter(prefix="/api/v1/conversations", tags=["conversations"])
+
+
+async def _sse_from(pieces):
+    """服务层流式片段 → 对外 SSE：内容 delta →（错误终止时）错误帧 → `[DONE]`。
+
+    §6.7 / 工作单 P1-9 **对外那一半**。此前原生面**没有任何**错误出口：模型服务报错时异常
+    直接从生成器抛出，而 Starlette 在 `stream_response` 里**先发 200 响应头、再迭代 body**
+    （`starlette/responses.py:251`）⇒ 状态码早已不可改，客户端只看到"没有 `[DONE]` 的半截流"，
+    既拿不到 `error.code` 也拿不到退避时长 —— 上游限流/超时对用户完全不可见（§18.2-F2 的
+    最后一跳）。现按协议形态补齐：`data: {"error": {…code、retry_after_s…}}` 其后仍发
+    `[DONE]`（G3-1）。
+
+    ⚠️ 判据是 `error_message` 有值、**不是** `terminate_reason` 有值：§8.1.1 的绝对上限也写
+    terminate_reason，但它对外按「回复中断」表现、**不给**错误提示（§8.1.1 末句）。
+    """
+    done: StreamDone | None = None
+    try:
+        async for piece in pieces:
+            if isinstance(piece, StreamDone):
+                done = piece
+                continue  # 结束标记不外发，落库已在服务层完成
+            yield format_sse({"choices": [{"index": 0, "delta": {"content": piece}}]})
+    except ModelServiceError as e:  # 首字节前就已经失败（HTTP 错误状态传到平台后转发）
+        yield format_sse(
+            stream_error_frame(
+                e.code,
+                e.message,
+                err_type=e.err_type,
+                retryable=e.retryable,
+                retry_after_s=e.retry_after,
+            )
+        )
+        yield SSE_DONE
+        return
+    except Exception as e:  # 其余上游异常：给得出 shape 就给，code 留空由客户端按自有策略处理
+        yield format_sse(stream_error_frame(None, f"LLM upstream error: {e}"))
+        yield SSE_DONE
+        return
+    if done is not None and done.error_message is not None:
+        # 模型服务的**流内**错误帧已由 RemoteBackend 归因到 done，对外同样不得吞掉。
+        yield format_sse(
+            stream_error_frame(
+                done.terminate_reason,
+                done.error_message,
+                retryable=done.error_retryable,
+                retry_after_s=done.retry_after_s,
+            )
+        )
+    yield SSE_DONE
 
 
 async def _get_owned_conversation(conversation_id: UUID, user_id, db) -> Conversation:
@@ -110,15 +159,11 @@ async def send(
     # 准入（配额 429 / 余额 402）必须在开流之前 —— 200 之后无法再回错误状态码
     await ensure_native_admitted(db, conv, body.content)
     if body.stream:
-
-        async def event_stream():
-            async for piece in send_message_stream(db, conv, body.content, source="native"):
-                if isinstance(piece, StreamDone):
-                    continue  # 结束标记不外发，落库已在服务层完成
-                yield format_sse({"choices": [{"index": 0, "delta": {"content": piece}}]})
-            yield SSE_DONE
-
-        return StreamingResponse(event_stream(), media_type="text/event-stream", headers=SSE_HEADERS)
+        return StreamingResponse(
+            _sse_from(send_message_stream(db, conv, body.content, source="native")),
+            media_type="text/event-stream",
+            headers=SSE_HEADERS,
+        )
 
     try:
         user_message, assistant_message = await send_message(db, conv, body.content, source="native")
@@ -145,14 +190,11 @@ async def regenerate(
     conv = await _get_owned_conversation(conversation_id, user.id, db)
     await ensure_native_admitted(db, conv)  # content=None：历史末尾已是该用户消息
 
-    async def event_stream():
-        async for piece in regenerate_stream(db, conv, source="native"):
-            if isinstance(piece, StreamDone):
-                continue
-            yield format_sse({"choices": [{"index": 0, "delta": {"content": piece}}]})
-        yield SSE_DONE
-
-    return StreamingResponse(event_stream(), media_type="text/event-stream", headers=SSE_HEADERS)
+    return StreamingResponse(
+        _sse_from(regenerate_stream(db, conv, source="native")),
+        media_type="text/event-stream",
+        headers=SSE_HEADERS,
+    )
 
 
 @router.get("/{conversation_id}/messages", response_model=list[MessageOut])

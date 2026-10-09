@@ -41,7 +41,29 @@ _CODE_TO_PLATFORM: dict[str, tuple[int, bool, bool]] = {
     "upstream_error": (503, False, True),
     "service_unavailable": (503, False, True),
     "upstream_timeout": (504, False, True),
+    # O1（v1.7）：首字节**之后**的 chunk 间隔预算耗尽（中途停顿）——与首 token 超时
+    # （upstream_timeout）区分归因；同属 5xx/超时类 ⇒ 计入熔断（§11）。
+    "upstream_chunk_timeout": (504, False, True),
 }
+
+
+def _classify_error_code(code: str, *, raw_status: int | None = None) -> tuple[int, bool, bool]:
+    """§7 `error.code` → (对外 status, 是否运维告警, 是否计入熔断)。
+
+    **流式与非流式共用这一处**（工作单 P1-9 预审①）。§11 的口径只有一个来源：
+    「是否计熔断」由 **code** 决定，不由「是不是流内错误帧」决定 —— 流内
+    `rate_limited`／`budget_exhausted` **不得**计数（重复限流会误杀整条链路，正是 §11
+    负列表要防的），`internal_error`／`upstream_*`／`service_unavailable` **必须**计数。
+    若在流式路径另写一套"流内帧一律计入"，两处口径就会漂移。
+
+    未知码：给了原始 HTTP 状态就按它归类（5xx 计熔断），否则保守按 502 且计入。
+    """
+    known = _CODE_TO_PLATFORM.get(code)
+    if known is not None:
+        return known
+    if raw_status is not None:
+        return (raw_status if raw_status >= 400 else 502, False, raw_status >= 500)
+    return (502, False, True)
 
 
 class ModelServiceError(Exception):
@@ -69,6 +91,33 @@ class ModelServiceError(Exception):
         # 注意：协议 §7.1 硬规则规定平台**收到任何响应后一律不重试**，故该字段
         # 当前只作诊断/可观测用途，不驱动重试；保留以符合契约形状。
         self.retryable = retryable
+
+
+def _error_from_frame(err: dict) -> ModelServiceError:
+    """§6.7 流内错误帧 → ModelServiceError，并按 §11 **按码**决定是否计熔断。
+
+    审计 §18.2-F2 的根因是平台把该帧整条丢弃：内容空、无 code、`record_success()`、
+    熔断不计数、退避时长丢失。此处把它当作与 HTTP 错误响应**同等**的失败处理，
+    只是状态码已随 200 发出、无法再改（故走 `StreamDone` 归因而非 raise）。
+    """
+    code = str(err.get("code") or "upstream_error")
+    message = str(err.get("message") or f"模型服务流内错误 {code}")
+    status, alert, counts = _classify_error_code(code)
+    raw_ra = err.get("retry_after_s")
+    retry_after = raw_ra if isinstance(raw_ra, int) and not isinstance(raw_ra, bool) else None
+    if counts:
+        breaker.record_failure()
+    if alert:
+        logger.error("模型服务流内错误帧告警 code=%s: %s", code, message)
+    return ModelServiceError(
+        code,
+        message,
+        status=status,
+        retry_after=retry_after,
+        alert=alert,
+        err_type=str(err.get("type") or "api_error"),
+        retryable=bool(err.get("retryable", False)),
+    )
 
 
 # 协议 §1-1 / §4.2：这些字段一律不得出现在发往模型服务的请求里。
@@ -333,11 +382,7 @@ class RemoteBackend:
         except Exception:
             pass
 
-        status, alert, counts = _CODE_TO_PLATFORM.get(code, (502, False, True))
-        if code not in _CODE_TO_PLATFORM:
-            # 未知码：按原始 HTTP 状态归类，5xx 计入熔断
-            status = resp.status_code if resp.status_code >= 400 else 502
-            counts = resp.status_code >= 500
+        status, alert, counts = _classify_error_code(code, raw_status=resp.status_code)
         retry_after = None
         if code == "rate_limited":
             ra = resp.headers.get("Retry-After")
@@ -478,6 +523,7 @@ class RemoteBackend:
         xms: dict = {}
         finish_reason: str | None = None
         current_event: str | None = None
+        stream_error: ModelServiceError | None = None  # §6.7 首字节后的流内错误帧
         client = httpx.AsyncClient(timeout=timeout, trust_env=False)
         # §8.1 缺口 K：httpx 的 total 超时**对流式不适用**，必须显式做空闲计时。
         # 语义是"沉默时长"而非"总时长"：只有**协议活动**（注释行/事件行/data 行）重置，
@@ -537,6 +583,17 @@ class RemoteBackend:
                         obj = json.loads(payload)
                     except json.JSONDecodeError:
                         continue
+                    if isinstance(obj.get("error"), dict):
+                        # §6.7（工作单 P1-9 / 审计 §18.2-F2）：**首字节之后**的错误以流内错误帧
+                        # 收尾。此前平台整条丢弃该帧 → 内容空、无 code、下面记 record_success()，
+                        # 于是流式（主路径）下上游限流/超时对平台不可见、熔断不计数、账本按成功结算。
+                        # 是否计熔断由 `_error_from_frame` 按 code 经 §11 决定，不在此另立口径。
+                        stream_error = _error_from_frame(obj["error"])
+                        if isinstance(obj.get("usage"), dict):
+                            # §6.7 G3-2：错误帧可携带**实测部分 usage**（加法字段），优先采信，
+                            # 不让账本无谓降档到 tiktoken/estimated。
+                            usage = obj["usage"]
+                        break
                     if current_event == "model_service":
                         # 终止事件（§6.3）：承载扩展字段，不污染 OpenAI chunk
                         inner = obj.get("x_model_service")
@@ -561,12 +618,22 @@ class RemoteBackend:
         except httpx.HTTPError as exc:
             # §11：流式是主路径，传输失败（连接错/读超时）必须计入熔断（审计 A）。
             # 只在此记一次；`_unavailable` 已不再记，修掉此前流式连接错被双计数（缺陷①）。
-            breaker.record_failure()
-            raise await self._unavailable(f"流式连接失败：{exc!r}", model=model) from exc
+            if stream_error is not None:
+                # 预审③ 防双计：本请求已按**帧内 code** 定过计数（该计的都计了），随后关流时的
+                # 传输层报错属同一请求的余波 —— 不再重复计入，也不覆盖帧内归因。
+                logger.warning("流内错误帧后关流报错（同一请求余波，不重复计熔断）：%r", exc)
+            else:
+                breaker.record_failure()
+                raise await self._unavailable(f"流式连接失败：{exc!r}", model=model) from exc
         finally:
             await client.aclose()
 
-        if terminate_reason == "stream_max_duration":
+        if stream_error is not None:
+            # §6.7：帧错误**既不记成功、也不补记失败**（是否计入由 `_error_from_frame` 按码决定，
+            # 流内 rate_limited 两不沾 —— 预审②）。归因写进 terminate_reason，结算层沿用 P1-6
+            # 那条通路把它落成 error_code，内容仍按已收 token 结算为 settled（§8.1.1 口径）。
+            terminate_reason = stream_error.code
+        elif terminate_reason == "stream_max_duration":
             # §8.1.1-4：绝对上限属连接类失败，计入熔断；但不 raise，落到下面按已收 token 结算。
             breaker.record_failure()
         else:
@@ -598,4 +665,8 @@ class RemoteBackend:
             cost_status=xms.get("cost_status"),
             fallback_used=bool(xms.get("fallback_used", False)),
             terminate_reason=terminate_reason,
+            # 供路由层把流式错误**原样**翻译给客户端（对外形态与对内形态是两件事）
+            error_message=stream_error.message if stream_error is not None else None,
+            error_retryable=stream_error.retryable if stream_error is not None else False,
+            retry_after_s=stream_error.retry_after if stream_error is not None else None,
         )

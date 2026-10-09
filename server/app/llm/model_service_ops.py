@@ -109,21 +109,30 @@ async def startup_self_check() -> None:
 
     # P2-2 / §8.1：模型服务必须自持上游超时并在 capabilities 暴露，
     # 平台据此**断言内层 < 外层**（自动化红线 8，替代人工读配置）。
-    timeouts = caps.get("timeouts") or {}
-    inner_total = timeouts.get("upstream_total_s")
-    outer_idle = s.model_service_stream_idle_timeout
-    if inner_total is not None:
-        if float(inner_total) >= float(outer_idle):
+    #
+    # ⚠️ **两处都读**（顶层 `timeouts` 与 `features.timeouts`）：§8.1 只写"在 capabilities
+    # 暴露 `timeouts`"、§8.3 的形状示例里根本没有该字段，**条文没钉死嵌套层级**。真实服务
+    # 放在 `features.timeouts`（`msvc/main.py` 的 capabilities），而这里此前只读顶层
+    # ⇒ 对真实服务永远读不到，再叠上"字段缺失即跳过"，红线 8 断言在生产里**静默不执行**
+    # （P2-2 名义闭合、实则从未触发，与 P1-8 是同一类"两端各跑自家桩"的盲区）。
+    # 层级应由架构师在条文里钉死；实现先做兼容读，见工作单 P1-9 回执。
+    timeouts = caps.get("timeouts") or (caps.get("features") or {}).get("timeouts") or {}
+    outer_idle = float(s.model_service_stream_idle_timeout)
+    for key, label in (
+        ("upstream_total_s", "上游总超时"),
+        ("upstream_first_token_s", "首 token 超时"),
+        # H2 / O1：中途空闲预算同样必须 < 平台空闲上限，否则平台先断开、
+        # 服务侧的 `upstream_chunk_timeout` 归因永远看不到。
+        ("upstream_chunk_idle_s", "中途空闲预算"),
+    ):
+        inner = timeouts.get(key)
+        if inner is None:
+            continue  # Proxy 过渡期无 capabilities 契约 → 跳过（§8.3）
+        if float(inner) >= outer_idle:
             raise ProtocolVersionError(
-                f"超时分层违反红线 8：模型服务上游总超时 {inner_total}s ≥ 平台流式空闲上限 "
+                f"超时分层违反红线 8：模型服务{label} {inner}s ≥ 平台流式空闲上限 "
                 f"{outer_idle}s。内层必须严格小于外层，否则平台会先断开（钱花了、回包丢了）。"
-                f"请调小模型服务超时或调大 MODEL_SERVICE_STREAM_IDLE_TIMEOUT。"
-            )
-        inner_first = timeouts.get("upstream_first_token_s")
-        if inner_first is not None and float(inner_first) >= float(outer_idle):
-            raise ProtocolVersionError(
-                f"超时分层违反红线 8：模型服务首 token 超时 {inner_first}s ≥ 平台流式空闲上限 "
-                f"{outer_idle}s。"
+                f"请调小模型服务该项超时或调大 MODEL_SERVICE_STREAM_IDLE_TIMEOUT。"
             )
     logger.info("模型服务自检通过：native 模式，协议版本 %s", pv)
 

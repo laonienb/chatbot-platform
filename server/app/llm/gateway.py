@@ -82,7 +82,15 @@ class StreamDone:
     fallback_used: bool = False
     # 流式非正常终止原因（§8.1.1）：绝对上限触发时 = "stream_max_duration"，正常结束为 None。
     # 结算层据此写 error_code；但内容照常落库、状态仍按已收 token 结算（不是 failed）。
+    # §6.7 扩展：流内错误帧终止时 = 帧内 `error.code`（同一条通路，归因仍按码）。
     terminate_reason: str | None = None
+    # 下面几项仅在 terminate_reason 来自流内错误帧时有值，供**路由层**把它翻译成对外
+    # SSE 错误帧（平台对外形态与对内形态是两件事，缺这些就只能把错误悄悄吞掉）。
+    # 判据用 `error_message is not None` 而不是「terminate_reason 有值」：§8.1.1 的绝对上限
+    # 也写 terminate_reason，但对外**只表现为「回复中断」、不给错误提示**（§8.1.1 末句）。
+    error_message: str | None = None
+    error_retryable: bool = False
+    retry_after_s: int | None = None
 
 
 def _estimate_tokens(text: str) -> int:

@@ -83,6 +83,14 @@ class Control:
                 "routing_hints": True,
                 "compliance_policies": ["cn_only_providers"],
                 "idempotency_window_seconds": 600,
+                # ⚠️ 与**真实服务同形**：`msvc/main.py` 把 timeouts 放在 `features` 里。
+                # 桩若放在顶层，平台侧测试就会对着一个真实服务永远给不出的形状断言
+                # （红线 8 的启动断言正是这样在生产里静默失效的，见 model_service_ops）。
+                "timeouts": {
+                    "upstream_first_token_s": 15,
+                    "upstream_chunk_idle_s": 30,
+                    "upstream_total_s": 60,
+                },
             },
             "implementation": {"name": "fake-model-service", "version": "0.1.0"},
         }
@@ -102,6 +110,15 @@ class Control:
     # 发满 N 个内容 chunk 后**永久沉默**（不发 usage/终止事件/[DONE]），
     # 用于验证平台侧流式空闲上限（协议 §8.1 缺口 K）。
     silence_after_chunks: int | None = None
+
+    # ---- 流内错误帧（§6.7 / 工作单 P1-9 验收③；此前桩**无法**注入，故 F2 无人看守）----
+    # 形如 {"code": "rate_limited", "retry_after_s": 30}：发满 `stream_error_after_chunks`
+    # 个内容 chunk 后插入 `data: {"error": {...}}`，其后仍发 [DONE]（G3-1）。
+    # 与 `error`（HTTP 错误响应，即**首字节前**的失败）是两条互斥路径，分别验 §6.7 两支。
+    stream_error: dict[str, Any] | None = None
+    stream_error_after_chunks: int = 1
+    # 错误帧是否携带实测部分 usage（§6.7 G3-2，加法字段）
+    stream_error_usage: bool = False
     # 沉默期间是否持续发 `: keepalive` 注释行（心跳应能重置空闲计时）。
     keepalive_during_silence: bool = False
     # 沉默持续时长（秒）；配合 silence_after_chunks 使用。
@@ -145,6 +162,25 @@ def _error_response(control: Control) -> Response | None:
         }
     }
     return JSONResponse(body, status_code=status, headers=headers)
+
+
+def _stream_error_body(err: dict[str, Any]) -> dict[str, Any]:
+    """流内错误帧的错误体（§6.7）。
+
+    帧**没有 HTTP header 可携带** `Retry-After`，故退避时长走 v1.7-澄清2 的加法字段
+    `retry_after_s`——这是流式路径传退避的唯一手段。
+    """
+    code = err.get("code", "upstream_error")
+    body: dict[str, Any] = {
+        "message": err.get("message", f"注入流内错误 {code}"),
+        "type": err.get("type", "api_error"),
+        "code": code,
+        "param": None,
+        "retryable": bool(err.get("retryable", False)),  # §7.1 缺省 false
+    }
+    if err.get("retry_after_s") is not None:
+        body["retry_after_s"] = int(err["retry_after_s"])
+    return body
 
 
 def _check_auth_and_version(request: Request, control: Control) -> Response | None:
@@ -366,6 +402,19 @@ async def _stream_body(control: Control):
             )
             sent += 1
             await asyncio.sleep(control.stream_chunk_delay_seconds)
+            # 流内错误帧（§6.7 / P1-9 验收③）：**首字节之后**的错误只能用帧表达，
+            # 其后仍须 [DONE]（G3-1）。与 `control.error`（首字节前的 HTTP 错误）互斥。
+            if control.stream_error is not None and sent >= control.stream_error_after_chunks:
+                frame: dict[str, Any] = {"error": _stream_error_body(control.stream_error)}
+                if control.stream_error_usage:  # G3-2：帧可带实测部分 usage
+                    partial = _usage(control)
+                    if partial:
+                        frame["usage"] = partial
+                yield _sse(frame)
+                yield _sse("[DONE]")
+                control.stream_finished += 1
+                control.upstream_completed += 1
+                return
             # 测试用：发满 N 个 chunk 后停止一切输出（不发 usage/终止/[DONE]），
             # 用于验证平台侧流式空闲上限会断开连接（协议 §8.1 / 缺口 K）。
             if control.silence_after_chunks is not None and sent >= control.silence_after_chunks:
