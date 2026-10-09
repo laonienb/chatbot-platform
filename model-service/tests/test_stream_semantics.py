@@ -312,3 +312,33 @@ async def test_p1_9_capabilities_exposes_chunk_idle_budget(client):
     assert timeouts["upstream_chunk_idle_s"] > 1.0, (
         "预算不得回退到旧的硬编码 1s（O1：真实上游正常停顿即被误杀）"
     )
+
+
+# ============================================================ H4：首字节前超时的入窗**正例**
+async def test_h4_pre_first_byte_timeout_must_be_cached(client, app, scenario, monkeypatch):
+    """H4 / §8.2.1 双向原则：首字节**前**的超时属「结果不明」⇒ **必须入窗**。
+
+    `test_p1_10_pre_first_byte_failure_not_cached` 钉的是反方向（上游 429 瞬时拒绝**不**入窗）。
+    只有那一条，实现就能写成"首字节前的失败一律不入窗"而**全绿** —— 而那会让同 key 重发
+    再打一次上游（超时已经发起调用、可能已计费 ⇒ 双烧）。两条方向相反，缺一即漏一类。
+
+    判据链：首 token 超时 → `ServiceError(upstream_timeout, retryable=False)` → HTTP 504 →
+    `_finish_window(..., reached_upstream=True)` → `should_cache` 两布尔 ⇒ 入窗。
+    """
+    from msvc.config import get_settings
+
+    app.state.upstream.reset()
+    monkeypatch.setattr(get_settings(), "upstream_first_token_timeout", 0.3)
+    scenario.first_token_seconds = 1.0
+    h = {"Idempotency-Key": "idem-pre-timeout"}
+
+    r1 = await client.post("/v1/chat/completions", json=_body(stream=True), headers=h)
+    assert r1.status_code == 504, "§6.7：首字节前的失败须走 HTTP 错误状态"
+    assert r1.json()["error"]["code"] == "upstream_timeout"
+    assert r1.json()["error"]["retryable"] is False, "结果不明（可能已计费）⇒ retryable=false"
+    assert app.state.upstream.started == 1
+
+    scenario.first_token_seconds = 0.0  # 上游恢复
+    r2 = await client.post("/v1/chat/completions", json=_body(stream=True), headers=h)
+    assert r2.status_code == 504, "结果不明已入窗 ⇒ 同 key 重发回放，不能再打上游"
+    assert app.state.upstream.started == 1, "重发真实重调上游就是双烧（幂等窗存在的理由）"
