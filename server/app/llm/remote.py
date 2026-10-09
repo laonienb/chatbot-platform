@@ -183,8 +183,14 @@ class CircuitBreaker:
         self._probe_in_flight = False
 
 
-# 进程级单例（一个模型服务）。测试可 reset()。
-breaker = CircuitBreaker()
+# 进程级单例（一个模型服务）。阈值/冷却从配置读取——修掉此前写死 5/30、
+# `model_service_cb_threshold`/`model_service_cb_reset_seconds` 形同虚设的缺陷（复核③）。
+# 测试可 reset()（reset 只清状态，不改阈值/冷却，与既有测试用 breaker.threshold 一致）。
+_bs = get_settings()
+breaker = CircuitBreaker(
+    threshold=_bs.model_service_cb_threshold,
+    reset_seconds=_bs.model_service_cb_reset_seconds,
+)
 
 
 def _parse_cost(raw: object) -> Decimal | None:
@@ -299,7 +305,7 @@ class RemoteBackend:
         收到任何 HTTP 响应（含 5xx）后**一律不重试**：§8.2 的幂等窗口会使第二次请求
         直接命中首次结果，徒增延迟；`internal_error` 交由熔断 + 降级链承担。
         """
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
             try:
                 return await self._post(client, url, body, headers)
             except httpx.HTTPError as exc:
@@ -307,7 +313,7 @@ class RemoteBackend:
                     raise  # 已送达/读超时 → 不重试
                 logger.warning("模型服务建连失败（请求未送达），按 §7.1 重试 1 次")
         # 新建 client 做唯一一次重试（旧连接已不可用）
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
             return await self._post(client, url, body, headers)
 
     def _error_from_response(self, resp: httpx.Response) -> ModelServiceError:
@@ -355,8 +361,13 @@ class RemoteBackend:
         )
 
     async def _unavailable(self, reason: str, *, model: str) -> ModelServiceError:
-        """熔断打开 / 连接失败：§8.4 生产默认 503（可选直连降级由调用方处理）。"""
-        breaker.record_failure()
+        """构造 §8.4 生产降级 503。
+
+        **此处不计入熔断**：`_unavailable` 既服务「真实传输失败」（由调用点显式
+        `record_failure`）也服务「被熔断主动拒绝」的请求——后者根本没出网，若在此计数
+        会污染连续失败数、并在 half_open 下清掉在飞探测的 `_probe_in_flight` 位（复核缺陷②）。
+        是否计入完全交由调用点决定。
+        """
         logger.warning("模型服务不可用：%s", reason)
         return ModelServiceError(
             "service_unavailable", "模型服务暂不可用，请稍后再试", status=503
@@ -427,6 +438,7 @@ class RemoteBackend:
                 timeout, self._url(), body, self._headers(idempotency_key)
             )
         except httpx.HTTPError as exc:
+            breaker.record_failure()  # 真实传输失败计入熔断；被拒路径走 allow() 分支不记（缺陷①②）
             raise await self._unavailable(f"连接失败：{exc!r}", model=model) from exc
 
         if resp.status_code != 200:
@@ -466,7 +478,7 @@ class RemoteBackend:
         xms: dict = {}
         finish_reason: str | None = None
         current_event: str | None = None
-        client = httpx.AsyncClient(timeout=timeout)
+        client = httpx.AsyncClient(timeout=timeout, trust_env=False)
         # §8.1 缺口 K：httpx 的 total 超时**对流式不适用**，必须显式做空闲计时。
         # 语义是"沉默时长"而非"总时长"：只有**协议活动**（注释行/事件行/data 行）重置，
         # 纯空白行不算 —— 否则一个持续发空行的服务能把连接无限吊住。
@@ -532,8 +544,8 @@ class RemoteBackend:
                     if isinstance(obj.get("usage"), dict):
                         usage = obj["usage"]  # usage chunk（choices 为空）
         except httpx.HTTPError as exc:
-            # §11：**流式是主路径，必须计入熔断**。连接错/超时/读超时都算。
-            # 此前只在非流式与错误响应里 record_failure → 流式挂掉熔断永不触发（审计 A）。
+            # §11：流式是主路径，传输失败（连接错/读超时）必须计入熔断（审计 A）。
+            # 只在此记一次；`_unavailable` 已不再记，修掉此前流式连接错被双计数（缺陷①）。
             breaker.record_failure()
             raise await self._unavailable(f"流式连接失败：{exc!r}", model=model) from exc
         finally:

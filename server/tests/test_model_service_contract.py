@@ -1075,3 +1075,51 @@ async def test_p0_1_negative_cases_actually_fail(remote_mode, monkeypatch):
     assert broken2.prompt_tokens == 999
     assert broken2.prompt_tokens != control.prompt_tokens, "破坏后 T1 的断言应当失败"
 
+
+# ============================================================ 复核①② 熔断计数正确性
+# 上一轮复核发现两个非直觉缺陷，现有绿灯用例都抓不到（它们只断言「会打开」/「只有
+# 1 个到达上游」，对「一次失败计几次」「被拒请求是否改计数」不设防）。这两条专门锁定。
+
+
+async def test_recheck_streaming_transport_failure_counts_once(remote_mode):
+    """缺陷①：一次流式传输失败只能给熔断记 **1** 次。
+
+    修复前 `chat_stream` 的 `except httpx.HTTPError` 记一次、其 raise 的 `_unavailable`
+    又记一次 → 连接错/读超时按 +2 计，熔断在 ⌈阈值/2⌉ 就误开（阈值语义被悄悄减半）。
+    """
+    from app.config import get_settings
+
+    breaker.reset()
+    get_settings().model_service_base_url = "http://127.0.0.1:1"  # 必然建连失败（传输错误）
+
+    with pytest.raises(ModelServiceError):
+        await _drain_done(
+            RemoteBackend().chat_stream([{"role": "user", "content": "hi"}], "deepseek-chat")
+        )
+    assert breaker._consecutive_failures == 1, (
+        f"流式传输失败应恰好计 1 次，实际 {breaker._consecutive_failures}（双计回归）"
+    )
+
+
+async def test_recheck_breaker_rejection_not_counted(remote_mode):
+    """缺陷②：被熔断主动拒绝的请求未出网，不得再计入连续失败。
+
+    修复前 `_unavailable` 无条件 `record_failure`，连「因熔断打开而被拒」的请求也算失败，
+    还在 half_open 下清掉在飞探测的 `_probe_in_flight` 位，破坏单探测不变量。
+    """
+    control, _ = remote_mode
+    control.error = {"code": "upstream_error", "http": 502}
+    for _ in range(breaker.threshold):
+        with pytest.raises(ModelServiceError):
+            await RemoteBackend().chat([{"role": "user", "content": "hi"}], "deepseek-chat")
+    assert breaker.state == "open"
+    failures_at_open = breaker._consecutive_failures
+
+    # 熔断已开：这一发在 allow() 处被拒，根本没碰网络，计数不应再涨。
+    with pytest.raises(ModelServiceError) as ei:
+        await RemoteBackend().chat([{"role": "user", "content": "hi"}], "deepseek-chat")
+    assert ei.value.code == "service_unavailable"
+    assert breaker._consecutive_failures == failures_at_open, (
+        "被拒请求不应计入连续失败（此前经 _unavailable 误记）"
+    )
+
