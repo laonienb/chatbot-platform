@@ -31,6 +31,9 @@ class Scenario:
     """单次请求的注入场景（测试驱动）。"""
 
     error: dict[str, Any] | None = None
+    # 流式：把 error 推迟到「已产出 N 个内容 chunk 之后」再抛（首字节**之后**的错误）。
+    # None ⇒ error 在首字节前抛出（HTTP 错误状态路径）。见 §6.7。
+    error_after_chunks: int | None = None
     delay_seconds: float = 0.0  # 上游响应前延迟（测超时）
     first_token_seconds: float = 0.0  # 流式首字节延迟（测首 token 超时）
     chunk_delay: float = 0.01  # 流式相邻 chunk 间隔；测 T6 取消时调大以续住连接
@@ -107,15 +110,22 @@ class FakeUpstream:
         self.started += 1
         t0 = time.monotonic()
         try:
-            if scenario.error:
+            if scenario.error and scenario.error_after_chunks is None:
                 if scenario.delay_seconds:
                     await asyncio.sleep(scenario.delay_seconds)
                 raise _scenario_error(scenario.error)
             if scenario.first_token_seconds:
                 await asyncio.sleep(scenario.first_token_seconds)
+            sent = 0
             for piece in ("这是", " 模型服务的", "流式回复。"):
                 yield {"kind": "chunk", "content": piece}
+                sent += 1
                 await asyncio.sleep(scenario.chunk_delay)
+                # 首字节**之后**的错误（§6.7）：已产出 N 块后再抛 → 服务侧应发流内错误帧
+                if scenario.error_after_chunks is not None and sent >= scenario.error_after_chunks:
+                    raise _scenario_error(
+                        scenario.error or {"code": "internal_error", "retryable": False}
+                    )
             yield {"kind": "usage", "usage": self._usage()}
             if scenario.cost_mode != "absent":
                 yield {"kind": "terminate", "x_model_service": self._xms(scenario)}

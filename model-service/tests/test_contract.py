@@ -259,15 +259,20 @@ async def test_t10_models_catalog(client):
 
 # ---------------------------------------------------------------- T11 超时分层（首 token）
 async def test_t11_first_token_timeout(client, scenario):
+    """T11 / §6.7：上游慢于首 token 超时 → **首字节前**返回 HTTP 504 `upstream_timeout`。
+
+    v1.7（工作单 P1-9）改判：首字节**之前**的失败必须是 **HTTP 错误状态**，不得发成
+    「200 + 流内错误帧」—— 后者会让平台的限流退避、`Retry-After` 透传、熔断计数全部失效。
+    本用例原断言"响应文本里含 upstream_timeout"，在 JSON 错误体下会**假绿**（不含状态码
+    约束），故一并收紧为断言状态码 + code + retryable。
+    """
     from msvc.config import get_settings
 
-    # 场景：首 token 延迟 > 服务自身首 token 超时 → 流内错误码 upstream_timeout
     scenario.first_token_seconds = get_settings().upstream_first_token_timeout + 0.5
-    async with client.stream("POST", "/v1/chat/completions", json=_body(stream=True)) as r:
-        text = ""
-        async for line in r.aiter_lines():
-            text += line + "\n"
-    assert "upstream_timeout" in text
+    r = await client.post("/v1/chat/completions", json=_body(stream=True))
+    assert r.status_code == 504, "首字节前的上游超时必须走 HTTP 错误状态（§6.7）"
+    assert r.json()["error"]["code"] == "upstream_timeout"
+    assert r.json()["error"]["retryable"] is False  # 结果不明 ⇒ 入窗（§8.2.1）
 
 
 async def test_unauthorized_without_token(app):

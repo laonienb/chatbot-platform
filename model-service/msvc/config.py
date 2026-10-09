@@ -26,8 +26,12 @@ class Settings(BaseSettings):
     upstream_first_token_timeout: float = 15.0
     upstream_total_timeout: float = 60.0
 
-    # 幂等窗口（§8.2.1）：≥10 分钟。
+    # 幂等窗口（§8.2.1）：≥10 分钟。窗口对**流式/非流式同等适用**（§8.2.2）。
     idempotency_window_seconds: int = 600
+    # 窗口缓存的条数/体积上限（§8.2.2-3：缓存必须有界）。超限按插入序淘汰最旧条目，
+    # 被淘汰的 key 后续重发按未命中处理（会真实调用上游）——语义已声明于 README。
+    idempotency_cache_max_entries: int = 256
+    idempotency_cache_max_chars: int = 1_000_000
 
     protocol_version: int = 1
     implementation_name: str = "model-service"
