@@ -1320,13 +1320,13 @@ a.copy-btn {
   text-decoration: none;
 }
 .admin-note {
-  color: var(--text-faint);
+  color: var(--text-dim);
   font-size: 11.5px;
   line-height: 1.7;
   margin: 18px 2px 0;
 }
 .admin-note strong {
-  color: var(--text-dim);
+  color: var(--text);
 }
 /* 概览数字默认是渐变文字（background-clip），着色需先撤掉渐变 */
 .usage-summary strong.stat-neg,
@@ -1738,5 +1738,30 @@ html[data-theme="light"] .md-body pre {
 html[data-theme="light"] .key-row code,
 html[data-theme="light"] .keys-table code {
   background: rgba(20, 26, 50, 0.08);
+}
+
+/* 管理后台：--success/--danger 是为深底设计的亮色，白底上对比度不足，
+   在管理后台作用域内压深（不改全局令牌，避免影响他人页面） */
+html[data-theme="light"] .usage-summary strong.stat-pos {
+  color: #157f56;
+}
+html[data-theme="light"] .usage-summary strong.stat-neg {
+  color: #c0333a;
+}
+html[data-theme="light"] .admin-alert {
+  background: rgba(192, 51, 58, 0.07);
+  border-color: rgba(192, 51, 58, 0.32);
+}
+html[data-theme="light"] .admin-alert strong {
+  color: #b3282f;
+}
+html[data-theme="light"] .admin-alert span {
+  color: #5a6070;
+}
+html[data-theme="light"] .admin-note {
+  color: #6b7385;
+}
+html[data-theme="light"] .admin-note strong {
+  color: #4a5163;
 }
 
