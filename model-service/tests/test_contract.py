@@ -55,19 +55,25 @@ async def test_t3_persona_prefix_rejected(client):
 
 
 # ---------------------------------------------------------------- P0-3 红线1 禁字段入站校验
-@pytest.mark.parametrize("field", ["user_id", "conversation_id", "persona"])
-async def test_p0_3_forbidden_field_rejected_400(client, field):
+# 验收①列了四个字段（user_id / conversation_id / persona / trace）——`trace` 是
+# §4.2 v1.5 收编为「v1 禁发」的字段，最易被漏，必须同样有用例（架构师核对遗留①）。
+@pytest.mark.parametrize("field", ["user_id", "conversation_id", "persona", "trace"])
+async def test_p0_3_forbidden_field_rejected_400(client, app, field):
     r = await client.post("/v1/chat/completions", json=_body(**{field: "x"}))
     assert r.status_code == 400
     assert r.json()["error"]["code"] == "invalid_request"
-    # 关键：禁字段必须在任何上游调用前被拒（app.state.upstream 计数不动）
+    # 关键：禁字段必须在任何上游调用前被拒（架构师核对遗留②：注释宣称的验收点必须落地成断言）。
+    # 对齐平台侧 `test_audit_c_forbidden_fields_rejected_platform_side` 的强度（assert 请求数为 0），
+    # 防后人把 guard_request 挪到上游调用之后。
+    assert app.state.upstream.started == 0, "禁字段必须在触达上游前被拒（红线1）"
 
 
-async def test_p0_3_message_level_forbidden_field(client):
+async def test_p0_3_message_level_forbidden_field(client, app):
     body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": "hi", "user_id": "leak"}]}
     r = await client.post("/v1/chat/completions", json=body)
     assert r.status_code == 400
     assert r.json()["error"]["code"] == "invalid_request"
+    assert app.state.upstream.started == 0, "messages 夹带身份字段同样必须在触达上游前被拒"
 
 
 async def test_p0_3_unknown_extension_not_rejected(client):
@@ -165,6 +171,63 @@ async def test_t7_unknown_result_must_cache(client, app):
     app.state.scenario.error = None
     r2 = await client.post("/v1/chat/completions", json=_body(), headers=h)
     assert r2.status_code == 500, "结果不明的失败已入窗 → 重发回放缓存而非重调上游（防双烧）"
+    assert app.state.upstream.started == 1
+
+
+async def test_t7_deterministic_reject_413_must_cache(client, app):
+    """§8.2.1 三分表「确定性拒绝 → 入窗」：413 context_length_exceeded 入窗回放。
+
+    与上一条 `test_t7_unknown_result_must_cache` **语义不同，不是重复用例**：
+    - 那条测「结果不明」（已发起调用后的 5xx，**可能已计费**）→ 入窗理由是**防双烧**；
+    - 本条测「确定性拒绝」（`413`，**同输入必同拒绝**）→ 入窗理由是**回放正确且省一次上游调用**。
+    这正是 P1-7 于 v1.4 立项的理由：若按「4xx 一律不入窗」实现，`413` 会被排除掉。
+    因此本用例必须能捕获「4xx 一刀切」这一类错误实现——否则这道防线无人看守。
+
+    契约依据：§8.2.1 三分表第③行 + §1 红线 11（可重放性按副作用性质三分，不得按状态码段归类）；
+    实现依据：`errors.py:18`（`context_length_exceeded`→413）、`idempotency.py:62`
+    （`status in (413, 404)` 入窗）、`main.py:143-146`（经 `_map_upstream_error` 传真实
+    `retryable=False` 与 `reached_upstream=True`）。
+    """
+    app.state.upstream.reset()
+    h = {"Idempotency-Key": "idem-413"}
+    app.state.scenario.error = {"code": "context_length_exceeded", "retryable": False}
+    first = await client.post("/v1/chat/completions", json=_body(), headers=h)
+    assert first.status_code == 413
+    assert first.json()["error"]["code"] == "context_length_exceeded"
+    assert first.json()["error"]["retryable"] is False
+    assert app.state.upstream.started == 1
+
+    app.state.scenario.error = None  # 模拟"上游恢复"
+    second = await client.post("/v1/chat/completions", json=_body(), headers=h)
+    assert second.status_code == 413, "确定性拒绝必须入窗 → 同 key 重发回放缓存，而非重新调上游"
+    assert second.json()["error"]["code"] == "context_length_exceeded"
+    assert app.state.upstream.started == 1, "回放不得再打上游（否则 413 被当普通 4xx 排除 → 上游重复调用/双烧）"
+
+
+@pytest.mark.parametrize(
+    "bad_body",
+    [
+        pytest.param(lambda: _body(user_id="u-leak"), id="forbidden-field-400"),
+        pytest.param(lambda: _body(model="persona:libai"), id="persona-prefix-400"),
+    ],
+)
+async def test_t7_local_reject_not_cached(client, app, bad_body):
+    """§8.2.1 三分表末行「本地拒绝 → 不入窗」：本地 400 后同 key 仍可被正常处理。
+
+    结构事实（也是本用例要钉住的东西）：`main.py:98` 的 `guard_request(body)` **先于**
+    `:109` 读取 `Idempotency-Key` 与 `:120` 的 `window.begin()` ⇒ 本地拒绝根本不进窗口。
+    若后人把校验挪到 `window.begin()` 之后，第一次拒绝会占住在飞位/写入缓存，同 key 重发
+    将回放 400 或直接 409 —— 客户端退避重试永远失败（§14.2 的必需配套）。
+    """
+    app.state.upstream.reset()
+    h = {"Idempotency-Key": "idem-local-400"}
+    first = await client.post("/v1/chat/completions", json=bad_body(), headers=h)
+    assert first.status_code == 400
+    assert first.json()["error"]["code"] == "invalid_request"
+    assert app.state.upstream.started == 0, "本地拒绝不得触达上游"
+
+    second = await client.post("/v1/chat/completions", json=_body(), headers=h)
+    assert second.status_code == 200, "本地拒绝未入窗 → 同 key 重发应被正常处理（不是回放 400，也不是 409）"
     assert app.state.upstream.started == 1
 
 
