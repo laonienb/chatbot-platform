@@ -451,6 +451,7 @@ async def _stream_reply(
                 assistant_message = await _save_reply(
                     db, conversation, persona, piece, "".join(parts),
                     reservation_id=reservation_id, attribution=attribution, source=source,
+                    error_code=getattr(piece, "terminate_reason", None),
                 )
                 # 记忆提取（不入账，fire-and-forget 后台任务）
                 schedule_extraction(
@@ -651,7 +652,10 @@ async def run_completion_stream(
             if isinstance(piece, StreamDone):
                 if not settled:
                     settled = True
-                    await settle_usage(db, reservation_id, done=piece, attribution=attribution)
+                    await settle_usage(
+                        db, reservation_id, done=piece, attribution=attribution,
+                        error_code=getattr(piece, "terminate_reason", None),
+                    )
             else:
                 parts.append(piece)
             yield piece

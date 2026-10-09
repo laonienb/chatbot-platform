@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     # httpx 的 total 超时对流式不适用，故必须显式实现空闲计时（审计缺口 K）。
     # 必须 > 模型服务上游总超时（60s），满足红线 8「内层 < 外层」。
     model_service_stream_idle_timeout: float = 90.0
+    # §8.1 流式绝对上限：单条 SSE 连接的墙钟生存期，**心跳不可重置**（缺口 M / §15.4）。
+    # 触发走 §8.1.1 收尾（部分照常结算、计熔断、error_code=stream_max_duration），非 §8.4 降级。
+    # 与上面的「空闲上限」、以及模型服务的「upstream_total_s」是三个独立概念，不得合并。
+    model_service_stream_max_duration: float = 180.0
     # 生产环境守卫（§8.4 尾句 / 红线 9）：APP_ENV=prod 且 LLM_BACKEND=mock → 拒绝启动
     app_env: str = "dev"  # dev | prod
     model_service_fallback_direct: str = ""  # §8.4 可选直连降级模型；默认空 = 不降级，直接 503

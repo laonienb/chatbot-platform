@@ -1123,3 +1123,69 @@ async def test_recheck_breaker_rejection_not_counted(remote_mode):
         "被拒请求不应计入连续失败（此前经 _unavailable 误记）"
     )
 
+
+# ============================================================ P1-6 流式绝对上限（§8.1 / §8.1.1）
+
+
+async def test_p1_6_absolute_cap_terminates_despite_keepalive(remote_mode, monkeypatch):
+    """§8.1 缺口 M：心跳能重置空闲计时，但**绝对上限**（心跳不可重置）仍须按时切断流。
+
+    桩发 2 个内容 chunk 后进入沉默期、每 0.1s 吐 `: keepalive`（持续 3s）。空闲上限被撑到
+    30s（心跳永远喂不满它），绝对上限压到 0.5s。正确实现应在 ~0.5s **优雅收尾**（不 raise）、
+    保留已收内容、`terminate_reason=stream_max_duration`、计入熔断一次（§8.1.1）。
+    """
+    import time as _t
+
+    from app.config import get_settings
+
+    control, _ = remote_mode
+    control.silence_after_chunks = 2
+    control.keepalive_during_silence = True
+    control.silence_seconds = 3.0
+    monkeypatch.setattr(get_settings(), "model_service_stream_idle_timeout", 30.0)
+    monkeypatch.setattr(get_settings(), "model_service_stream_max_duration", 0.5)
+    breaker.reset()
+
+    t0 = _t.monotonic()
+    parts, done = await _drain_done(
+        RemoteBackend().chat_stream([{"role": "user", "content": "hi"}], "deepseek-chat")
+    )
+    elapsed = _t.monotonic() - t0
+
+    assert elapsed < 2.0, f"绝对上限未在 ~0.5s 切断（实际 {elapsed:.2f}s，疑似空闲计时误当兜底）"
+    assert done is not None and done.terminate_reason == "stream_max_duration"
+    assert len(parts) >= 1, "绝对上限前已产生的部分内容必须保留"
+    assert breaker._consecutive_failures == 1, "§8.1.1-4：绝对上限计入熔断一次"
+
+
+async def test_p1_6_absolute_cap_settles_partial_not_failed(
+    remote_mode, client, auth_headers, db_engine
+):
+    """§8.1.1-3/-5：绝对上限的账本按已收 token **结算为 settled（不是 failed）**，
+    并记 `error_code=stream_max_duration`。直接喂一个带 terminate_reason 的 StreamDone 走结算。
+    """
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from app.llm.gateway import StreamDone
+
+    async with async_sessionmaker(db_engine, expire_on_commit=False)() as s:
+        uid = await _any_user_id(s)
+        rid = await reserve_usage(
+            s, user_id=uid, model_requested="deepseek-chat", model_upstream="deepseek-chat"
+        )
+        done = StreamDone(
+            model="deepseek-chat",
+            prompt_tokens=50,
+            completion_tokens=20,
+            metering_source="estimated",
+            needs_review=True,
+            terminate_reason="stream_max_duration",
+        )
+        # 上层（chat.py）会把 done.terminate_reason 作为 error_code 传入；此处模拟该契约
+        await settle_usage(s, rid, done=done, error_code=done.terminate_reason)
+        log = (await s.execute(select(UsageLog))).scalars().one()
+
+    assert log.status == "settled", "§8.1.1-3：绝对上限部分内容结算为 settled，不是 failed"
+    assert log.error_code == "stream_max_duration", "§8.1.1-5：记 error_code 便于归因"
+    assert log.completion_tokens == 20, "按已收 token 结算"
+

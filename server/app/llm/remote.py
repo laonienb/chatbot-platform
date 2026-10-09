@@ -483,6 +483,9 @@ class RemoteBackend:
         # 语义是"沉默时长"而非"总时长"：只有**协议活动**（注释行/事件行/data 行）重置，
         # 纯空白行不算 —— 否则一个持续发空行的服务能把连接无限吊住。
         idle_limit = s.model_service_stream_idle_timeout
+        abs_limit = s.model_service_stream_max_duration
+        started = time.monotonic()
+        terminate_reason: str | None = None
         try:
             # 取消传播（红线6）：消费方断开 → 本生成器被关闭 → async with 退出
             # → httpx 关闭连接 → 模型服务侧感知断连并中止上游。
@@ -492,13 +495,25 @@ class RemoteBackend:
                     raise self._error_from_response(resp)
                 line_iter = resp.aiter_lines().__aiter__()
                 while True:
+                    # §8.1 两层独立计时：
+                    # - 空闲上限 idle_limit：任一协议行（含 `:` 心跳）都重置；
+                    # - 绝对上限 abs_limit：墙钟总生存期，心跳**不**重置（缺口 M）。
+                    remaining = abs_limit - (time.monotonic() - started)
+                    if remaining <= 0:
+                        terminate_reason = "stream_max_duration"  # §8.1.1 收尾，见 finally 后
+                        break
                     try:
                         line = await asyncio.wait_for(
-                            line_iter.__anext__(), timeout=idle_limit
+                            line_iter.__anext__(), timeout=min(idle_limit, remaining)
                         )
                     except StopAsyncIteration:
                         break
                     except TimeoutError:
+                        if abs_limit - (time.monotonic() - started) <= 0:
+                            # 绝对上限命中（即便心跳在续命）→ §8.1.1，非 §8.4 降级
+                            terminate_reason = "stream_max_duration"
+                            break
+                        # 纯沉默超空闲上限 → 断开走 §8.4 降级（缺口 K）
                         breaker.record_failure()
                         raise ModelServiceError(
                             "upstream_timeout",
@@ -551,7 +566,11 @@ class RemoteBackend:
         finally:
             await client.aclose()
 
-        breaker.record_success()
+        if terminate_reason == "stream_max_duration":
+            # §8.1.1-4：绝对上限属连接类失败，计入熔断；但不 raise，落到下面按已收 token 结算。
+            breaker.record_failure()
+        else:
+            breaker.record_success()
         prompt, completion, cache_read, reasoning = _usage_from(usage)
         metering = "provider"
         if prompt == 0 or completion == 0:
@@ -578,4 +597,5 @@ class RemoteBackend:
             cost_usd=_parse_cost(xms.get("cost_usd")),
             cost_status=xms.get("cost_status"),
             fallback_used=bool(xms.get("fallback_used", False)),
+            terminate_reason=terminate_reason,
         )

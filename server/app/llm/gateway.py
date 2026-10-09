@@ -80,6 +80,9 @@ class StreamDone:
     cost_usd: Decimal | None = None
     cost_status: str | None = None
     fallback_used: bool = False
+    # 流式非正常终止原因（§8.1.1）：绝对上限触发时 = "stream_max_duration"，正常结束为 None。
+    # 结算层据此写 error_code；但内容照常落库、状态仍按已收 token 结算（不是 failed）。
+    terminate_reason: str | None = None
 
 
 def _estimate_tokens(text: str) -> int:
