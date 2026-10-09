@@ -96,6 +96,38 @@ async def test_t4_stream_chunks_usage_terminate_done(client):
     # 顺序：usage 早于 terminate 早于 [DONE]
     assert text.index('"usage"') < text.index("event: model_service") < text.index("[DONE]")
 
+    # ---- P1-8 / §6.6：收尾 chunk 携带**非 null** finish_reason，且位于 usage chunk 之前 ----
+    # 结构级断言（不用文本匹配：内容 chunk 里也有 `"finish_reason": null`，文本判断会假绿）。
+    objs = []
+    for line in text.splitlines():
+        if not line.startswith("data:"):
+            continue
+        payload = line[len("data:") :].strip()
+        if payload != "[DONE]":
+            objs.append(json.loads(payload))
+    finish_at = next(
+        (i for i, o in enumerate(objs) if any(c.get("finish_reason") for c in (o.get("choices") or []))),
+        None,
+    )
+    usage_at = next((i for i, o in enumerate(objs) if isinstance(o.get("usage"), dict)), None)
+    assert finish_at is not None, "§6.6：必须存在携带非 null finish_reason 的收尾 chunk（P1-8）"
+    assert usage_at is not None, "§6.2：必须存在 usage chunk"
+    assert finish_at < usage_at, "§6.6：收尾 chunk 必须位于 usage chunk **之前**"
+
+
+async def test_p1_8_finish_reason_reflects_scenario(client, scenario):
+    """P1-8：`finish_reason` 取**上游实际值**，不是硬编码 `stop`。
+
+    平台据此区分「正常结束 vs 被 max_tokens 截断」（工作单 P1-1 的价值所在）。若实现把
+    收尾 chunk 写成固定 `"stop"`，本用例必须变红。
+    """
+    scenario.finish_reason = "length"
+    async with client.stream("POST", "/v1/chat/completions", json=_body(stream=True)) as r:
+        text = ""
+        async for line in r.aiter_lines():
+            text += line + "\n"
+    assert '"finish_reason": "length"' in text, "收尾 chunk 必须回显上游实际的终止原因"
+
 
 # ---------------------------------------------------------------- T5 429 双语义
 async def test_t5_rate_limited_has_retry_after(client, scenario):
@@ -184,8 +216,9 @@ async def test_t7_deterministic_reject_413_must_cache(client, app):
     因此本用例必须能捕获「4xx 一刀切」这一类错误实现——否则这道防线无人看守。
 
     契约依据：§8.2.1 三分表第③行 + §1 红线 11（可重放性按副作用性质三分，不得按状态码段归类）；
-    实现依据：`errors.py:18`（`context_length_exceeded`→413）、`idempotency.py:62`
-    （`status in (413, 404)` 入窗）、`main.py:143-146`（经 `_map_upstream_error` 传真实
+    实现依据：`errors.py`（`context_length_exceeded`→413）、`idempotency.py` 的
+    `should_cache`（**两布尔**：`retryable=False` 且 `reached_upstream=True` ⇒ 入窗，无状态码
+    白名单——见 P1-11）、`main.py` 的 `_map_upstream_error` → `_finish_window`（传真实
     `retryable=False` 与 `reached_upstream=True`）。
     """
     app.state.upstream.reset()
@@ -202,6 +235,40 @@ async def test_t7_deterministic_reject_413_must_cache(client, app):
     assert second.status_code == 413, "确定性拒绝必须入窗 → 同 key 重发回放缓存，而非重新调上游"
     assert second.json()["error"]["code"] == "context_length_exceeded"
     assert app.state.upstream.started == 1, "回放不得再打上游（否则 413 被当普通 4xx 排除 → 上游重复调用/双烧）"
+
+
+@pytest.mark.parametrize(
+    ("code", "http"),
+    [
+        pytest.param("upstream_auth_failed", 401, id="upstream-401-凭证失效"),
+        pytest.param("compliance_denied", 403, id="upstream-403-内容策略"),
+    ],
+)
+async def test_p1_11_upstream_deterministic_reject_must_cache(client, app, code, http):
+    """P1-11：入窗判定是**两个布尔**，不是 `status in (413, 404)` 白名单。
+
+    上游 401（provider 凭证失效）与上游 403（内容策略拒绝）和 413 同属「同输入必同拒绝」
+    的**永久性拒绝**：已到达上游、重发必然同样失败 ⇒ 必须入窗回放。旧实现按状态码白名单
+    判定时它们会被漏掉，于是窗口内每次重发都**白打一次上游**（§8.2.1 v1.6 澄清、§19.3-G6）。
+
+    本用例看守的正是那类白名单：把 `should_cache` 改回 `status in (413, 404)` 必须变红。
+    与 `test_t7_local_reject_not_cached` 的分界在 `started == 1` —— 错误由 `FakeUpstream`
+    抛出（确实到了上游），本地拒绝则是 `started == 0` 且根本不进窗口。
+    """
+    app.state.upstream.reset()
+    h = {"Idempotency-Key": f"idem-{code}"}
+    app.state.scenario.error = {"code": code, "retryable": False}
+
+    first = await client.post("/v1/chat/completions", json=_body(), headers=h)
+    assert first.status_code == http
+    assert first.json()["error"]["code"] == code
+    assert app.state.upstream.started == 1, "错误须来自上游，否则测的是本地拒绝路径、看守不到本项"
+
+    app.state.scenario.error = None  # 模拟"上游恢复"
+    second = await client.post("/v1/chat/completions", json=_body(), headers=h)
+    assert second.status_code == http, "上游永久性拒绝须入窗 → 同 key 重发回放缓存"
+    assert second.json()["error"]["code"] == code
+    assert app.state.upstream.started == 1, "回放不得重调上游"
 
 
 @pytest.mark.parametrize(

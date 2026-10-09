@@ -323,6 +323,12 @@ async def _handle_stream(request, body, model, scenario, idem) -> Response:
                 if kind == "chunk":
                     terminal.content += ev["content"]
                     yield _sse(_chunk(ev["content"], model_used))
+                elif kind == "finish":
+                    # §6.6（工作单 P1-8）：收尾 chunk 必须携带**非 null** finish_reason，且位于
+                    # usage chunk **之前**。此前服务侧从不发它 ⇒ 平台的 StreamDone.finish_reason
+                    # 恒 None、P1-1 归因在生产路径静默失效（平台自家桩已发，故其测试全绿 = 桩分歧）。
+                    terminal.finish_reason = ev["finish_reason"]
+                    yield _sse(_chunk(None, model_used, ev["finish_reason"]))
                 elif kind == "usage":
                     terminal.usage = ev["usage"]
                     yield _sse(_usage_chunk(ev["usage"], model_used))
@@ -331,15 +337,24 @@ async def _handle_stream(request, body, model, scenario, idem) -> Response:
                     yield _sse({"x_model_service": ev["x_model_service"]}, event="model_service")
                 elif kind == "done":
                     break
-                # 取下一个事件：**首字节之后**的错误一律以流内错误帧收尾（状态码已无法改）
+                # 取下一个事件：**首字节之后**的错误一律以流内错误帧收尾（状态码已无法改）。
+                # O1（v1.7）：中途停顿用**独立可配**预算 `upstream_chunk_idle_timeout`
+                # （默认 30s），**不与首 token 超时共用硬编码值**——旧实现硬编码 1.0s，
+                # 真实上游中途正常停顿 >1s 即被误杀，且归因文案错写成"首 token 超时"。
                 try:
-                    ev = await asyncio.wait_for(agen.__anext__(), timeout=1.0)
+                    ev = await asyncio.wait_for(
+                        agen.__anext__(), timeout=settings.upstream_chunk_idle_timeout
+                    )
                 except StopAsyncIteration:
                     ev = None
                 except asyncio.TimeoutError:
                     terminal.error = _error_payload(
-                        "upstream_timeout", "上游首 token 超时", retryable=False
+                        "upstream_chunk_timeout",
+                        f"上游中途停顿超过 {settings.upstream_chunk_idle_timeout}s 未产出下一个事件"
+                        "（§8.1 中途空闲预算，与首 token 超时区分归因）",
+                        retryable=False,
                     )
+                    await _aclose(agen)  # 红线6：别让上游生成器悬空
                     break
                 except _ScenarioError as exc:
                     err = await _map_upstream_error(exc)
@@ -350,6 +365,7 @@ async def _handle_stream(request, body, model, scenario, idem) -> Response:
                     # §6.7 G3-2：错误帧**可**携带实测部分 usage（加法字段）
                     if isinstance(exc.payload.get("usage"), dict):
                         terminal.usage = exc.payload["usage"]
+                    await _aclose(agen)
                     break
             if terminal.error is not None:
                 yield _sse(_error_event(terminal.error, terminal.usage))
@@ -387,6 +403,7 @@ async def capabilities(request: Request) -> Response:
                 # §8.1-2：暴露实际超时值供平台启动断言「内层 < 外层」
                 "timeouts": {
                     "upstream_first_token_s": s.upstream_first_token_timeout,
+                    "upstream_chunk_idle_s": s.upstream_chunk_idle_timeout,
                     "upstream_total_s": s.upstream_total_timeout,
                 },
             },

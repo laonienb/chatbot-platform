@@ -24,6 +24,10 @@ class Settings(BaseSettings):
 
     # 超时（§8.1，模型服务侧自持，红线8：内层 < 平台流式空闲上限 90s）。
     upstream_first_token_timeout: float = 15.0
+    # 首字节**之后**的 chunk 间隔预算（O1，v1.7）：中途停顿超此值 → 流内错误帧
+    # `upstream_chunk_timeout`（与首 token 超时的 `upstream_timeout` 区分归因）。
+    # 旧实现硬编码 1.0s，会把真实上游（LiteLLMProvider）的正常停顿误杀。
+    upstream_chunk_idle_timeout: float = 30.0
     upstream_total_timeout: float = 60.0
 
     # 幂等窗口（§8.2.1）：≥10 分钟。窗口对**流式/非流式同等适用**（§8.2.2）。

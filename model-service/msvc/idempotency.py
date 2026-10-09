@@ -144,16 +144,24 @@ class IdempotencyWindow:
             )
 
     def should_cache(self, status: int, retryable: bool, reached_upstream: bool) -> bool:
-        """§8.2.1 三分表判定：这次结果是否入窗。"""
-        if retryable:  # 瞬时拒绝 / 未送达 → 不入窗
+        """§8.2.1 入窗判定：**两个布尔**，不存在状态码白名单分支（工作单 P1-11）。
+
+        | 情形 | 判据 | 入窗 |
+        |---|---|---|
+        | 上游瞬时拒绝 / 未送达 | `retryable=True` | ❌ 重发可能成功，入窗会堵死退避 |
+        | 成功响应 | 2xx | ✅ 常规回放对象 |
+        | 结果不明（超时、已发起调用后的 5xx）**或**上游永久性拒绝（400/401/403/413/404） | `retryable=False` 且 `reached_upstream=True` | ✅ 前者防双烧、后者同输入必同拒绝 |
+        | 本地拒绝（无副作用） | `reached_upstream=False` | ❌ |
+
+        ⚠️ 本函数**不得**写成 `status in (413, 404)` 式的白名单：那样虽能过针对 413 的
+        用例，却会漏掉上游 401/403/400 这类**已到达上游的永久性拒绝**（§8.2.1 v1.6 澄清，
+        工作单 P1-11 记该写法在此处已错两次）。`status` 形参只用于成功判定。
+        """
+        if retryable:
             return False
         if 200 <= status < 300:
-            return True  # 成功
-        if status in (413, 404):
-            return True  # 确定性拒绝（同输入必同拒绝）
-        if 500 <= status < 600 and reached_upstream:
-            return True  # 结果不明（已发起调用后的 5xx/超时）→ 防双烧必须入窗
-        return False  # 本地拒绝（400/401/403）等 → 不入窗
+            return True
+        return reached_upstream
 
     def clear(self) -> None:
         self._store.clear()

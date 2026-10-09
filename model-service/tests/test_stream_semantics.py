@@ -218,3 +218,97 @@ async def test_p1_10_replay_chunk_boundary_may_differ(client, app, kind):
 
     assert "".join(_content_chunks(first["raw"])) == "".join(_content_chunks(replay["raw"]))
     assert first["content"] == replay["content"]
+
+
+# ============================================================ P1-8 收尾 chunk 的 finish_reason
+async def test_p1_8_success_stream_carries_finish_reason(client, scenario):
+    """P1-8 / §6.6：成功流必须有一个携带**非 null** `finish_reason` 的收尾 chunk，且在 usage 前。
+
+    服务侧此前从不发它（`provider.py` 不 yield 收尾事件、`main.py` 调 `_chunk` 不传 finish），
+    而平台侧 `remote.py` 已在解析该字段并填进 `StreamDone.finish_reason`——**平台自家桩已发、
+    真实服务不发**，所以平台的 P1-1 归因在生产路径静默失效。本用例把"服务侧真的发"钉住。
+    """
+    scenario.finish_reason = "length"  # 上游实际值：被 max_tokens 截断
+    status, got = await _collect(client)
+    assert status == 200
+    assert got["finish_reason"] == "length", "收尾 chunk 的 finish_reason 必须是上游实际值"
+    # 顺序：finish chunk 在 usage chunk 之前（§6.6）
+    lines = [l for l in got["raw"].splitlines() if l.startswith("data:")]
+    at_finish = next(i for i, l in enumerate(lines) if '"finish_reason": "length"' in l)
+    at_usage = next(i for i, l in enumerate(lines) if '"usage"' in l)
+    assert at_finish < at_usage
+
+
+async def test_p1_8_replay_preserves_finish_reason(client, app, scenario):
+    """§8.2.2-3：终态重放的一致性清单里含 `finish_reason` —— 回放必须与首次同值。
+
+    若缓存只存内容/usage 而丢掉 finish_reason，重放的终态就与首次**不等价**（平台侧
+    归因从 `length` 变成 None），违反本节"内容文本、usage、finish_reason、终止事件一致"。
+    """
+    app.state.upstream.reset()
+    scenario.finish_reason = "length"
+    h = {"Idempotency-Key": "idem-finish-replay"}
+    _, first = await _collect(client, h)
+    _, replay = await _collect(client, h)
+    assert first["finish_reason"] == "length"
+    assert replay["finish_reason"] == first["finish_reason"], "终态重放必须保持 finish_reason"
+    assert replay["usage"] == first["usage"]
+    assert app.state.upstream.started == 1
+
+
+# ============================================================ P1-9 验收⑥：中途停顿不得被误杀（O1）
+async def test_p1_9_mid_stream_stall_within_budget_is_not_killed(client, scenario):
+    """P1-9 ⑥ / O1：真实上游偶发的 **>1s 停顿是正常的**，不得被 chunk 间隔预算误杀。
+
+    旧实现把首字节后的间隔超时**硬编码为 1.0s**，且触发时文案写「上游首 token 超时」——
+    真实上游（推理模型、网络抖动）中途停 2s 就会被判失败并误归因。默认预算 30s，
+    故 2s 停顿必须完整跑完（内容 + usage + 收尾 + [DONE]）。
+    """
+    from msvc.config import get_settings
+
+    assert get_settings().upstream_chunk_idle_timeout >= 5.0, (
+        "中途空闲预算不得小于 5s（O1 定案值 30s，压回 1s 等于把误杀改回来）"
+    )
+    scenario.stall_after_chunks = 1
+    scenario.stall_seconds = 2.0
+    status, got = await _collect(client)
+    assert status == 200
+    assert got["error"] is None, "2s 停顿在预算内，不得产生流内错误帧"
+    assert got["content"], "内容必须完整"
+    assert got["finish_reason"], "P1-8：正常收尾必须带 finish_reason"
+    assert got["done"] is True
+
+
+# ============================================================ P1-9 验收⑦：超预算归因须独立成码
+async def test_p1_9_chunk_budget_exceeded_has_its_own_code(client, scenario, monkeypatch):
+    """P1-9 ⑦：中途停顿超预算 → `upstream_chunk_timeout`，**不得**复用 `upstream_timeout`。
+
+    §7.1：两类失败「入窗结论相同、归因不同」，日志与 `error_code` 必须可区分。首字节已过
+    ⇒ 状态码改不了，只能以流内错误帧收尾（§6.7），其后仍须 `[DONE]`（G3-1）。
+    """
+    from msvc.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "upstream_chunk_idle_timeout", 0.3)
+    scenario.stall_after_chunks = 1
+    scenario.stall_seconds = 3.0
+    status, got = await _collect(client)
+    assert status == 200, "首字节已过 → 只能流内错误帧，不能改状态码"
+    assert got["error"] is not None
+    assert got["error"]["code"] == "upstream_chunk_timeout", "归因必须区别于首 token 超时"
+    assert got["error"]["retryable"] is False, "结果不明/可能已计费 ⇒ 入窗（§8.2.1）"
+    assert got["content"], "已产出的部分内容必须保留"
+    assert got["done"] is True, "§6.7 G3-1：错误帧之后仍须发 [DONE]"
+
+
+async def test_p1_9_capabilities_exposes_chunk_idle_budget(client):
+    """§8.1-2 / 架构师B H2：`capabilities.timeouts` 必须暴露中途空闲预算。
+
+    平台启动自检据此断言「内层 < 外层」。缺这个字段，服务侧把预算配成 > 平台流式空闲
+    上限（90s）时无人拦截——平台会先断开并把归因抢走。
+    """
+    d = (await client.get("/v1/capabilities")).json()
+    timeouts = d["features"]["timeouts"]
+    assert "upstream_chunk_idle_s" in timeouts, "中途空闲预算须可被平台观测"
+    assert timeouts["upstream_chunk_idle_s"] > 1.0, (
+        "预算不得回退到旧的硬编码 1s（O1：真实上游正常停顿即被误杀）"
+    )

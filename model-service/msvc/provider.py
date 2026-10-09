@@ -37,12 +37,17 @@ class Scenario:
     delay_seconds: float = 0.0  # 上游响应前延迟（测超时）
     first_token_seconds: float = 0.0  # 流式首字节延迟（测首 token 超时）
     chunk_delay: float = 0.01  # 流式相邻 chunk 间隔；测 T6 取消时调大以续住连接
+    # 流式：产出 N 个 chunk 后**停顿** M 秒（中途空闲，测 O1 的 chunk 间隔预算）。
+    stall_after_chunks: int | None = None
+    stall_seconds: float = 0.0
     silence_after_chunks: int | None = None  # 发满 N 块后沉默
     keepalive_during_silence: bool = False
     silence_seconds: float = 5.0
     cost_mode: str = "exact"  # exact | unknown | absent
     provider: str = "deepseek"
     model_used: str = "deepseek/deepseek-chat"
+    # 流式收尾的 `finish_reason`（§6.6：`stop` / `length` / 上游实际值）。P1-8。
+    finish_reason: str = "stop"
 
 
 class FakeUpstream:
@@ -106,7 +111,12 @@ class FakeUpstream:
         )
 
     async def stream(self, body: dict, scenario: Scenario) -> AsyncIterator[dict[str, Any]]:
-        """yield 事件字典：{"kind":"chunk"|"usage"|"terminate"|"keepalive"|"done", ...}。"""
+        """yield 事件字典：{"kind":"chunk"|"finish"|"usage"|"terminate"|"done", ...}。
+
+        `finish` 是**收尾事件**（§6.6 / 工作单 P1-8）：上游实际终止原因，服务侧据此发
+        带非 null `finish_reason` 的最后一个 chunk。真实 provider 从
+        `chunk.choices[0].finish_reason` 取；fake 用 `scenario.finish_reason`。
+        """
         self.started += 1
         t0 = time.monotonic()
         try:
@@ -120,12 +130,16 @@ class FakeUpstream:
             for piece in ("这是", " 模型服务的", "流式回复。"):
                 yield {"kind": "chunk", "content": piece}
                 sent += 1
+                # 中途停顿（O1）：真实上游偶发的 >1s 停顿**不得**被误杀
+                if scenario.stall_after_chunks is not None and sent >= scenario.stall_after_chunks:
+                    await asyncio.sleep(scenario.stall_seconds)
                 await asyncio.sleep(scenario.chunk_delay)
                 # 首字节**之后**的错误（§6.7）：已产出 N 块后再抛 → 服务侧应发流内错误帧
                 if scenario.error_after_chunks is not None and sent >= scenario.error_after_chunks:
                     raise _scenario_error(
                         scenario.error or {"code": "internal_error", "retryable": False}
                     )
+            yield {"kind": "finish", "finish_reason": scenario.finish_reason}
             yield {"kind": "usage", "usage": self._usage()}
             if scenario.cost_mode != "absent":
                 yield {"kind": "terminate", "x_model_service": self._xms(scenario)}
