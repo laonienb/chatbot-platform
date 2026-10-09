@@ -35,3 +35,7 @@ logs/
 data/
 *.sqlite3
 *.db
+
+# 浏览器/前端验证工具产物（前一位前端 agent 的 playwright-cli 遗留）
+.playwright-cli/
+output/

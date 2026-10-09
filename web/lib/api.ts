@@ -23,52 +23,141 @@ export function clearTokens() {
   localStorage.removeItem(REFRESH_KEY);
 }
 
-export type ApiErrorKind = "balance" | "rate_limit" | "quota";
+/**
+ * 错误语义分类（供 UI 差异化处理）。
+ * - balance        余额不足（402）：引导充值，**禁止自动重试**
+ * - quota          额度/预算用尽（429 budget_exhausted / 无 Retry-After）：重试无用
+ * - rate_limit     限流（429 rate_limited / 带 Retry-After）：可按 retryAfter 退避
+ * - service        服务繁忙（503 service_unavailable / upstream_error）：可稍后手动重试
+ * - context        上下文超长（413）：需用户裁剪输入，重试无用
+ * - forbidden      合规否决（403 compliance_denied）：该模型不可用，重试无用
+ * - model_missing  模型不存在（404 model_not_found）：重试无用
+ */
+export type ApiErrorKind =
+  | "balance"
+  | "quota"
+  | "rate_limit"
+  | "service"
+  | "context"
+  | "forbidden"
+  | "model_missing";
 
 export class ApiError extends Error {
   status: number;
-  /** 计费拒绝语义（402/429），按 AGENTS.md「三」的通告约定 */
   kind?: ApiErrorKind;
   /** 仅 rate_limit：限流退避秒数（来自 Retry-After） */
   retryAfter?: number;
-  constructor(status: number, message: string, opts?: { kind?: ApiErrorKind; retryAfter?: number }) {
+  /** 平台 / 模型服务的机器可判语义码（协议 §7），无则为 undefined */
+  code?: string;
+  constructor(
+    status: number,
+    message: string,
+    opts?: { kind?: ApiErrorKind; retryAfter?: number; code?: string }
+  ) {
     super(message);
     this.status = status;
     this.kind = opts?.kind;
     this.retryAfter = opts?.retryAfter;
+    this.code = opts?.code;
   }
 }
 
 /**
+ * 从响应体取「可展示文案 + 机器可判 code」。
+ *
+ * 两种面形状都要认（已核实后端实现，非猜测）：
+ * - 原生面：`{"detail": "...", "code": "rate_limited"}`
+ * - 兼容面：`{"error": {"message": "...", "code": "rate_limited"}}`
+ * 错误体本身可能就是流式里的帧，这里只负责已解析的 JSON 对象。
+ */
+function readErrorBody(body: unknown, fallback: string): { message: string; code?: string } {
+  if (!body || typeof body !== "object") return { message: fallback };
+  const b = body as Record<string, unknown>;
+  const err = b.error as Record<string, unknown> | undefined;
+  // 兼容面把文案放在 error.message；原生面在顶层 detail
+  const message =
+    (typeof err?.message === "string" && err.message) ||
+    (typeof b.detail === "string" && b.detail) ||
+    (typeof err?.detail === "string" && err.detail) ||
+    (typeof b.message === "string" && b.message) ||
+    fallback;
+  // code 可能在顶层（原生面）或 error.code（兼容面）
+  const code =
+    (typeof err?.code === "string" && err.code) ||
+    (typeof b.code === "string" && b.code) ||
+    undefined;
+  return { message, code };
+}
+
+/**
+ * 服务端 code → 前端语义 + 展示文案（协议 §7 的 code 表）。
+ * 优先按 code 判读（机器可判、无歧义）；code 缺失时回退到状态码 + Retry-After 启发式。
+ *
+ * 为什么要 code 优先：旧约定靠「429 有没有 Retry-After」区分限流与预算耗尽，
+ * 而上游 429 常自带 Retry-After —— 一旦平台透传，`budget_exhausted`（重试无用）
+ * 会被误判成限流并自动退避重试。协议 §7 明确「旧约定保留一个版本周期后废弃」，
+ * 故此处主动切换到 code 优先，同时保留启发式以免后端未发 code 时行为倒退。
+ */
+function classify(
+  status: number,
+  code: string | undefined,
+  retryAfter: number | undefined,
+  message: string
+): ApiError {
+  const withKind = (kind: ApiErrorKind, text: string, extra?: { retryAfter?: number }) =>
+    new ApiError(status, text, { kind, code, ...extra });
+
+  switch (code) {
+    case "rate_limited":
+      return withKind(
+        "rate_limit",
+        retryAfter ? `操作过于频繁，请 ${retryAfter} 秒后再试` : "操作过于频繁，请稍后再试",
+        { retryAfter }
+      );
+    case "budget_exhausted":
+      return withKind("quota", "本月额度已用尽，请充值或联系管理员（重试无效）");
+    case "service_unavailable":
+    case "upstream_error":
+      return withKind("service", "服务繁忙，请稍后重试");
+    case "context_length_exceeded":
+      return withKind("context", "对话上下文过长，请精简后重试（或开新会话）");
+    case "compliance_denied":
+      return withKind("forbidden", "该模型当前不可用，请更换模型");
+    case "model_not_found":
+      return withKind("model_missing", "模型不存在或已下线，请刷新模型列表");
+  }
+
+  // ---- code 缺失或未知：回退到状态码启发式（保持既有行为）----
+  if (status === 402) return withKind("balance", `${message}，请充值或联系管理员`);
+  if (status === 429) {
+    return retryAfter
+      ? withKind("rate_limit", `操作过于频繁，请 ${retryAfter} 秒后再试`, { retryAfter })
+      : withKind("quota", "本月额度已用尽，请充值或联系管理员（重试无效）");
+  }
+  if (status === 503) return withKind("service", "服务繁忙，请稍后重试");
+  if (status === 413) return withKind("context", "对话上下文过长，请精简后重试（或开新会话）");
+  if (status === 403) return withKind("forbidden", "该模型当前不可用，请更换模型");
+  if (status === 404) return withKind("model_missing", "模型不存在或已下线，请刷新模型列表");
+  return new ApiError(status, message, { code });
+}
+
+/**
  * 把非 2xx 响应翻译成可展示的错误。
- * 计费拒绝语义（见 AGENTS.md「三」通告，commit d7a132c）：
- * - 402 余额不足 → 引导充值，禁止自动重试
- * - 429 带 Retry-After → 限流，按秒退避
- * - 429 不带 Retry-After → 月度配额用尽，重试无用
+ * 判读顺序：`error.code`（协议 §7）→ 状态码 → `Retry-After` 启发式。
  * 注意：401 的刷新重试逻辑不在此处，且绝不扩展到其他 4xx。
  */
 async function interpretError(resp: Response): Promise<ApiError> {
-  let detail = `请求失败 (${resp.status})`;
+  let message = `请求失败 (${resp.status})`;
+  let code: string | undefined;
   try {
-    detail = (await resp.json()).detail ?? detail;
+    ({ message, code } = readErrorBody(await resp.json(), message));
   } catch {
-    /* keep */
+    /* 非 JSON 响应体：保留兜底文案 */
   }
-  if (resp.status === 402) {
-    return new ApiError(402, `${detail}，请充值或联系管理员`, { kind: "balance" });
-  }
-  if (resp.status === 429) {
-    const ra = resp.headers.get("Retry-After");
-    const secs = ra !== null ? Number(ra) : NaN;
-    if (Number.isFinite(secs) && secs > 0) {
-      return new ApiError(429, `操作过于频繁，请 ${Math.round(secs)} 秒后再试`, {
-        kind: "rate_limit",
-        retryAfter: Math.round(secs),
-      });
-    }
-    return new ApiError(429, "本月额度已用尽，请充值或联系管理员（重试无效）", { kind: "quota" });
-  }
-  return new ApiError(resp.status, detail);
+  const ra = resp.headers.get("Retry-After");
+  const secs = ra !== null ? Number(ra) : NaN;
+  const retryAfter = Number.isFinite(secs) && secs > 0 ? Math.round(secs) : undefined;
+  return classify(resp.status, code, retryAfter, message);
 }
 
 async function refreshTokens(): Promise<boolean> {
@@ -107,8 +196,19 @@ export async function api<T = unknown>(path: string, init: RequestInit = {}, ret
   return resp.json();
 }
 
-/** 解析 SSE 流（OpenAI chunk 格式），逐个产出 content 增量；[DONE] 结束。 */
-export async function streamSSE(resp: Response, onDelta: (text: string) => void): Promise<void> {
+/** 解析 SSE 流（OpenAI chunk 格式），逐个产出 content 增量；[DONE] 结束。
+ *
+ * 宽松解析（协议 §6）：`: keepalive` 注释行与未知命名事件一律忽略——
+ * 本实现只认 `data: ` 行，天然满足（模型服务协议会发 `event: model_service`
+ * 终止事件与心跳注释，都不应被当成内容或错误）。
+ *
+ * 流内错误：兼容面在流中途会发 `data: {"error": {...}}`（HTTP 已是 200，
+ * 无法再改状态码）。此时必须抛出，否则错误被静默吞掉、用户只看到空回复。
+ */
+export async function streamSSE(
+  resp: Response,
+  opts: { onDelta: (text: string) => void }
+): Promise<void> {
   const reader = resp.body!.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
@@ -123,13 +223,21 @@ export async function streamSSE(resp: Response, onDelta: (text: string) => void)
       if (!line.startsWith("data: ")) continue;
       const payload = line.slice(6);
       if (payload === "[DONE]") return;
+      let obj: unknown;
       try {
-        const obj = JSON.parse(payload);
-        const content = obj?.choices?.[0]?.delta?.content;
-        if (typeof content === "string" && content) onDelta(content);
+        obj = JSON.parse(payload);
       } catch {
-        /* 跳过无法解析的帧 */
+        continue; // 跳过无法解析的帧
       }
+      const body = obj as Record<string, unknown> | null;
+      if (body && typeof body === "object" && body.error) {
+        const { message, code } = readErrorBody(body, "生成失败");
+        // 流已开始，HTTP 状态无从更改：以 200 传入，判读主要由 code 决定
+        throw classify(resp.status, code, undefined, message);
+      }
+      const content = (body?.choices as { delta?: { content?: unknown } }[] | undefined)?.[0]?.delta
+        ?.content;
+      if (typeof content === "string" && content) opts.onDelta(content);
     }
   }
 }
@@ -370,7 +478,7 @@ async function postSSE(
   if (!resp.ok) {
     throw await interpretError(resp);
   }
-  await streamSSE(resp, onDelta);
+  await streamSSE(resp, { onDelta });
 }
 
 export async function sendMessageStream(
