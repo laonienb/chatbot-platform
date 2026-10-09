@@ -447,12 +447,33 @@ export const platformApi = {
 };
 
 /** 发送 POST 并消费 SSE 流；401 时自动刷新 token 重试一次。 */
+/** 限流退避重发的等待上限。后端滑窗 60s，真触发限流时 Retry-After 通常接近 60
+ *  （`ratelimit.py` 取"最老请求过期还需几秒"），所以不能把上限压到几秒，否则形同禁用。
+ *  等待期间通过 onNotice 反馈进度，不让用户对着 loading 干等。 */
+const MAX_AUTO_BACKOFF_SECONDS = 60;
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 async function postSSE(
   path: string,
   body: unknown,
   onDelta: (t: string) => void,
   signal?: AbortSignal,
-  retried = false
+  retried = false,
+  backoffRetried = false,
+  onNotice?: (msg: string) => void
 ): Promise<void> {
   const doFetch = async (): Promise<Response> => {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
@@ -476,7 +497,20 @@ async function postSSE(
     throw new ApiError(401, "登录已过期");
   }
   if (!resp.ok) {
-    throw await interpretError(resp);
+    const err = await interpretError(resp);
+    // 只重发「平台自身 RPM 限流」这一种 429：它由 rate_limit_native 依赖抛出，
+    // 早于 ensure_native_admitted 与 send_message（conversations.py:107→111→124），
+    // 此时用户消息尚未落库，重发安全。其响应体为 {"detail": "rate limit exceeded"}，无 code。
+    // 而带 code=rate_limited 的 429 是模型服务/上游限流经原生面透传
+    // （main.py:180-182），发生在阶段A 之后——重发会把用户消息再落一遍。
+    const isOwnRpmLimit = err.kind === "rate_limit" && err.code === undefined;
+    const secs = err.retryAfter ?? 0;
+    if (isOwnRpmLimit && !backoffRetried && secs > 0 && secs <= MAX_AUTO_BACKOFF_SECONDS) {
+      onNotice?.(`请求过于频繁，${secs} 秒后自动重试…`);
+      await sleep(secs * 1000, signal);
+      return postSSE(path, body, onDelta, signal, retried, true, onNotice);
+    }
+    throw err;
   }
   await streamSSE(resp, { onDelta });
 }
@@ -485,13 +519,17 @@ export async function sendMessageStream(
   conversationId: string,
   content: string,
   onDelta: (text: string) => void,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onNotice?: (msg: string) => void
 ): Promise<void> {
   await postSSE(
     `/api/v1/conversations/${conversationId}/messages`,
     { content, stream: true },
     onDelta,
-    signal
+    signal,
+    false,
+    false,
+    onNotice
   );
 }
 
@@ -499,7 +537,16 @@ export async function sendMessageStream(
 export async function regenerateStream(
   conversationId: string,
   onDelta: (text: string) => void,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onNotice?: (msg: string) => void
 ): Promise<void> {
-  await postSSE(`/api/v1/conversations/${conversationId}/regenerate`, {}, onDelta, signal);
+  await postSSE(
+    `/api/v1/conversations/${conversationId}/regenerate`,
+    {},
+    onDelta,
+    signal,
+    false,
+    false,
+    onNotice
+  );
 }

@@ -250,8 +250,10 @@ export default function ChatPage() {
           });
           scrollToBottom();
         },
-        controller.signal
+        controller.signal,
+        setError
       );
+      setError(null); // 清掉退避期间的「N 秒后自动重试」提示
       setMessages(await platformApi.messages(activeId, { limit: PAGE_SIZE }));
       setConversations(await platformApi.conversations());
     } catch (err) {
@@ -295,8 +297,10 @@ export default function ChatPage() {
           });
           scrollToBottom();
         },
-        controller.signal
+        controller.signal,
+        setError
       );
+      setError(null); // 清掉退避期间的「N 秒后自动重试」提示
       setMessages(await platformApi.messages(activeId, { limit: PAGE_SIZE }));
     } catch (err) {
       if ((err as Error).name !== "AbortError") {
