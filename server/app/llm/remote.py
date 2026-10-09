@@ -555,11 +555,17 @@ class RemoteBackend:
                     except StopAsyncIteration:
                         break
                     except TimeoutError:
-                        if abs_limit - (time.monotonic() - started) <= 0:
-                            # 绝对上限命中（即便心跳在续命）→ §8.1.1，非 §8.4 降级
+                        # 判定"这次是哪一个预算到了"，用**本次等待实际取的那个上界**，不再重读时钟：
+                        #   `remaining <= idle_limit` ⇒ 触发时沉默时长就是 `remaining`，
+                        #     它 ≤ idle_limit ⇒ 空闲条件根本没到，只能是绝对上限 → §8.1.1（settled 结算）；
+                        #   否则空闲先到 → 断开走 §8.4 降级（缺口 K）。
+                        # 旧写法在这里再取一次 `time.monotonic()` 与 `abs_limit` 比较：wait_for 用的是
+                        # 事件循环**每轮缓存**的时钟，可能比 monotonic 早触发几微秒，于是"还没到上限"
+                        # ⇒ 绝对上限被误报成空闲超时（504 + §8.4 降级），把 §8.1.1 要求的 settled 结算
+                        # 换成了 failed。负载下偶发、单独跑不复现——是本项"已闭合"后查出的一处真缺陷。
+                        if remaining <= idle_limit:
                             terminate_reason = "stream_max_duration"
                             break
-                        # 纯沉默超空闲上限 → 断开走 §8.4 降级（缺口 K）
                         breaker.record_failure()
                         raise ModelServiceError(
                             "upstream_timeout",
