@@ -90,7 +90,12 @@ async def admin_delete(model_id: UUID, admin: AdminUser, db: DbSession):
     row = await db.get(LlmModel, model_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "模型不存在")
+    was_default = row.is_default
     await db.delete(row)
+    await db.flush()
+    if was_default:
+        # 删除默认模型必须自动回退，否则全列表无默认、「会话回退到默认模型」语义悬空
+        await _promote_default(db)
     await db.commit()
 
 
@@ -99,3 +104,20 @@ async def _clear_default(db, keep_id: UUID) -> None:
     for r in rows:
         if r.id != keep_id:
             r.is_default = False
+
+
+async def _promote_default(db) -> None:
+    """从启用模型中把 sort 最小（并列取创建最早）者提升为新默认。
+
+    无启用模型时不提升（列表已空或全禁用，无默认可言）。
+    """
+    candidate = (
+        await db.execute(
+            select(LlmModel)
+            .where(LlmModel.enabled == True)  # noqa: E712
+            .order_by(LlmModel.sort, LlmModel.created_at)
+            .limit(1)
+        )
+    ).scalars().first()
+    if candidate is not None:
+        candidate.is_default = True

@@ -36,6 +36,7 @@ async def test_admin_models_require_admin(client, auth_headers):
 
 async def test_admin_model_crud_and_default(client, auth_headers, user_tokens, db_engine):
     await _promote(db_engine, user_tokens["user"]["id"])
+    await client.get("/api/v1/models", headers=auth_headers)  # 触发播种（admin 端点自身不播种）
 
     resp = await client.post(
         "/api/v1/admin/models",
@@ -168,3 +169,74 @@ async def test_regenerate_on_opening_message_only(client, auth_headers, persona)
     ).json()
     assert [m["role"] for m in msgs] == ["assistant", "assistant"]
     assert msgs[0]["content"] == persona["opening_message"]
+
+
+async def _admin_models(client, auth_headers):
+    resp = await client.get("/api/v1/admin/models", headers=auth_headers)
+    assert resp.status_code == 200
+    return resp.json()
+
+
+async def test_delete_default_model_promotes_sort_min(client, auth_headers, user_tokens, db_engine):
+    """需求单：删除默认模型后自动回退 —— enabled 中 sort 最小者顶上，恰有一个默认。"""
+    await _promote(db_engine, user_tokens["user"]["id"])
+    await client.get("/api/v1/models", headers=auth_headers)  # 触发播种（admin 端点自身不播种）
+
+    # 播种 3 个：默认 gpt-4o-mini(sort 0)。删除它 → 应由 gpt-4o(sort 1) 顶上
+    mini = next(m for m in await _admin_models(client, auth_headers) if m["model"] == "gpt-4o-mini")
+    assert mini["is_default"] is True
+
+    resp = await client.delete(f"/api/v1/admin/models/{mini['id']}", headers=auth_headers)
+    assert resp.status_code == 204
+
+    models = await _admin_models(client, auth_headers)
+    defaults = [m for m in models if m["is_default"]]
+    assert len(models) == 2
+    assert len(defaults) == 1, f"删除默认后应恰有一个默认，实为 {defaults}"
+    assert defaults[0]["model"] == "gpt-4o"  # 剩余 enabled 中 sort 最小
+
+
+async def test_delete_default_model_tie_break_created_at(client, auth_headers, user_tokens, db_engine):
+    """sort 并列时取创建更早者为新默认。"""
+    await _promote(db_engine, user_tokens["user"]["id"])
+    await client.get("/api/v1/models", headers=auth_headers)  # 触发播种（admin 端点自身不播种）
+
+    a = (await client.post("/api/v1/admin/models", json={"name": "A", "model": "tie-a", "sort": 9}, headers=auth_headers)).json()
+    b = (await client.post("/api/v1/admin/models", json={"name": "B", "model": "tie-b", "sort": 9}, headers=auth_headers)).json()
+    # 禁用其他启用模型，只留默认 + A/B（sort 并列）
+    for m in await _admin_models(client, auth_headers):
+        if m["model"] in ("gpt-4o", "deepseek-chat"):
+            await client.patch(f"/api/v1/admin/models/{m['id']}", json={"enabled": False}, headers=auth_headers)
+
+    mini = next(m for m in await _admin_models(client, auth_headers) if m["is_default"])
+    assert (await client.delete(f"/api/v1/admin/models/{mini['id']}", headers=auth_headers)).status_code == 204
+
+    defaults = [m for m in await _admin_models(client, auth_headers) if m["is_default"]]
+    assert len(defaults) == 1
+    assert defaults[0]["model"] == "tie-a"  # A 先创建
+
+
+async def test_delete_non_default_keeps_default(client, auth_headers, user_tokens, db_engine):
+    """删非默认不动默认。"""
+    await _promote(db_engine, user_tokens["user"]["id"])
+    await client.get("/api/v1/models", headers=auth_headers)  # 触发播种（admin 端点自身不播种）
+    deepseek = next(m for m in await _admin_models(client, auth_headers) if m["model"] == "deepseek-chat")
+    assert (await client.delete(f"/api/v1/admin/models/{deepseek['id']}", headers=auth_headers)).status_code == 204
+
+    defaults = [m for m in await _admin_models(client, auth_headers) if m["is_default"]]
+    assert len(defaults) == 1 and defaults[0]["model"] == "gpt-4o-mini"
+
+
+async def test_delete_default_with_no_enabled_left(client, auth_headers, user_tokens, db_engine):
+    """删除默认后无启用模型可顶上 → 无默认（空列表语义，不报错）。"""
+    await _promote(db_engine, user_tokens["user"]["id"])
+    await client.get("/api/v1/models", headers=auth_headers)  # 触发播种（admin 端点自身不播种）
+    # 全部禁用后只剩默认自己？——先禁用其余，再删默认
+    for m in await _admin_models(client, auth_headers):
+        if not m["is_default"]:
+            await client.patch(f"/api/v1/admin/models/{m['id']}", json={"enabled": False}, headers=auth_headers)
+    mini = next(m for m in await _admin_models(client, auth_headers) if m["is_default"])
+    assert (await client.delete(f"/api/v1/admin/models/{mini['id']}", headers=auth_headers)).status_code == 204
+
+    models = await _admin_models(client, auth_headers)
+    assert all(not m["is_default"] for m in models)  # 无启用可顶上 → 无默认
