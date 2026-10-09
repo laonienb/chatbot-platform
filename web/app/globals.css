@@ -19,7 +19,8 @@
   /* 文字 */
   --text: #e8ebf4;
   --text-dim: #8a93aa;
-  --text-faint: #5c6478;
+  /* 最弱层级仍需承载可读文字（表头/空态/侧栏标签），故按 WCAG 4.5:1 定值 */
+  --text-faint: #7f889f;
 
   /* 主色：靛蓝 → 紫 渐变 */
   --accent: #6474f0;
@@ -1669,7 +1670,7 @@ html[data-theme="light"] {
 
   --text: #1b2133;
   --text-dim: #58617a;
-  --text-faint: #939bb0;
+  --text-faint: #616a7d;
 
   --accent: #4f5ee6;
   --accent-hover: #3f4ed8;
@@ -1757,11 +1758,5 @@ html[data-theme="light"] .admin-alert strong {
 }
 html[data-theme="light"] .admin-alert span {
   color: #5a6070;
-}
-html[data-theme="light"] .admin-note {
-  color: #6b7385;
-}
-html[data-theme="light"] .admin-note strong {
-  color: #4a5163;
 }
 
