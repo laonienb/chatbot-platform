@@ -10,6 +10,7 @@
  *   node scripts/contrast-audit.mjs --email 别的号 --password ...   # 换登录身份
  *   node scripts/contrast-audit.mjs --email none                    # 游客态
  *   node scripts/contrast-audit.mjs --no-hover      # 只测静止态（快）
+ *   node scripts/contrast-audit.mjs --no-overlays   # 跳过浮层夹具
  *   node scripts/contrast-audit.mjs --json          # 机器可读
  * 退出码：0 全部达标；1 发现不达标项；2 工具自身跑不起来（浏览器缺失、服务未起等）。
  *
@@ -26,6 +27,10 @@
  *   受影响的样式挂在 class 上，故同一 class 签名只测首个实例；测前注入
  *   `transition:none` —— 否则 getComputedStyle 会取到过渡中间的插值色。
  *   这条不是可选装饰：静态态达标、悬停被通用 button:hover 换成半透明底，是两类真缺陷。
+ * - **浮层夹具也测**（默认开，`--no-overlays` 可关）：弹窗、toast、自绘下拉的展开面板只在
+ *   交互之后才进 DOM，逐页遍历对它们完全失明。夹具按组件的真实 class 嵌套现造一棵树，
+ *   注入 body 后同法复测再移除。它测的是"这些 class 组合出来的字/底"，不是真实渲染，
+ *   所以 state 驱动的差异（禁用态、真实数据长度）仍由逐页那一轮负责。
  * - 排除三类并单独计数，不当作通过：
  *     transparent-text  渐变裁切文字（color 透明，solid 数学测不了实际像素）
  *     graphic-only      纯 emoji/符号（文本里没有字母数字，不受 1.4.3 约束）
@@ -51,6 +56,7 @@ const DEFAULTS = {
   password: "uiprobe123",
   json: false,
   hover: true,
+  overlays: true,
 };
 
 function parseArgs(argv) {
@@ -66,12 +72,14 @@ function parseArgs(argv) {
     else if (a === "--password") opts.password = next();
     else if (a === "--json") opts.json = true;
     else if (a === "--no-hover") opts.hover = false;
+    else if (a === "--no-overlays") opts.overlays = false;
     else if (a === "--help" || a === "-h") {
       console.log(
         [
           "用法: node scripts/contrast-audit.mjs [--base URL] [--pages a,b] [--themes light,dark]",
-          "         [--email 账号 --password 密码] [--settle 毫秒] [--no-hover] [--json]",
-          "默认审计 6 页 × 深浅两主题的静止态与 hover 态，用本地测试号登录态。",
+          "         [--email 账号 --password 密码] [--settle 毫秒] [--no-hover] [--no-overlays] [--json]",
+          "默认审计 6 页 × 深浅两主题的静止态与 hover 态，用本地测试号登录态；外加一份浮层夹具",
+          "（弹窗 / toast / 自绘下拉——它们只在交互后才进 DOM，逐页遍历永远测不到）。",
         ].join("\n")
       );
       process.exit(0);
@@ -388,13 +396,13 @@ const HARNESS = () => {
     };
   };
 
-  const all = () => {
+  const collect = (els) => {
     const fails = [];
     const excluded = { "transparent-text": 0, "graphic-only": 0, "inactive-ui": 0 };
     const seen = new Set();
     let checked = 0;
 
-    for (const el of document.querySelectorAll("body *")) {
+    for (const el of els) {
       const r = measureEl(el);
       if (!r) continue;
       if (r.exempt) {
@@ -413,17 +421,74 @@ const HARNESS = () => {
     }
 
     fails.sort((a, b) => a.ratio - b.ratio);
-    return {
-      theme: document.documentElement.dataset.theme,
-      path: location.pathname,
-      checked,
-      failTotal: fails.length,
-      fails: fails.slice(0, 12),
-      excluded,
-    };
+    return { checked, failTotal: fails.length, fails: fails.slice(0, 12), excluded };
   };
 
-  return { measureEl, all };
+  const all = () => ({
+    theme: document.documentElement.dataset.theme,
+    path: location.pathname,
+    ...collect(document.querySelectorAll("body *")),
+  });
+
+  // 浮层夹具：弹窗、toast、自绘下拉的展开面板都只在交互之后才进 DOM，逐页遍历永远测不到。
+  // 结构与 class 组合照抄组件（chat 的人设弹窗、MemoryModal、Select 的 portal、各页的 toast），
+  // 挂在 body 下走真实祖先链合成底色；测完立即移除，不给页面留残留。
+  const OVERLAY_FIXTURE = `
+<div class="modal-mask"><div class="modal memory-modal">
+  <h3>记忆管理</h3>
+  <p class="hint">开启后，助手会参考这里保存的长期记忆。</p>
+  <label class="memory-toggle"><span>启用长期记忆</span><button class="switch on"><span class="knob"></span></button></label>
+  <form class="memory-add"><input type="text" value="回答尽量简洁一点"><button class="primary" type="submit">添加</button></form>
+  <p class="auth-error">保存失败：模型服务暂不可用，请稍后再试</p>
+  <div class="memory-list">
+    <div class="memory-item"><span class="memory-content">用户偏好简体中文回答</span><span class="memory-meta">2026-10-10 更新<button class="icon-btn" title="编辑">编辑</button><button class="icon-btn danger" title="删除">删除</button></span></div>
+  </div>
+  <div class="modal-actions"><span class="spacer"></span><button type="button">取消</button><button class="danger" type="button">清空全部</button></div>
+</div></div>
+<div class="modal-mask"><form class="modal">
+  <h3>新建人设</h3>
+  <div class="avatar-picker">
+    <!-- 8 条人名哈希渐变逐条测（inline style 照抄 Avatar.tsx 的 GRADIENTS），CSS 里那条
+         --grad-accent 兜底不是真实渲染面，测它只会给出假红。initial 各不相同，否则
+         按 class 签名去重会把后 7 条并掉。 -->
+    <span class="avatar" style="background:linear-gradient(135deg,#6474f0,#9a6cf5)">A</span>
+    <span class="avatar" style="background:linear-gradient(135deg,#e8618c,#f08a5d)">B</span>
+    <span class="avatar" style="background:linear-gradient(135deg,#22b8a6,#4e8fe8)">C</span>
+    <span class="avatar" style="background:linear-gradient(135deg,#f0784a,#e8b64e)">D</span>
+    <span class="avatar" style="background:linear-gradient(135deg,#8164f1,#4ecf8e)">E</span>
+    <span class="avatar" style="background:linear-gradient(135deg,#4a8af0,#22c1dc)">F</span>
+    <span class="avatar" style="background:linear-gradient(135deg,#e85d5d,#e85dcf)">G</span>
+    <span class="avatar" style="background:linear-gradient(135deg,#5d9ce8,#5de8c0)">H</span>
+    <span class="avatar" style="background:rgba(120,140,255,0.12)">🦊</span>
+    <div class="avatar-picker-body">
+      <div class="emoji-grid"><button type="button" class="emoji-opt">🐱</button><button type="button" class="emoji-opt picked">🦊</button></div>
+    </div>
+  </div>
+  <div class="field-row"><label>名称<input type="text" value="产品经理助理"></label><label>可见性<div class="select-trigger"><span class="select-trigger-label">公开（发布到人设市场）</span></div></label></div>
+  <label class="check-row"><input type="checkbox" checked><span>同步展示到人设市场</span></label>
+  <p class="saved-hint">已保存 ✓</p>
+  <div class="modal-actions"><button type="button" class="danger">删除</button><span class="spacer"></span><button type="button">取消</button><button class="primary" type="submit">保存</button></div>
+</form></div>
+<div class="select-pop"><button type="button" class="select-opt active">私有</button><button type="button" class="select-opt selected">公开（发布到人设市场）</button></div>
+<div class="toast error">模型服务暂不可用，请稍后再试</div>
+<div class="toast success">已复制 API Key</div>
+<div class="toast">对账完成，共 12 笔</div>
+`;
+
+  const overlays = () => {
+    const host = document.createElement("div");
+    host.innerHTML = OVERLAY_FIXTURE;
+    document.body.appendChild(host);
+    let out;
+    try {
+      out = collect(host.querySelectorAll("*"));
+    } finally {
+      host.remove();
+    }
+    return { theme: document.documentElement.dataset.theme, path: "/浮层", ...out };
+  };
+
+  return { measureEl, all, overlays };
 };
 
 // ---------- 主流程 ----------
@@ -561,6 +626,9 @@ async function main() {
   const httpBase = `http://127.0.0.1:${new URL(browserWs).port}`;
 
   const results = [];
+  // 空壳格 = 假绿。实测过一次：URL 被 MSYS 改写成 /C:/Program%20Files/Git/market 后，
+  // 那一格只测到 2 个含字元素却报"不达标 0"。工具宁可报错，也不能对着一具空 DOM 说达标。
+  const suspects = [];
   try {
     const target = await newPageTarget(httpBase);
     const s = await openPageSession(target.webSocketDebuggerUrl);
@@ -594,8 +662,26 @@ async function main() {
         });
         const r = await gotoAndProbe(s, `${opts.base}${page}`, opts.settle, opts.hover);
         r.theme = theme; // 首屏引导脚本可能尚未应用，以驱动意图为准
+        const want = page.replace(/\/$/, "") || "/";
+        const got = (r.path || "").replace(/\/$/, "") || "/";
+        if (got !== want) suspects.push(`${theme} ${want} 实际落在 ${got}（被重定向，或 URL 被 shell 改写过）`);
+        else if (r.checked < 5) suspects.push(`${theme} ${want} 只测到 ${r.checked} 个含字元素（页面是空的？）`);
         results.push(r);
         if (!opts.json) printRow(r);
+      }
+      // 浮层夹具挂在当前页上：globals.css 全站共用，祖先链就是 body，逐页重复测不出新东西
+      if (opts.overlays) {
+        const o = await s.send("Runtime.evaluate", {
+          expression: `window.__cp.overlays()`,
+          returnByValue: true,
+        });
+        if (o.exceptionDetails) {
+          throw new Error(`浮层夹具探针抛错：${o.exceptionDetails.exception?.description ?? "未知异常"}`);
+        }
+        const row = o.result.value;
+        row.theme = theme;
+        results.push(row);
+        if (!opts.json) printRow(row);
       }
     }
     s.ws.close();
@@ -609,11 +695,23 @@ async function main() {
   }
 
   const sum = (r) => (r.failTotal ?? 0) + (r.hover?.fails?.length ?? 0);
+  if (suspects.length) {
+    const msg = suspects.map((line) => `  - ${line}`).join("\n");
+    if (tokens) {
+      console.error(`\n有 ${suspects.length} 格没测到内容，整份结论不可信，已按工具故障处理：\n${msg}`);
+      process.exit(2);
+    }
+    console.error(`\n⚠️ 游客态下有 ${suspects.length} 格落不到目标页（受登录保护属预期），本报告仅供浏览：\n${msg}`);
+  }
   const failTotal = results.reduce((n, r) => n + sum(r), 0);
   if (opts.json) {
     console.log(JSON.stringify({ base: opts.base, failTotal, results }, null, 2));
   } else {
-    console.log(`\n${results.length} 格（页面 × 主题），不达标 ${failTotal} 处。`);
+    const overlayRows = results.filter((r) => r.path === "/浮层").length;
+    const pageRows = results.length - overlayRows;
+    console.log(
+      `\n${pageRows} 格（页面 × 主题）${overlayRows ? ` + ${overlayRows} 格浮层夹具` : ""}，不达标 ${failTotal} 处。`
+    );
     if (failTotal === 0) console.log("全部达标（WCAG AA：正文 4.5:1 / 大字 3:1）。");
     else console.log("修法优先动令牌或本组件作用域，别散着补 13 个选择器。");
   }

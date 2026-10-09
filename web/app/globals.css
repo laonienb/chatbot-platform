@@ -470,9 +470,11 @@ a {
   height: 36px;
   min-width: 36px;
   border-radius: 12px;
-  background: var(--grad-accent);
-  /* 首字母头像的底由 Avatar.tsx 按名字哈希从 8 条亮渐变里取，白字最差只有 1.53:1；
-     深墨在同一批底色上最差 4.87:1（第 5 条的紫色端点已在组件侧提亮）。 */
+  background: var(--accent-soft);
+  /* 真实底色由 Avatar.tsx 按名字哈希从 8 条渐变里取并写在 inline style 上，这里只是兜底：
+     兜底若用 --grad-accent，深墨压在其浅端只有 4.09:1，是个"平时不出事、换个用法就翻车"的陷阱。
+     首字母头像的底由组件供给，那 8 条底色上深墨最差需 ≥4.5:1（第 5 条的紫色端点已从
+     #7a5cf0 提到 #8164f1，4.63）——这条不变量现在由审计工具的浮层夹具逐条守着。 */
   color: var(--gradient-ink);
   display: inline-flex;
   align-items: center;
@@ -1093,9 +1095,17 @@ button.stop {
   padding: 10px 20px;
   border-radius: 12px;
   font-size: 13px;
+  /* 基础态必须有底：管理后台用的是不带变体的 <div className="toast">，原来这里既没底
+     也没色，只有一颗投影 —— 等于一行没有面板的浮字。变体在后面对 color 是等特异性的
+     后来者，覆盖得掉。 */
+  background: var(--bg-panel-solid);
+  color: var(--text);
   box-shadow: var(--shadow-md);
   animation: toast-in 0.18s ease;
-  z-index: 5;
+  /* 原来 5：压在 .modal-mask(10) 之下。模型页保存失败时提示与弹窗是同时存在的
+     （saveEdit 的失败写的就是页面级 error），结果通知被遮罩压成一层暗字。
+     通知是转瞬即逝、不需要点击的，压在弹窗与两个 popover(60) 之上最省事。 */
+  z-index: 70;
 }
 @keyframes toast-in {
   from {
@@ -1108,11 +1118,15 @@ button.stop {
   }
 }
 .toast.error {
-  background: linear-gradient(135deg, #e5484d, #d63b55);
+  /* 白字压在这条渐变上，最差端只有 3.91:1（#e5484d）。压深到两个色标都 ≥4.8，
+     保持红色族与"从左到右略微加深"的原方向。 */
+  background: linear-gradient(135deg, #d1354a, #c22f4d);
   color: #fff;
 }
 .toast.success {
-  background: linear-gradient(135deg, #2ea36f, #3fcf8e);
+  /* 同上，且更严重：原渐变尾部 #3fcf8e 上的白字只有 1.99:1，几乎看不清。
+     绿色压到这个深度才容得下白字（两个色标 5.49 / 6.05）。 */
+  background: linear-gradient(135deg, #0f7147, #12784f);
   color: #fff;
 }
 
@@ -1701,6 +1715,11 @@ html[data-theme="light"] {
   --accent: #4f5ee6;
   --accent-hover: #3f4ed8;
   --accent-soft: rgba(85, 100, 230, 0.12);
+  /* :root 的 --success/--danger 是为深底设计的亮色，浅底上作正文级字色只有 1.99~3.29:1
+     （11 处 var() 引用全是字色，散在 auth-error / saved-hint / danger 按钮等别人页面的规则里），
+     所以压深在令牌上，与 :root 的深底值并存 —— 管理后台原先为绕开这个问题打的两个作用域补丁因此作废。 */
+  --danger: #c0333a;
+  --success: #12784f;
   --grad-accent: linear-gradient(135deg, #5566e8, #8b5cf0);
   --grad-accent-solid: linear-gradient(135deg, #5566e8, #8655ef);
   --grad-accent-solid-hover: linear-gradient(135deg, #4b5de7, #7c47ee);
@@ -1769,14 +1788,9 @@ html[data-theme="light"] .keys-table code {
   background: rgba(20, 26, 50, 0.08);
 }
 
-/* 管理后台：--success/--danger 是为深底设计的亮色，白底上对比度不足，
-   在管理后台作用域内压深（不改全局令牌，避免影响他人页面） */
-html[data-theme="light"] .usage-summary strong.stat-pos {
-  color: #157f56;
-}
-html[data-theme="light"] .usage-summary strong.stat-neg {
-  color: #c0333a;
-}
+/* 管理后台：--success/--danger 浅底压深已上收到全局令牌（见 html[data-theme="light"] 的
+   定义），这里只留后台特有的告警面板底色与描边 —— 原先各自打的两条 .stat-pos/.stat-neg
+   字色补丁是同一问题的局部绕法，令牌修好后作废（负毛利字色与原补丁同值 #c0333a）。 */
 html[data-theme="light"] .admin-alert {
   background: rgba(192, 51, 58, 0.07);
   border-color: rgba(192, 51, 58, 0.32);
