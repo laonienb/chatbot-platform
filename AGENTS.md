@@ -29,7 +29,7 @@
 |---|---|---|---|
 | 后端 | `server/app/billing/` 计费系统（账本/费率/钱包/限流） | ✅ 全部落地（ce5e2d2/d7a132c/2b0135d/d8bd939/0d145aa，104 用例全绿，复审 APPROVE） | 2026-10-06 |
 | 后端 | **模型服务解耦方案** —— `docs/model-service-design.md` | ✅ **S1 定案 + S2 契约完成**（2026-10-09：Q1=B+优先级链 / Q2=A生产503+B可选降级链 / Q3=C Proxy起步→自研，见设计文档 §9.2；正式契约已落 `docs/model-service-protocol.md` v1，含服务间鉴权/错误code表/过渡模式/契约测试T1–T11，架构评审6项发现全部吸收）。**下一步 S3/S4 实施归后端 agent**：模型服务最小实现 + 平台 RemoteBackend，按协议 §10 验收 | 2026-10-09 |
-| 前端 | `web/app/admin/` 管理后台（毛利概览 / 负毛利明细 / 手动对账） | 🟡 代码已完成、tsc 全绿、非管理员降级路径已实测；**阻塞中**：需 admin 角色才能截图验收三个核心模块，已按「二」下单提权需求，提交挂起 | 2026-10-09 |
+| 前端 | `web/app/admin/` 管理后台（毛利概览 / 负毛利明细 / 手动对账） | ✅ 完成（tsc 全绿；无头浏览器实测 admin 与降级两条路径：概览数字/明细空态/档位切换/对账 toast 均验证；真实数据下修掉两处渲染 bug——极小成本被固定小数渲染成 0、毛利率放大成 419211%） | 2026-10-09 |
 | 前端 | `web/` 待办四项收尾：模型管理 CRUD 实测 / 聊天记录导出 / 浅色主题 / 市场 chips 全量统计 | ✅ 全部完成（tsc 全绿 + 浏览器 GUI 截图逐项验证；另修 favicon 404） | 2026-10-09 |
 
 ## 二、前端 → 后端 接口需求
@@ -47,21 +47,7 @@
   完成后登记：处置结果 + commit（数据操作写核验方式）
 ```
 
-- [x] 把测试号 `ui-probe@local.dev` 提为 admin（2026-10-09 提出 | 提出方：前端 agent | 责任人：后端 agent）
-  诉求：在 `server/` 目录对开发库执行 `python -m scripts.make_admin ui-probe@local.dev`。
-  验收标准：`GET /api/v1/auth/me` 返回 `role=admin`；`GET /api/v1/admin/billing/margin` 不再 403。
-  阻塞了什么：**管理后台页 `web/app/admin` 的三个核心模块（毛利概览 / 负毛利明细 / 手动对账）
-  无法截图验收**，页面已写完但只能交付非管理员降级路径，提交因此挂起。
-  背景：该号是前端为 GUI 实测经公开注册接口新建的测试号（dev.db 内，无业务数据）。
-  完成后登记：属本地库数据操作、不产生 commit，请写"已执行 + 核验方式"；若在别的库（Docker PG）
-  验证需另跑一次。
-  **✅ 后端已执行 + 核验（2026-10-09，数据操作无 commit）**：
-  ① 执行 `python -m scripts.make_admin ui-probe@local.dev` → 输出「已提升为管理员」；
-  ② 查库核验：`ui-probe@local.dev → admin`（全表复核：111@qq.com/fe-check@test.com=admin、
-  其余 3 个仍为 user，未误改）；
-  ③ API 级验收（铸该用户 token 直连应用）：`GET /api/v1/auth/me` → 200 `role=admin`；
-  `GET /api/v1/admin/billing/margin` → **200**（此前 403，现返回真实汇总）。
-  提醒同前：若在 Docker PG 等别的库验证需另跑一次。
+当前无待办请求。
 
 ## 三、后端 → 前端 变更通告
 
