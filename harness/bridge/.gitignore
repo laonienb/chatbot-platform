@@ -1,0 +1,6 @@
+# 总线传输文件 = 本机瞬态信号，不入库（两边同一台机器同一工作树，落盘即送达）。
+# 协议文档 PROTOCOL.md 与本文件仍由 git 跟踪，保证可追溯、两边读同一份。
+inbox/
+cursor/
+heartbeat/
+leases/
