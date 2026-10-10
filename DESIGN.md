@@ -259,7 +259,7 @@ wx.login() 取 code → POST /auth/wechat-miniprogram {code}
 | 层 | 选型 | 理由 |
 |---|---|---|
 | 后端 | Python 3.12 + FastAPI + SQLAlchemy + Alembic | IM/LLM 生态最全；async 原生支持 SSE 流式 |
-| LLM 接入 | **独立模型服务**（自研 `model-service/`，OpenAI 兼容协议 + 扩展字段；LiteLLM 作为其 provider 实现之一） | v0.3 定案：凭证/路由/重试降级/成本归因/合规收口在模型服务，平台零 provider 依赖。曾评估 LiteLLM Proxy 起步（Q3=C），最终以自研交付（契约测试 T1–T12 双侧全绿；⚠️ `LiteLLMProvider` 的**流式**尚未实现，见 §10 ①） |
+| LLM 接入 | **独立模型服务**（自研 `model-service/`，OpenAI 兼容协议 + 扩展字段；LiteLLM 作为其 provider 实现之一） | v0.3 定案：凭证/路由/重试降级/成本归因/合规收口在模型服务，平台零 provider 依赖。曾评估 LiteLLM Proxy 起步（Q3=C），最终以自研交付（契约测试 T1–T12 双侧全绿；⚠️ `LiteLLMProvider` 的**流式与错误映射**尚未实现，见 §10 ①） |
 | 数据库 | PostgreSQL + pgvector | 业务数据与向量（知识库/记忆）一库搞定 |
 | 缓存/限流/队列 | Redis | 令牌桶限流、会话缓存、绑定码 TTL |
 | 前端 | Next.js + React | Web 与后续小程序生态近；SSE 消费简单 |
@@ -296,7 +296,7 @@ chatbot-platform/
 
 单机 Compose 起步，服务：`server`（8000）、`web`（Nginx 托管静态+反代）、`postgres`、`redis`、**`model-service`（仅内网，不暴露公网；compose 尚未落地，属生产切换前置项）**、`napcat`（QQ 协议端）、`astrbot`。
 
-**生产切换清单（模型服务上线前置，v0.3 登记；R1 复核后由六步改七步）**：① **补全真实上游的流式实现** —— `msvc/provider.py:LiteLLMProvider.stream()` 现为 `NotImplementedError`，而 native 模式流式是主路径（契约测试只覆盖 `FakeUpstream`，故 40 条全绿照不到），不补则 `LLM_BACKEND=remote` 后流式请求必失败；补完应以一条真上游 smoke 用例锁住。② compose 增补 `model-service` 服务与内网隔离；③ `MODEL_SERVICE_TOKEN` 生成注入双方（≥32 字节随机，不落 git）；④ 平台侧 `LLM_BACKEND=remote` + `MODEL_SERVICE_MODE=native` + `APP_ENV=prod`（mock 生产禁启守卫已实现）；⑤ provider 凭证迁入模型服务、`llm_models.api_key/api_base` 两列废弃迁移（S6 收尾）；⑥ 幂等窗容量按 `max_entries ≥ 峰值RPS×600` 配置（H3 公式，见 model-service/README）；⑦ 前端确认已消费「三」流式错误通告。⚠️ **①未完成前不得切换 `LLM_BACKEND=remote`**。
+**生产切换清单（模型服务上线前置，v0.3 登记；R1 复核后由六步改七步）**：① **补全真实上游的流式实现与错误映射** —— `msvc/provider.py:LiteLLMProvider.stream()` 现为 `NotImplementedError`，而 native 模式流式是主路径（契约测试只覆盖 `FakeUpstream`，故 40 条全绿照不到），不补则 `LLM_BACKEND=remote` 后流式请求必失败（实测裸 `500`）；**同一盲区还藏着 R4**：`_map_upstream_error` 只认假桩的 `_ScenarioError`、handler 无 catch-all ⇒ 真实上游异常逃逸，既违反协议 §7（无 `code` 的裸 500），又让幂等**在飞位永久泄漏**（同 key 后续恒 `409`，兼容面指纹键 ⇒ 用户同一条消息在进程重启前永久发不出）。补完应以真上游 smoke 用例锁住**成功与错误两条路径**（工作单 SW-1/SW-4，协议 §24.2）。② compose 增补 `model-service` 服务与内网隔离；③ `MODEL_SERVICE_TOKEN` 生成注入双方（≥32 字节随机，不落 git）；④ 平台侧 `LLM_BACKEND=remote` + `MODEL_SERVICE_MODE=native` + `APP_ENV=prod`（mock 生产禁启守卫已实现）；⑤ provider 凭证迁入模型服务、`llm_models.api_key/api_base` 两列废弃迁移（S6 收尾）；⑥ 幂等窗容量按 `max_entries ≥ 峰值RPS×600` 配置（H3 公式，见 model-service/README）；⑦ 前端确认已消费「三」流式错误通告。⚠️ **①未完成前不得切换 `LLM_BACKEND=remote`**。
 
 小程序/微信侧的现实约束（影响部署而非架构）：
 
@@ -331,7 +331,7 @@ chatbot-platform/
 
 计费后续（尚未做）：**用户侧充值**（余额查询 API 与 Web 展示已上线）、订阅 plan 维度费率、per-user 额度。
 
-未开始（按建议优先级，v0.3 重排）：**① 生产切换**（compose 落地 model-service + 补全真实上游流式实现 + §10 切换清单七步；**契约侧已就绪，部署侧尚缺真实上游的流式实现，见 §10 ①**）→ **② 聊天记录蒸馏流水线**（§13.2 用户核心需求；原「需先接真实 LLM」的阻塞已被模型服务解除）→ ③ M2 机器人接入（AstrBot+NapCat 部署文档）→ ④ 小程序端 → ⑤ M4 剩余（RAG/工具调用）→ ⑥ PostgreSQL 生产切换。
+未开始（按建议优先级，v0.3 重排）：**① 生产切换**（compose 落地 model-service + 补全真实上游流式与错误映射 + §10 切换清单七步；**契约侧已就绪，部署侧尚缺真实上游的流式与错误映射，见 §10 ①**）→ **② 聊天记录蒸馏流水线**（§13.2 用户核心需求；原「需先接真实 LLM」的阻塞已被模型服务解除）→ ③ M2 机器人接入（AstrBot+NapCat 部署文档）→ ④ 小程序端 → ⑤ M4 剩余（RAG/工具调用）→ ⑥ PostgreSQL 生产切换。
 
 ## 12. 风险与对策
 

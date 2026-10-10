@@ -52,11 +52,14 @@
 > 旧契约治理行（模型服务解耦 **P0 3/3、P1 11/11、P2 3/3 全部闭合**，历史见协议 §22）。
 > 同日架构师 A **复核 B 的文档收编**（协议 §23）：纠正 `DESIGN.md`/`README` 把「契约门槛解除」
 > 外推成「已具备接管资格」——**真实上游流式未实现**，已在 `DESIGN.md §10` 补第①步、新增后端行。
+> 同日架构师 B **冻结快照复核 §23**（协议 §24）：R1/R2/R3 全部确认（真上游流式实测裸 `500`），
+> **另发现 R4 🔴**——真实上游**错误映射整体缺失**且异常逃逸**永久泄漏幂等在飞位**（同 key 恒 `409`），
+> 已转工作单 **SW-4**（v1.9）并扩写 `DESIGN.md §10 ①`；附一条 §8.2.1 澄清提案**待 A 会签**。
 
 | Agent | 模块 | 状态 | 更新时间 |
 |---|---|---|---|
-| 架构师A+B | 模型服务契约治理（收官态） | ✅ 协议 **v1.7-澄清3** 定稿，全部工作单闭合、门槛解除（**契约侧** S3 可接管生产流量；**部署侧尚缺真实上游流式**，见下行）。活着的遗留：O-a 非阻断（流内 `rate_limited` 帧未回填 `retry_after_s`，`_error_payload` 一处小改，随下次服务侧提交顺带）；`deploy/docker-compose.yml` 尚无 model-service；DESIGN.md v0.3 **已收编**（架构师 A 复核记录见协议 §23） | 2026-10-10 |
-| 后端 | **生产切换前置：真实上游流式未实现** 🔴 | `model-service/msvc/provider.py:191` `LiteLLMProvider.stream()` 抛 `NotImplementedError`；native 模式流式是主路径 ⇒ `LLM_BACKEND=remote` 后所有流式请求必失败。契约测试只覆盖 `FakeUpstream`（`# pragma: no cover`）故未暴露。**阻塞 `DESIGN.md §10` 生产切换①**（架构师 A 复核发现，协议 §23.1）。同批顺带：O-a 回填 `retry_after_s`、`model-service/README.md` 版本/用例列表更新（工作单 v1.8） | 2026-10-10 |
+| 架构师A+B | 模型服务契约治理（收官态） | ✅ 协议 **v1.7-澄清3** 定稿，全部工作单闭合、门槛解除（**契约侧** S3 可接管生产流量；**部署侧尚缺真实上游的流式与错误映射**，见下行）。活着的遗留：O-a 非阻断（流内 `rate_limited` 帧未回填 `retry_after_s`，`_error_payload` 一处小改，随下次服务侧提交顺带）；`deploy/docker-compose.yml` 尚无 model-service；DESIGN.md v0.3 **已收编**（A 复核见协议 §23、B 复核见 §24）。**待 A 会签一条**：§8.2.1「在飞位必须在任何退出路径释放」澄清提案（协议 §24.3） | 2026-10-10 |
+| 后端 | **生产切换前置：真实上游流式未实现 + 错误映射缺失** 🔴 | ①`model-service/msvc/provider.py:191` `LiteLLMProvider.stream()` 抛 `NotImplementedError`；native 模式流式是主路径 ⇒ `LLM_BACKEND=remote` 后所有流式请求必失败（实测裸 `500`）。②**（B 新发现，SW-4）**`msvc/main.py:31` `_map_upstream_error` 只认假桩的 `_ScenarioError`、两个 handler 无 catch-all、`create_app()` 无全局异常处理器 ⇒ litellm 异常族全部逃逸：响应违反协议 §7（裸 500 无 `code`），且 `_finish_window` 未被调用 ⇒ **幂等在飞位永久泄漏**——实测同 `Idempotency-Key` 第二次恒 `409`、`_inflight` 事后仍含该 key；兼容面键是 `api_key+model+消息体` 指纹 ⇒ **一次上游抖动让用户同一条消息在进程重启前永久发不出**，且 409 带 `retryable:true` 诱使客户端反复重试。契约测试只覆盖 `FakeUpstream`（`# pragma: no cover`）故两者均未暴露（打补丁前后基线都是 40 全绿 = 双向皆盲）。**阻塞 `DESIGN.md §10` 生产切换①**（协议 §23.1 / §24.2）。同批顺带：O-a 回填 `retry_after_s`、`model-service/README.md` 版本/用例列表更新、`_inflight` 加 TTL 兜底（工作单 v1.8/v1.9 的 SW-1…SW-5，验收标准见 §8） | 2026-10-10 |
 | 前端 | 「三」流式错误语义通告的消费 | 🔄 待前端跟进：退避时长改读 `error.retry_after_s`、`[DONE]` 为唯一正常终止信号（详见「三」活着通告）。完成后双方闭环删单 | 2026-10-10 |
 
 ## 二、前端 → 后端 接口需求

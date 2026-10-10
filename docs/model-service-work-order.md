@@ -285,17 +285,22 @@ P2-1 / P2-2（协议已就绪，可并行）
 | v1.6 | 2026-10-09 | 架构师 A | **复核后端 agent 补齐（`a1b3fd5`）后闭合 P0-3 与 P1-7**：① P1-7 **闭合**——验收①②③④四条全部有用例，且架构师**独立复现证伪**（`idempotency.py:62` → `if False:` 得 `1 failed, 5 passed`，**只有新用例红**），实证旧 3 条 T7 确实不看守该防线；② P0-3 **测试遗留清零**——`trace` 入参数化、`upstream.started == 0` 断言落地，架构师实跑 `-k p0_3` 得 6 passed；③ **裁决不采纳**后端"给 P0-3 用例加 `Idempotency-Key`"的可选加固（"先于幂等窗"是 P1-7 验收④的职责，已由 `test_t7_local_reject_not_cached` 覆盖，重复职责会造成维护重叠）；④ 状态表更新为「P0 全闭合 / P1 九项中 7 项闭合」；⑤ 更正 v1.5 行末句"P0-3/P1-7 验收遗留仍未补齐"——该判断在 `a1b3fd5` 后**已过时** |
 | v1.7 | 2026-10-09 | 架构师 A | **§19 第六轮评审会签后同步**（协议升 v1.7）：① **新增 P1-10（🔴）**——流式不入幂等窗（`msvc/main.py:114` 注释自缩范围）⇒ 兼容面指纹键重发**真实重调上游 + 平台重复 `reserve_usage`**，双烧上游且重复扣用户；定案**入窗分类与传输形态无关**，回放形态取**「终态重放」**（内容/usage/终止事件一致、chunk 边界可不同；不采用事件序列回放——缓存无界；不采用 409——把重发失败暴露给客户端）。**② P1-9 追加范围**：G3-1 错误帧后必须发 `[DONE]`、G3-2 错误帧可携带实测 `usage`、**O1 真实缺陷**（首字节后 chunk 间隔超时硬编码 1.0s 且归因文案错误 → 真实上游中途停顿 >1s 被误杀）；并记明 P1-9 与 P1-10 **改同一段代码、建议同一方连续做完**。**③ 新增 P1-11**——`should_cache` 仍是被 §8.2.1 明禁的状态码白名单（上游 401/403 不入窗），强制两布尔化 + 证伪。P1 计数 9→11；**四项流式待办全部闭合前 S3 不得接管生产流量** |
 | v1.8 | 2026-10-10 | 架构师 A | **复核架构师 B 的文档收编（`a8958c8`，协议 §23）后新增「生产切换前置项」**：R1 🔴 `msvc/provider.py:191` `LiteLLMProvider.stream()` 抛 `NotImplementedError`——**唯一真实上游不能流式**，而 native 模式流式是主路径，`DESIGN.md §10` 切换清单原六步无一步覆盖；契约测试只跑 `FakeUpstream`（`# pragma: no cover`）故 40 全绿照不到。R3 🟡 `model-service/README.md` 仍写 `v1`/`T1–T11`。R2 🟡 看板行「收编中」自相矛盾（架构师 A 已就地改）。**本单不新增 P 级编号**（P0/P1/P2 仍全闭合），前置项见 §8 |
+| v1.9 | 2026-10-10 | 架构师 B | **冻结快照复核 A 的 §23（协议 §24）后扩充 §8**：R1/R2/R3 **全部确认成立**（快照内基线 `40 passed`；真上游流式实测裸 `500`）。**另发现 R4 🔴 → 新增 SW-4**：`_map_upstream_error` 只认 `FakeUpstream` 的 `_ScenarioError`，两个 handler 无 catch-all、无全局异常处理器 ⇒ litellm 异常族全部逃逸，既违反 §7（裸 500 无 `code`），又让 `_finish_window` 不被调用 ⇒ **幂等在飞位永久泄漏**（实测：同 key 第二次恒 `409`，`_inflight` 事后仍含该 key；兼容面指纹键 ⇒ 同一条消息在重启前永久发不出）。**对照组 + 快照内补丁双向验证**：窗口逻辑本身正确（可映射错误 → 429/429、`_inflight` 清空），根因唯一为「异常在 `_finish_window` 前逃出」；打补丁前后基线均 40 全绿 ⇒ 用例对该类缺陷**双向皆盲**。同批：**SW-1 验收扩至错误路径**、新增 **SW-5 🟢**（`_inflight` TTL 兜底）。另附**一条待 A 会签的 §8.2.1 澄清提案**（在飞位必须在任何退出路径释放）。**本单仍不新增 P 级编号**（P0/P1/P2 保持全闭合），R4 属实现/部署缺口 |
 
 ---
 
-## 8. 生产切换前置项（v1.8 登记，归后端）
+## 8. 生产切换前置项（v1.8 登记 / v1.9 扩充，归后端）
 
 > 性质：**部署/实现缺口，非契约缺陷**。P0/P1/P2 契约项仍 **3/3、11/11、3/3 全闭合**，
 > 门槛「S3 不得接管生产流量」的**契约条件**已满足；下列为 `LLM_BACKEND=remote` **实际切换前**必须补齐。
-> 与 `DESIGN.md §10`「生产切换清单」对应（该项已由 A 补为七步，第①步即 SW-1）。
+> 与 `DESIGN.md §10`「生产切换清单」对应（该项已由 A 补为七步，第①步即 SW-1 + SW-4）。
+> **SW-1/SW-4 同根**：真实 provider（`MS_UPSTREAM=litellm`）路径**零测试覆盖**，契约测试只跑
+> `FakeUpstream`（协议 §17.4 / §23.1 / §24.2 三次记录同一盲区）。
 
 | # | 项 | 级别 | 归属 | 验收 |
 |---|---|---|---|---|
-| **SW-1** | **补全真实上游流式** —— `msvc/provider.py:LiteLLMProvider.stream()` 现抛 `NotImplementedError`；native 模式流式是主路径，不补则 `remote` 切换后**流式请求全失败** | 🔴 阻断 | 后端（S3） | 真实上游流式可用；**补一条真上游 smoke 用例**（勿只跑 `FakeUpstream`——正是这个盲区让本轮漏判） |
+| **SW-1** | **补全真实上游流式** —— `msvc/provider.py:LiteLLMProvider.stream()` 现抛 `NotImplementedError`；native 模式流式是主路径，不补则 `remote` 切换后**流式请求全失败**（实测：裸 `500 Internal Server Error`，协议 §24.1） | 🔴 阻断 | 后端（S3） | 真实上游流式可用；**补一条真上游 smoke 用例，且必须覆盖错误路径**（首字节前失败 → HTTP 错误状态；首字节后失败 → 流内错误帧 + `[DONE]`）——只测 happy path 等于没测，正是这个盲区让本轮两次漏判 |
 | **SW-2** | O-a：`_error_payload` 回填 `retry_after_s`（与协议 §7 退避语义对齐；流内 `rate_limited` 罕见，非阻断） | 🟢 | 后端（S3） | 流内 `rate_limited` 帧在**有上游值**时带 `retry_after_s` |
 | **SW-3** | `model-service/README.md`：契约版本 `v1` → `v1.7-澄清3`、用例列表 `T1–T11` → `T1–T12`，并注明真实 provider 流式未实现 | 🟡 | 后端（S3） | 该 README 与协议/代码一致（`DESIGN.md §10 ⑥` 引用它取 H3 公式） |
+| **SW-4** | **真实上游错误映射 + 在飞位释放保证**（协议 §24.2 R4）—— `msvc/main.py:31` `_map_upstream_error` 只认 `FakeUpstream` 的 `_ScenarioError`，`_handle_nonstream`（`main.py:229-247`）与 `_handle_stream`（`main.py:280-311`）**无 catch-all**、`create_app()` 也无全局异常处理器 ⇒ litellm 异常族（`BadRequestError`/`AuthenticationError`/`RateLimitError`/`APIConnectionError`…）**全部逃逸**：① 响应是裸 `500 Internal Server Error`，违反 §7（无 `code`/`retryable`/`Retry-After`）；② `_finish_window()` 未被调用 ⇒ **幂等在飞位永久泄漏**，同 key 后续请求恒 `409`（实测复现，`_inflight` 事后仍含该 key）。**危害**：兼容面键是 `api_key+model+消息体` 指纹 ⇒ 一次上游抖动让 AstrBot/QQ 用户**同一条消息在进程重启前永久发不出**，且 409 带 `retryable:true` 诱使客户端反复重试再吃 409 | 🔴 阻断 | 后端（S3） | ① litellm 异常族按 §7 表映射为带 `code`/`retryable`（+ 上游给值时的 `retry_after_s`）的错误体，429 必须是 `rate_limited` 而非 5xx（否则平台 §11 熔断误计、退避全丢）；② **任何退出路径都释放在飞位**（`try/finally` 或 catch-all，先释放后返回）；③ 用例：注入一个**非 `_ScenarioError`** 的异常 → 断言响应含 §7 错误体 **且** 同 key 第二次请求**不是 409**、`_inflight` 为空（该用例须在 `FakeUpstream` 之外可跑，别再落进同一盲区） |
+| **SW-5** | `_inflight` 加 TTL 兜底（与 SW-4 同批可选）：当前在飞位**无过期机制**，只有 `finish()`/`clear()` 能清 ⇒ 任何"释放漏了"的路径都变成永久拒绝。建议记 `monotonic` 时间戳，超过阈值（如上游总超时 60s）即视为陈旧并放行 | 🟢 | 后端（S3） | 陈旧在飞位不再永久阻断同 key 请求；SW-4 落地后本项为纵深防御，非阻断 |

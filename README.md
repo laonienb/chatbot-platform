@@ -106,7 +106,7 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
   -d '{"model":"persona:人设slug","messages":[{"role":"user","content":"你好"}]}'
 ```
 
-接入真实模型（生产目标态）：起 `model-service/`（provider 凭证配在它那边），平台 `.env` 设 `LLM_BACKEND=remote` + `MODEL_SERVICE_BASE_URL` + `MODEL_SERVICE_TOKEN` + `MODEL_SERVICE_MODE=native`；生产切换清单见 `DESIGN.md` §10（⚠️ 真实上游 provider 的**流式**实现待补——`DESIGN.md` §10 ①——补全前勿切 `remote`）。旧直连方式（`LLM_BACKEND=litellm` + `LITELLM_API_KEY`/`LITELLM_API_BASE`）仍可用但退役中。
+接入真实模型（生产目标态）：起 `model-service/`（provider 凭证配在它那边），平台 `.env` 设 `LLM_BACKEND=remote` + `MODEL_SERVICE_BASE_URL` + `MODEL_SERVICE_TOKEN` + `MODEL_SERVICE_MODE=native`；生产切换清单见 `DESIGN.md` §10（⚠️ 真实上游 provider 的**流式**实现与**错误映射**待补——`DESIGN.md` §10 ①、工作单 SW-1/SW-4——补全前勿切 `remote`）。旧直连方式（`LLM_BACKEND=litellm` + `LITELLM_API_KEY`/`LITELLM_API_BASE`）仍可用但退役中。
 
 Docker 方式（PostgreSQL + Redis + server）：
 
