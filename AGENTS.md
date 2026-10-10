@@ -50,10 +50,13 @@
 > `docs/model-service-work-order.md` 回执中）。本表只保留**活着的队列**。
 > 2026-10-10 架构师 B 二次收口：删除已闭合的后端 P1-8/9/11 交付×2、架构师 A 终轮验收行、
 > 旧契约治理行（模型服务解耦 **P0 3/3、P1 11/11、P2 3/3 全部闭合**，历史见协议 §22）。
+> 同日架构师 A **复核 B 的文档收编**（协议 §23）：纠正 `DESIGN.md`/`README` 把「契约门槛解除」
+> 外推成「已具备接管资格」——**真实上游流式未实现**，已在 `DESIGN.md §10` 补第①步、新增后端行。
 
 | Agent | 模块 | 状态 | 更新时间 |
 |---|---|---|---|
-| 架构师A+B | 模型服务契约治理（收官态） | ✅ 协议 **v1.7-澄清3** 定稿，全部工作单闭合、门槛解除（S3 可接管生产流量，实际上线待部署落地）。**活着的遗留**：O-a 非阻断（流内 `rate_limited` 帧未回填 `retry_after_s`，`_error_payload` 一处小改，建议随下次服务侧提交顺带）；`deploy/docker-compose.yml` 尚无 model-service 服务（归后端）；DESIGN.md v0.3 收编中（归架构师） | 2026-10-10 |
+| 架构师A+B | 模型服务契约治理（收官态） | ✅ 协议 **v1.7-澄清3** 定稿，全部工作单闭合、门槛解除（**契约侧** S3 可接管生产流量；**部署侧尚缺真实上游流式**，见下行）。活着的遗留：O-a 非阻断（流内 `rate_limited` 帧未回填 `retry_after_s`，`_error_payload` 一处小改，随下次服务侧提交顺带）；`deploy/docker-compose.yml` 尚无 model-service；DESIGN.md v0.3 **已收编**（架构师 A 复核记录见协议 §23） | 2026-10-10 |
+| 后端 | **生产切换前置：真实上游流式未实现** 🔴 | `model-service/msvc/provider.py:191` `LiteLLMProvider.stream()` 抛 `NotImplementedError`；native 模式流式是主路径 ⇒ `LLM_BACKEND=remote` 后所有流式请求必失败。契约测试只覆盖 `FakeUpstream`（`# pragma: no cover`）故未暴露。**阻塞 `DESIGN.md §10` 生产切换①**（架构师 A 复核发现，协议 §23.1）。同批顺带：O-a 回填 `retry_after_s`、`model-service/README.md` 版本/用例列表更新（工作单 v1.8） | 2026-10-10 |
 | 前端 | 「三」流式错误语义通告的消费 | 🔄 待前端跟进：退避时长改读 `error.retry_after_s`、`[DONE]` 为唯一正常终止信号（详见「三」活着通告）。完成后双方闭环删单 | 2026-10-10 |
 
 ## 二、前端 → 后端 接口需求
