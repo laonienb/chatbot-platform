@@ -1,7 +1,10 @@
 # 聊天机器人平台设计方案（API 优先）
 
-> 版本：v0.1（2026-10-05）
-> 状态：设计稿，待评审
+> 版本：v0.3（2026-10-10）
+> 状态：**现行真源**。v0.3 收编模型服务解耦（S1–S4 已交付）：平台不再直连任何
+> provider，统一经独立**模型服务**（`model-service/`）。服务间契约的唯一真源是
+> `docs/model-service-protocol.md`（v1.7），本文只保留架构视图与决策记录索引；
+> 解耦动机与七轮交叉评审史见 `docs/model-service-design.md`（S1 定案）。
 
 ## 1. 设计原则
 
@@ -22,13 +25,26 @@
    └──────────┘        │  ┌────────────┐  └────────┬────────┘  │
                        │  │ OpenAI 兼容 │           ▼           │
    第三方机器人框架       │  │ /v1        │  ┌─────────────────┐  │
-   ┌──────────┐──APIKey▶│  └────────────┘  │ LLM 网关 LiteLLM │  │
-   │ AstrBot  │        │                   └───────┬─────────┘  │
-   │ NapCatQQ │        └───────────────────────────┼────────────┘
-   └────┬─────┘                                    ▼
-        │                                    OpenAI / Claude /
-   QQ 用户、微信群…                              Gemini / DeepSeek…
+   ┌──────────┐──APIKey▶│  └────────────┘  │ RemoteBackend    │  │
+   │ AstrBot  │        │                   │ (熔断/降级/目录)  │  │
+   │ NapCatQQ │        └───────────────────┼──────────────────┘
+   └────┬─────┘                            │ OpenAI 兼容 + 扩展字段
+        │                                  ▼ （内网，服务间 token）
+   QQ 用户、微信群…              ┌───────────────────────┐
+                               │  模型服务 model-service │
+                               │  凭证·路由·重试降级      │
+                               │  成本归因·合规·幂等窗    │
+                               └───────────┬───────────┘
+                                           ▼
+                              OpenAI / Claude / DeepSeek / Qwen /
+                              自部署 vLLM·Ollama …（provider 原生协议）
 ```
+
+**模型服务解耦（v0.3 收编，2026-10-10 全单闭合）**：平台不接触任何 provider 凭证；
+模型服务无状态、只认真实模型名（`persona:` 前缀显式 400 拒绝）、永不认识
+`user_id`/`conversation_id`。边界铁律、错误码表、幂等三分表、超时分层、契约测试
+T1–T12 全部以 `docs/model-service-protocol.md` 为准。平台侧 `LLM_BACKEND` 三态：
+`mock`（本地开发，生产禁启）/ `litellm`（旧直连，退役中）/ `remote`（生产目标态）。
 
 ## 3. 客户端接入矩阵
 
@@ -72,7 +88,7 @@ Authorization: Bearer sk-xxx
 - **无状态模式**：调用方（AstrBot）自己维护多轮历史并全量传 `messages`，平台不做会话存储（只记用量日志）。AstrBot 本来就是自己管历史的，天然契合。
 - **人设即模型名**：`model` 解析顺序：
   1. `persona:<slug>` → 查 personas 表，注入人设 system prompt；
-  2. 其他值 → 原样作为真实模型名传给 LiteLLM（`gpt-4o`、`deepseek-chat`…）。
+  2. 其他值 → 原样作为真实模型名传给**模型服务**（`gpt-4o`、`deepseek-chat`…）。
 - **兜底注入**：客户端不便改 `model` 时，支持 header `X-Persona: <slug>` 覆盖人设选择。
 - **平台侧注入的内容**：人设 system prompt（拼接在用户消息最前）、后期加入长期记忆/知识库检索结果。平台是人格的唯一真源——AstrBot 侧的"人格情景"配置留空，避免两层 system prompt 冲突。
 - 返回与错误格式完全遵循 OpenAI 规范；`usage` 记入 usage_logs 并记账到 API Key。
@@ -216,7 +232,7 @@ usage_logs(
 ```
 用户发消息 → POST /conversations/{id}/messages {stream:true}
 → 服务端载入会话历史 → 组装 [persona.system_prompt + 历史 + 新消息]
-→ LiteLLM 调模型 → SSE 逐块返回 → 落库 messages + usage_logs
+→ 模型服务调上游 → SSE 逐块返回 → 落库 messages + usage_logs
 ```
 
 ### 7.2 QQ 消息（经 AstrBot，无状态）
@@ -225,7 +241,7 @@ usage_logs(
 QQ消息 → NapCatQQ(OneBot v11) → AstrBot 判断触发(被@/唤醒词)
 → AstrBot 取自己维护的上下文 → POST /v1/chat/completions
   (model="persona:xxx", user="qq:12345")
-→ 平台注入人设 → LiteLLM → 返回 → AstrBot 发回 QQ
+→ 平台注入人设 → 模型服务 → 返回 → AstrBot 发回 QQ
 ```
 
 AstrBot 侧每个群/会话用哪个 persona，由 AstrBot 的会话配置或插件决定（群绑定策略在平台侧是 im_bindings，AstrBot 插件可读它来决定 model 名）。
@@ -243,7 +259,7 @@ wx.login() 取 code → POST /auth/wechat-miniprogram {code}
 | 层 | 选型 | 理由 |
 |---|---|---|
 | 后端 | Python 3.12 + FastAPI + SQLAlchemy + Alembic | IM/LLM 生态最全；async 原生支持 SSE 流式 |
-| LLM 网关 | LiteLLM | 多模型路由/重试/降级/成本核算，不自己造 |
+| LLM 接入 | **独立模型服务**（自研 `model-service/`，OpenAI 兼容协议 + 扩展字段；LiteLLM 作为其 provider 实现之一） | v0.3 定案：凭证/路由/重试降级/成本归因/合规收口在模型服务，平台零 provider 依赖。曾评估 LiteLLM Proxy 起步（Q3=C），最终以自研交付（契约测试 T1–T12 双侧全绿） |
 | 数据库 | PostgreSQL + pgvector | 业务数据与向量（知识库/记忆）一库搞定 |
 | 缓存/限流/队列 | Redis | 令牌桶限流、会话缓存、绑定码 TTL |
 | 前端 | Next.js + React | Web 与后续小程序生态近；SSE 消费简单 |
@@ -262,19 +278,25 @@ chatbot-platform/
 │   │   ├── core/              # 配置、安全(JWT/APIKey)、依赖注入、限流
 │   │   ├── models/            # SQLAlchemy 模型
 │   │   ├── services/          # persona / conversation / usage / binding 业务逻辑
-│   │   └── llm/               # LiteLLM 封装、persona 注入、上下文组装
+│   │   ├── llm/               # RemoteBackend(模型服务客户端)/gateway/mock、persona 注入、上下文组装
+│   │   └── billing/           # 计价/归因/双阶段账本/费率/钱包/准入/对账（冻结区）
 │   ├── alembic/               # 迁移
-│   └── tests/
+│   └── tests/                 # 含契约测试（对 fake model-service 桩跑 T1–T12）
+├── model-service/             # ★ 独立模型服务（v0.3）：msvc 包 + 服务侧契约测试
+│   ├── msvc/                  #   main/guards/idempotency/provider/config/errors
+│   └── tests/                 #   FakeUpstream 离线可跑，与平台侧互为镜像
 ├── web/                       # Next.js 前端
 ├── deploy/
-│   ├── docker-compose.yml     # server, web, postgres, redis, litellm, napcat, astrbot
+│   ├── docker-compose.yml     # server, web, postgres, redis, model-service(待落地), napcat, astrbot
 │   └── astrbot/               # AstrBot 配置（provider 指向平台 /v1）
-└── docs/                      # API 文档、部署手册
+└── docs/                      # 协议契约(model-service-protocol)/设计/工作单/API 文档
 ```
 
 ## 10. 部署拓扑与合规注意
 
-单机 Compose 起步，服务：`server`（8000）、`web`（Nginx 托管静态+反代）、`postgres`、`redis`、`litellm`、`napcat`（QQ 协议端）、`astrbot`。
+单机 Compose 起步，服务：`server`（8000）、`web`（Nginx 托管静态+反代）、`postgres`、`redis`、**`model-service`（仅内网，不暴露公网；compose 尚未落地，属生产切换前置项）**、`napcat`（QQ 协议端）、`astrbot`。
+
+**生产切换清单（模型服务上线前置，v0.3 登记）**：① compose 增补 `model-service` 服务与内网隔离；② `MODEL_SERVICE_TOKEN` 生成注入双方（≥32 字节随机，不落 git）；③ 平台侧 `LLM_BACKEND=remote` + `MODEL_SERVICE_MODE=native` + `APP_ENV=prod`（mock 生产禁启守卫已实现）；④ provider 凭证迁入模型服务、`llm_models.api_key/api_base` 两列废弃迁移（S6 收尾）；⑤ 幂等窗容量按 `max_entries ≥ 峰值RPS×600` 配置（H3 公式，见 model-service/README）；⑥ 前端确认已消费「三」流式错误通告。
 
 小程序/微信侧的现实约束（影响部署而非架构）：
 
@@ -292,7 +314,7 @@ chatbot-platform/
 | M3 平台化（2-4 周） | 人设市场、配额与限流、管理后台、小程序端 | 每个用户有私有人设库并可发布分享 |
 | M4 增强 | RAG 知识库(pgvector)、长期记忆、工具调用、IM 绑定码打通身份 | 人设可挂知识库；QQ 身份与 Web 账号打通 |
 
-### 11.1 实际进度快照（2026-10-06 更新）
+### 11.1 实际进度快照（2026-10-10 更新）
 
 实际推进与原规划有交叉（多块内容提前落地），当前状态：
 
@@ -301,13 +323,15 @@ chatbot-platform/
 | M0 + M1 全部 | 注册登录/人设/会话/SSE 流式（双 API 面）/Web 聊天界面/用量接口 |
 | M3 的人设市场 | 发布/可见性/搜索/分类标签/fork（缺审核态） |
 | M3 的计费与计量（billing step 0–6） | token 归因（人设/记忆/历史/输入）、usage_logs 双阶段账本（pending→settled/failed/abandoned + 幂等键 + 价格快照）、费率规则（upstream/retail 双口径）、准入（月度配额 429 + 积分余额 402，开流前拦截）、结算即扣钱包（不足部分支付 + needs_review，幂等）、注册赠送与存量迁移补发、RPM 限流（双 API 面）、对账循环（收编残留 pending）与毛利倒挂告警、管理端 `/admin/billing/margin`+`/reconcile`。详见 `docs/compose/spec/billing-wiring.md` |
+| **模型服务解耦（S1–S4 全单闭合，2026-10-10）** | 独立 `model-service/`（无状态、服务间 token、仅内网）：路由/凭证/重试降级/成本归因（`cost_usd` 十进制字符串，unknown 绝不为 0）/合规否决/幂等窗三分表 + 流式终态重放/超时三层预算/目录同步（上线+下线）。平台侧 `RemoteBackend`（熔断含流式、503 降级、`error.code` 透传、启动自检 fail-fast）。契约 v1.7-澄清3 + 契约测试 T1–T12（服务侧 40 + 平台侧 180 用例全绿，双架构师七轮交叉评审 + 终轮验收）。详见 `docs/model-service-protocol.md` |
 | M4 的长期记忆 | §13.1 已实现：对话后自动提取 → 人设级记忆库 → 注入上下文 → Web 记忆管理 |
-| 聊天增强 | 会话级模型切换、llm_models 模型注册表（管理员 API，支持逐模型独立端点凭证）、停止/重新生成、Markdown 渲染、消息翻页、局域网访问（同源代理） |
-| UI 精致化 | 深色主题样式系统（渐变/毛玻璃/统一动效） |
+| 聊天增强 | 会话级模型切换、llm_models 模型注册表、停止/重新生成（`regen:{uuid}` 每次唯一键，不撞幂等窗）、Markdown、消息翻页、局域网访问 |
+| 管理后台（M3 部分） | `web/app/admin/`：毛利概览/负毛利明细/手动对账 + 模型管理 CRUD |
+| UI/前端质量 | 深浅双主题、WCAG 对比度全站归零（含浮层三轮审计）、首张回归网（21 用例+ESLint）、429 退避重发接线（仅平台自身 RPM 限流）、`error.code` 优先判读 + 503 降级提示、SSE 流内错误帧不再静默吞 |
 
-计费后续（尚未做）：用户侧充值/余额查询 API 与 Web 展示、订阅 plan 维度费率、管理后台整页。
+计费后续（尚未做）：**用户侧充值**（余额查询 API 与 Web 展示已上线）、订阅 plan 维度费率、per-user 额度。
 
-未开始（按建议优先级）：模型管理前端界面（需 admin 角色）→ **聊天记录蒸馏流水线**（§13.2，用户核心需求，需先接真实 LLM）→ M2 机器人接入（AstrBot+NapCat 部署文档）→ M3 剩余（管理后台/小程序）→ M4 剩余（RAG/工具调用）→ PostgreSQL 生产切换。
+未开始（按建议优先级，v0.3 重排）：**① 生产切换**（compose 落地 model-service + §10 切换清单六步，模型服务已具备接管资格）→ **② 聊天记录蒸馏流水线**（§13.2 用户核心需求；原「需先接真实 LLM」的阻塞已被模型服务解除）→ ③ M2 机器人接入（AstrBot+NapCat 部署文档）→ ④ 小程序端 → ⑤ M4 剩余（RAG/工具调用）→ ⑥ PostgreSQL 生产切换。
 
 ## 12. 风险与对策
 

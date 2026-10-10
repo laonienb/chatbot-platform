@@ -17,7 +17,7 @@
 - `/v1` OpenAI 兼容层：`model="persona:<slug>"` 即可让 AstrBot 等框架把人设当模型用
 - SSE 流式（两套 API 同构）、非流式、重新生成、会话级模型覆盖
 - 长期记忆：对话后自动提取事实 → 人设级记忆库 → 注入后续对话上下文（人设可开关）
-- LLM 网关：mock（零 Key 开发）/ litellm（真实模型）双后端；模型注册表支持为每个模型配独立 `api_base`/`api_key`（自部署 vLLM/Ollama 或第三方中转均可）
+- LLM 接入：`mock`（零 Key 开发）/ `remote`（**独立模型服务**，生产目标态：凭证/路由/重试降级/成本归因/合规收口，见 `model-service/` 与 `docs/model-service-protocol.md`）/ `litellm`（旧直连，退役中）；模型注册表支持展示目录与逐模型配置
 - 计费与计量：token 归因（人设/记忆/历史/输入拆分）、双阶段账本结算（幂等/价格快照）、费率规则、准入（月度配额 429 + 积分余额 402）、结算即扣钱包、注册赠送、RPM 限流、对账循环与毛利告警、管理端 `/admin/billing/*`
 
 **前端（Next.js 15 + React 19，深色精致主题）**
@@ -37,31 +37,34 @@ chatbot-platform/
 │   │   ├── api/openai_compat/ # /v1/chat/completions OpenAI 兼容层
 │   │   ├── billing/           # 计费：计价引擎 / token 归因 / 账本结算 / 费率 / 钱包
 │   │   ├── core/              # 配置、安全(JWT/APIKey)、SSE
-│   │   ├── llm/               # LLM 网关（mock / litellm 双后端）
+│   │   ├── llm/               # RemoteBackend（模型服务客户端）/ gateway / mock
 │   │   ├── models/            # SQLAlchemy 数据模型
 │   │   ├── schemas/           # Pydantic 请求/响应模型
 │   │   └── services/          # 业务逻辑（chat / persona / memory）
 │   ├── alembic/         # 数据库迁移
 │   ├── scripts/         # make_admin 等运维脚本
 │   └── tests/           # pytest（每测独立临时 SQLite，不依赖 .env）
+├── model-service/       # 独立模型服务（v0.3）：凭证/路由/重试降级/成本归因/合规/幂等窗
 ├── web/                 # 前端：Next.js 15 + React 19（手写深色主题 CSS）
-├── deploy/              # docker-compose（PostgreSQL + Redis + server）
-└── docs/                # API 文档、部署手册（待写）
+├── deploy/              # docker-compose（PostgreSQL + Redis + server；model-service 待落地）
+└── docs/                # 模型服务协议契约与设计、计费接线说明、前端工作报告
 ```
 
 ## 当前状态
 
-进度快照（2026-10-06，里程碑规划见 DESIGN.md 第 11 节）：
+进度快照（2026-10-10，里程碑规划见 DESIGN.md 第 11 节）：
 
 - [x] M0 骨架 — 注册登录、人设 CRUD、会话、非流式对话、OpenAI 兼容层（mock LLM）、API Key
 - [x] M1 Web 可用 — SSE 流式（双 API 面）、Next.js 聊天界面、me/usage 用量接口
-- [x] M3 提前完成一部分 — 人设市场（发布/搜索/分类/fork）；配额与限流（配额准入 429、余额准入 402、RPM 限流）
+- [x] M3 提前完成一部分 — 人设市场（发布/搜索/分类/fork）；配额与限流（配额准入 429、余额准入 402、RPM 限流）；管理后台（毛利概览/负毛利明细/手动对账、模型管理 CRUD）
 - [x] M4 提前完成一部分 — 长期记忆（自动提取/注入/管理）；聊天记录蒸馏流水线已设计（DESIGN.md §13.2）待实现
 - [x] 聊天增强 — 会话级模型切换、模型注册表、停止/重新生成、Markdown、局域网访问（同源代理）
-- [x] 计费与计量 — 归因/双阶段账本/费率/钱包扣费/准入/对账与毛利监控（`docs/compose/spec/billing-wiring.md`）；用户侧充值与余额展示未做
+- [x] 计费与计量 — 归因/双阶段账本/费率/钱包扣费/准入/对账与毛利监控（`docs/compose/spec/billing-wiring.md`）；余额查询与展示已上线，用户侧充值未做
+- [x] **模型服务解耦（2026-10-10 全单闭合）** — 独立 `model-service/` + 平台 `RemoteBackend`，契约 v1.7（`docs/model-service-protocol.md`），契约测试双侧全绿（40+180）；生产切换清单见 DESIGN.md §10
+- [ ] 生产切换 — compose 落地 model-service + 切换清单六步（模型服务已具备接管资格）
 - [ ] M2 机器人接入 — AstrBot + NapCat 部署（兼容层已就位）
-- [ ] M3 剩余 — 管理后台、小程序端
-- [ ] M4 剩余 — 蒸馏流水线、RAG 知识库、工具调用
+- [ ] M3 剩余 — 小程序端
+- [ ] M4 剩余 — 蒸馏流水线（真实 LLM 通路已就绪，阻塞解除）、RAG 知识库、工具调用
 
 ## 快速开始（后端）
 
@@ -79,7 +82,7 @@ cp .env.example .env
 # 起服务（http://127.0.0.1:8000，文档在 /docs）
 .venv/Scripts/uvicorn app.main:app --reload
 
-# 跑测试（104 个用例，每测独立临时 SQLite，不依赖 .env）
+# 跑测试（平台侧 180 个用例，每测独立临时 SQLite，不依赖 .env；模型服务侧另有 40 个契约用例）
 .venv/Scripts/pytest
 ```
 
@@ -103,7 +106,7 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
   -d '{"model":"persona:人设slug","messages":[{"role":"user","content":"你好"}]}'
 ```
 
-接入真实模型：复制 `.env` 中 `LLM_BACKEND=litellm` 并配 `LITELLM_API_KEY`/`LITELLM_API_BASE`，或起服务后在 `/docs` 用管理员账号把模型注册进 `llm_models`（可逐模型配端点与凭证）。
+接入真实模型（生产目标态）：起 `model-service/`（provider 凭证配在它那边），平台 `.env` 设 `LLM_BACKEND=remote` + `MODEL_SERVICE_BASE_URL` + `MODEL_SERVICE_TOKEN` + `MODEL_SERVICE_MODE=native`；生产切换清单见 `DESIGN.md` §10。旧直连方式（`LLM_BACKEND=litellm` + `LITELLM_API_KEY`/`LITELLM_API_BASE`）仍可用但退役中。
 
 Docker 方式（PostgreSQL + Redis + server）：
 
