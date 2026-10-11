@@ -119,6 +119,11 @@ class Control:
     stream_error_after_chunks: int = 1
     # 错误帧是否携带实测部分 usage（§6.7 G3-2，加法字段）
     stream_error_usage: bool = False
+    # ⚠️ **故意不带 `[DONE]` 就把连接掐掉**：发满 N 个内容 chunk 后在生成器里抛异常，
+    # 让 SSE 响应体没有终止块。用于「客户端看到的截断长什么样」的实弹（AGENTS.md「三」）。
+    # 注意它与 `silence_after_chunks` 不同：沉默只是不发 [DONE] 但连接仍在，到
+    # `silence_seconds` 后正常 return；本项是**传输层断**。
+    abort_after_chunks: int | None = None
     # 沉默期间是否持续发 `: keepalive` 注释行（心跳应能重置空闲计时）。
     keepalive_during_silence: bool = False
     # 沉默持续时长（秒）；配合 silence_after_chunks 使用。
@@ -402,6 +407,11 @@ async def _stream_body(control: Control):
             )
             sent += 1
             await asyncio.sleep(control.stream_chunk_delay_seconds)
+            # 故意断流（无 [DONE]）：在生成器里抛异常 ⇒ SSE 响应体没有终止块，传输层断开。
+            # 这条不是「服务侧发了错误帧」，而是「连接被掐」——用来验前端 `truncated` 判据
+            # 与平台兜底（平台侧仍会补 `data: {"error":…}` + `[DONE]`，见 AGENTS.md「三」）。
+            if control.abort_after_chunks is not None and sent >= control.abort_after_chunks:
+                raise RuntimeError("注入：模型服务在流中途断开，未发 [DONE]")
             # 流内错误帧（§6.7 / P1-9 验收③）：**首字节之后**的错误只能用帧表达，
             # 其后仍须 [DONE]（G3-1）。与 `control.error`（首字节前的 HTTP 错误）互斥。
             if control.stream_error is not None and sent >= control.stream_error_after_chunks:
