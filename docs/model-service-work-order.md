@@ -287,6 +287,7 @@ P2-1 / P2-2（协议已就绪，可并行）
 | v1.8 | 2026-10-10 | 架构师 A | **复核架构师 B 的文档收编（`a8958c8`，协议 §23）后新增「生产切换前置项」**：R1 🔴 `msvc/provider.py:191` `LiteLLMProvider.stream()` 抛 `NotImplementedError`——**唯一真实上游不能流式**，而 native 模式流式是主路径，`DESIGN.md §10` 切换清单原六步无一步覆盖；契约测试只跑 `FakeUpstream`（`# pragma: no cover`）故 40 全绿照不到。R3 🟡 `model-service/README.md` 仍写 `v1`/`T1–T11`。R2 🟡 看板行「收编中」自相矛盾（架构师 A 已就地改）。**本单不新增 P 级编号**（P0/P1/P2 仍全闭合），前置项见 §8 |
 | v1.9 | 2026-10-10 | 架构师 B | **冻结快照复核 A 的 §23（协议 §24）后扩充 §8**：R1/R2/R3 **全部确认成立**（快照内基线 `40 passed`；真上游流式实测裸 `500`）。**另发现 R4 🔴 → 新增 SW-4**：`_map_upstream_error` 只认 `FakeUpstream` 的 `_ScenarioError`，两个 handler 无 catch-all、无全局异常处理器 ⇒ litellm 异常族全部逃逸，既违反 §7（裸 500 无 `code`），又让 `_finish_window` 不被调用 ⇒ **幂等在飞位永久泄漏**（实测：同 key 第二次恒 `409`，`_inflight` 事后仍含该 key；兼容面指纹键 ⇒ 同一条消息在重启前永久发不出）。**对照组 + 快照内补丁双向验证**：窗口逻辑本身正确（可映射错误 → 429/429、`_inflight` 清空），根因唯一为「异常在 `_finish_window` 前逃出」；打补丁前后基线均 40 全绿 ⇒ 用例对该类缺陷**双向皆盲**。同批：**SW-1 验收扩至错误路径**、新增 **SW-5 🟢**（`_inflight` TTL 兜底）。另附**一条待 A 会签的 §8.2.1 澄清提案**（在飞位必须在任何退出路径释放）。**本单仍不新增 P 级编号**（P0/P1/P2 保持全闭合），R4 属实现/部署缺口 |
 | v1.10 | 2026-10-11 | 架构师 A | **SW-1…SW-5 终轮验收：全部通过**（交付 `c5ff7bb`，协议 §25.2）。冻结快照内实跑服务侧 **64 passed**；五处证伪各自只打红对应用例（SW-1→6、SW-4 映射→4、SW-4 释放→8 含旧 T7/P1-11、SW-5→1、SW-2→2），**关键实证：把真上游流式改回 `NotImplementedError` 时，契约用例（`FakeUpstream`）全绿、只有新文件红** ⇒ R4 的「真实 provider 零覆盖」被正面证实。会签 §24.3 提案并入 §8.2.1（协议 §25.1，v1.7-澄清4）。`DESIGN.md §10 ①` 代码侧闭合，剩余②–⑦为部署/运维。前端 `0c5869e` 同批验收通过（web 30 passed，证伪 2/1/7/1），`server` 180 passed 无回归 |
+| v1.11 | 2026-10-11 | 架构师 A | **新增 §9「生产切换清单 ②–⑦ 工作项」**（DW-2…DW-7，含责任人/动作/验收/阻塞，响应管家 G 的派发请求）。按「先做纯仓内项、把改库项单独立项」：**DW-2(compose)/DW-6(幂等窗容量) 已派 `flash-后端-G`**；**DW-3(token 落点)/DW-4(翻 remote)/DW-5(改库迁移) 标为「待用户定」未派**；DW-7 前端消费已闭合（`0c5869e`）。路径占用与租约建议见 §9 末 |
 
 ---
 
@@ -320,3 +321,26 @@ P2-1 / P2-2（协议已就绪，可并行）
 | SW-3 | ✅ 闭合 | `c5ff7bb` | `model-service/README.md` 头改 `v1.7-澄清3`、测试清单写 T12 与真上游文件、Provider 节记流式已实现 |
 | SW-4 | ✅ 闭合 | `c5ff7bb` | `_map_upstream_error` 全异常收敛（`from_upstream_exception`）；`create_app` 挂全局 `Exception` handler；`_finish_window` 自带兜底释放；证伪 4 红 + 8 红 |
 | SW-5 | ✅ 闭合 | `c5ff7bb` | `IdempotencyWindow.inflight_ttl_seconds`（默认 60s，`MS_IDEMPOTENCY_INFLIGHT_TTL_SECONDS`）陈旧即放行 + WARNING；证伪 1 红 |
+
+---
+
+## 9. 生产切换清单 ②–⑦ 工作项（v1.11 登记，部署侧）
+
+> 依据：`DESIGN.md §10` 生产切换清单 ②–⑦（① 的**代码侧**已由 `c5ff7bb` 闭合，协议 §25.2）。**真源 = 本节**；
+> `AGENTS.md §一` 只镜像活队列。**责任人一律「后端 agent」**；其中 **DW-3 / DW-4 / DW-5 含用户决策项**，
+> 决策未落前**不得开工**（见各行「待用户定」）。
+> 派发（2026-10-11 架构师 A）：**DW-2 / DW-6 已派 `flash-后端-G`**（会话 `66281830-7eb4-496a-99bd-2008d13cf76a`）；
+> **DW-3 / DW-4 / DW-5 保持未派**，等用户回话；**DW-7 已闭合**。架构师**不写实现代码**。
+
+| # | 对应 §10 | 项 | 责任人 | 具体动作 | 验收标准 | 阻塞了什么 | 状态 |
+|---|---|---|---|---|---|---|---|
+| **DW-2** | ② | compose 增补 `model-service` + 内网隔离 | 后端 | `deploy/docker-compose.yml` 增 `model-service` 服务（`build: ../model-service`、**不映射宿主端口**、仅挂内部网络）；`server` 经 `MODEL_SERVICE_BASE_URL=http://model-service:8000` 访问；env 用 `${VAR:-默认}` 形态**保持现状（仍 mock，不翻转）** | `docker compose config` 通过；`up` 后 server 能解析 `model-service` 且该服务**不暴露宿主端口**；提交后 `git status` 干净 | DW-4 的切换依赖它 | 🔄 已派 `flash-后端-G` |
+| **DW-6** | ⑥ | 幂等窗容量按 H3 定值 | 后端 | 按 `max_entries ≥ 峰值RPS × MS_IDEMPOTENCY_WINDOW_SECONDS` 给 `MS_IDEMPOTENCY_CACHE_MAX_ENTRIES`/`MAX_CHARS` 定值，写进 compose（并 `deploy/.env.example`）；把**峰值 RPS 假设 + 算例**补进 `model-service/README.md` | compose 中该 env 可见且值有据；README 有公式与按假设 RPS 的算例；运维信号「淘汰 WARNING 正常为零」在 README 明示 | 无（与 DW-2 同批） | 🔄 已派 `flash-后端-G` |
+| **DW-3** | ③ | `MODEL_SERVICE_TOKEN` 生成并注入双方 | 后端（+**用户定落点**） | 生成 ≥32 字节随机 token；写入**不入库**的 `deploy/.env`（`.gitignore` 已排除 `.env`/`.env.*`）；提交 `deploy/.env.example` 模板（占位符）；两处注入：model-service `MS_SERVICE_TOKENS`、server `MODEL_SERVICE_TOKEN`（§3 静态 Bearer） | `git check-ignore deploy/.env` 命中；`git grep <token>` 无命中；双方启动自检通过 | 任何 `remote` 联通 | ⏸ **未派**（待用户定 token 落点） |
+| **DW-4** | ④ | 翻到 `remote`（**生产变更**） | 后端（+**用户定**） | `LLM_BACKEND=remote` + `MODEL_SERVICE_MODE=native` + `APP_ENV=prod`；确认启动自检（协议版本 / 内层<外层超时 / 目录同步）通过 | prod 下 `mock` 被拒启动守卫生效；端到端一次真上游流式成功 | 生产可用 | ⏸ **未派**（待用户定是否切/用何凭证） |
+| **DW-5** | ⑤ | 凭证迁入 + 两列废弃迁移（S6） | 后端（+**用户定**） | provider 凭证迁入模型服务 env；`llm_models.api_key`/`api_base` 废弃迁移 | 迁移**有备份/回滚方案**；两列不再被读 | 生产凭证不再散落平台库 | ⏸ **未派**（改库、不可逆，建议**单独立项**） |
+| **DW-7** | ⑦ | 前端确认已消费「三」通告 | — | 无（已完成） | `0c5869e` 验收通过（协议 §25.3） | — | ✅ 已闭合 |
+
+**路径占用（供 G 落租约 / 向 C 侧发让路通告）**：DW-2 / DW-6 预计只动
+`deploy/docker-compose.yml`、新增 `deploy/.env.example`，以及 `model-service/README.md`；
+**不碰** `server/`（④ 的 env 翻转未派）与 `model-service/msvc/*.py`（⑥ 走 env，**不改代码**）。
