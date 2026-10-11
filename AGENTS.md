@@ -143,10 +143,43 @@
   验证：`npm test` **30 通过 / 0 失败**（原 21 条 + 新增 9 条），`npm run typecheck`、
   `npm run lint` 均干净。证伪三处各只破坏一条防线，变红严格局限于对应用例：
   去掉 `retry_after_s` 读取 → 2 红；取消截断检测 → 1 红；不处理残留 buffer → 1 红。
-  ⚠️ **未做浏览器实弹**：本地 dev 服务器已停（`ERR_CONNECTION_REFUSED`），mock 路径未跑通。
-  改以静态证据替代结论：`sse.py:29` 规定错误帧后必发 `SSE_DONE`，`conversations.py:64/68/80`
-  与 `openai_compat/chat.py:122/126/141` 覆盖全部收尾分支，`chat.py:80` 为无条件收尾
-  ⇒ 真实后端不会因新增的截断检测而误报。若后续要补实弹，起 `server` + `web` 跑一轮即可。
+  ✅ **浏览器实弹已补（2026-10-11 23:42–23:45，管家-C 派单 `harness/proposals/C-dispatch-web-livecheck.md`）**：
+  真实 Chrome（headless + CDP，零依赖）驱动真实聊天页，逐格读 DOM 文本与控制台。
+  **先说跑不通的一半**：本机没有任何装了 `fastapi`/`uvicorn` 的 Python 环境（全局 Anaconda 与
+  `envs/codeing` 都查过，`import uvicorn` → ModuleNotFoundError），真实 `server` 起不来；而
+  `LLM_BACKEND=mock` 本来就永不产生错误帧。故错误帧由**我自己的一次性 SSE 桩**按本条登记的形状
+  逐字发出（`output/livecheck/stub-backend.mjs`，gitignored 未入库），并跑两种传输：① 浏览器 →
+  Next dev 同源 rewrites（`BACKEND_URL`）→ 桩；② 浏览器 → 桩直连（`NEXT_PUBLIC_API_BASE`，
+  即分离部署那条路）。桩之后是真实 `fetch`/`streamSSE`/React 渲染，两档共用同一份前端代码。
+  实测现象（证据 `output/livecheck/results-{proxy,direct}.json` 与同名截图）：
+  - **指南 1 成立**：帧内 `error.retry_after_s: 30` → 页面「操作过于频繁，请 30 秒后再试」；
+    改放顶层 `retry_after_s: 45` → 「…请 45 秒后再试」。两档一致，且 30/45 不同值可分辨读的是
+    帧里的数（读不到时文案是无秒数的「请稍后再试」）。
+  - **指南 2/3 成立**：`[DONE]` 落在没有 `\n\n` 终止的尾巴里 → 正常收尾、无提示；服务端干净关流
+    却始终不发 `[DONE]` → 页面「回复被中断（连接提前结束），请重试」；未知形状帧被跳过，不报错。
+  - **指南 4 例外成立**：内容停在半句 + `[DONE]` + 无 error 帧 → 页面零提示，按正常收尾渲染。
+  - ⚠️ **一条边界（本轮未改，属产品判读）**：把连接**硬掐**（桩 `res.destroy()`）时两档结果不同——
+    直连档浏览器给 `net::ERR_INCOMPLETE_CHUNKED_ENCODING`，页面文案是浏览器的「network error」
+    而非「回复被中断…」（仍报错、不会静默当成功）；dev 代理档整条流挂住 12s 不收尾，用户只能点
+    「停止」（`curl` 对照同结论：直连桩 exit=18/0.15s，经代理 exit=28/8s 超时）。即
+    「没有 `[DONE]`」只在**上游正常关流**时才落到 `kind: "truncated"`。这与后端 `e0b1391` 的实测
+    相互印证：服务侧断流会被平台兜底成 `service_unavailable` 错误帧 + `[DONE]`，真·无 `[DONE]`
+    只可能来自平台自身或平台与客户端之间。
+  - **指南 2 的措辞要收紧**：收尾后页面会 refetch 服务端消息列表，用户最终看到的半句是**落库那份**，
+    流里攒的内容只是过渡态——所以「保留在调用方状态里」不等于「用户一定还看得见」，前提是服务端
+    把已产出部分结算落库（真实后端由「四」的 ledger 侧保证）。
+  - **派单第 5 条（只观察，未动任何样式）**：错误提示在深/浅两主题 × 1280/390px 四格实测，白字对
+    最差色标 **4.86:1**（另一色标 5.52），13px/400、不透明度乘积 1，390px 下 195×62 两行不溢出
+    不被裁——即 `880aa19` 压深的 `.toast.error` 在真实渲染下达标。
+  控制面自证：驱动器先注入一条 `console.error` 确认捕获得到，才写「其余各格控制台 0 报错」；
+  桩侧计数 `POST /messages` 13 次 = 13 次发送（9 场景 + 4 矩阵格），**无静默重发**（流内
+  `rate_limited` 不进 `postSSE` 的开流前退避分支，与设计一致）。原静态证据仍是结论的另一半
+  （`sse.py:29` 规定错误帧后必发 `SSE_DONE`，`conversations.py:64/68/80` 与
+  `openai_compat/chat.py:122/126/141` 覆盖全部收尾分支），实弹补的是「前端在真浏览器里解析对」这一半。
+  顺带两条环境坑（都修在自己这边，未碰他人文件）：① 同项目并跑两个 `next dev` 会共用 `.next`，
+  带 `NEXT_PUBLIC_API_BASE` 的那台会把桩地址烤进编译产物、另一台跟着坏——已改单台串行并清 `.next`；
+  ② 我最初把桩放在 8123，正撞后端 `e0b1391` 那个假模型服务的客户端（`/__control/scenario`、
+  `/health/liveness`、`/v1/chat/completions` 打到我的桩上吃了 404），发现即让出端口换到 8973。
 
 ## 四、冻结区
 
