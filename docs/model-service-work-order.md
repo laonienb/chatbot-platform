@@ -287,7 +287,7 @@ P2-1 / P2-2（协议已就绪，可并行）
 | v1.8 | 2026-10-10 | 架构师 A | **复核架构师 B 的文档收编（`a8958c8`，协议 §23）后新增「生产切换前置项」**：R1 🔴 `msvc/provider.py:191` `LiteLLMProvider.stream()` 抛 `NotImplementedError`——**唯一真实上游不能流式**，而 native 模式流式是主路径，`DESIGN.md §10` 切换清单原六步无一步覆盖；契约测试只跑 `FakeUpstream`（`# pragma: no cover`）故 40 全绿照不到。R3 🟡 `model-service/README.md` 仍写 `v1`/`T1–T11`。R2 🟡 看板行「收编中」自相矛盾（架构师 A 已就地改）。**本单不新增 P 级编号**（P0/P1/P2 仍全闭合），前置项见 §8 |
 | v1.9 | 2026-10-10 | 架构师 B | **冻结快照复核 A 的 §23（协议 §24）后扩充 §8**：R1/R2/R3 **全部确认成立**（快照内基线 `40 passed`；真上游流式实测裸 `500`）。**另发现 R4 🔴 → 新增 SW-4**：`_map_upstream_error` 只认 `FakeUpstream` 的 `_ScenarioError`，两个 handler 无 catch-all、无全局异常处理器 ⇒ litellm 异常族全部逃逸，既违反 §7（裸 500 无 `code`），又让 `_finish_window` 不被调用 ⇒ **幂等在飞位永久泄漏**（实测：同 key 第二次恒 `409`，`_inflight` 事后仍含该 key；兼容面指纹键 ⇒ 同一条消息在重启前永久发不出）。**对照组 + 快照内补丁双向验证**：窗口逻辑本身正确（可映射错误 → 429/429、`_inflight` 清空），根因唯一为「异常在 `_finish_window` 前逃出」；打补丁前后基线均 40 全绿 ⇒ 用例对该类缺陷**双向皆盲**。同批：**SW-1 验收扩至错误路径**、新增 **SW-5 🟢**（`_inflight` TTL 兜底）。另附**一条待 A 会签的 §8.2.1 澄清提案**（在飞位必须在任何退出路径释放）。**本单仍不新增 P 级编号**（P0/P1/P2 保持全闭合），R4 属实现/部署缺口 |
 | v1.10 | 2026-10-11 | 架构师 A | **SW-1…SW-5 终轮验收：全部通过**（交付 `c5ff7bb`，协议 §25.2）。冻结快照内实跑服务侧 **64 passed**；五处证伪各自只打红对应用例（SW-1→6、SW-4 映射→4、SW-4 释放→8 含旧 T7/P1-11、SW-5→1、SW-2→2），**关键实证：把真上游流式改回 `NotImplementedError` 时，契约用例（`FakeUpstream`）全绿、只有新文件红** ⇒ R4 的「真实 provider 零覆盖」被正面证实。会签 §24.3 提案并入 §8.2.1（协议 §25.1，v1.7-澄清4）。`DESIGN.md §10 ①` 代码侧闭合，剩余②–⑦为部署/运维。前端 `0c5869e` 同批验收通过（web 30 passed，证伪 2/1/7/1），`server` 180 passed 无回归 |
-| v1.11 | 2026-10-11 | 架构师 A | **新增 §9「生产切换清单 ②–⑦ 工作项」**（DW-2…DW-7，含责任人/动作/验收/阻塞，响应管家 G 的派发请求）。按「先做纯仓内项、把改库项单独立项」：**DW-2(compose)/DW-6(幂等窗容量) 已拆分就绪、待中继**（架构师 A 的跨会话派发被 harness 拒，需 G 或用户转发）；**DW-3(token 落点)/DW-4(翻 remote)/DW-5(改库迁移) 标为「待用户定」未开工**；DW-7 前端消费已闭合（`0c5869e`）。路径占用与租约建议见 §9 末 |
+| v1.12 | 2026-10-11 | 架构师 A | **更正 §9 DW-2 / DW-6 状态列**（响应管家 G 的防重做单 `harness/proposals/G-dispatch-fix-dw2-dw6-status.md`，租约 `harness/bridge/leases/G/DW-status-fix.docs.json`）：两项**已交付**（`d969a1e`；看板 `2055e56`；README 自纠 `dcc8862`），而原状态列停留在 `8f32ce3` 之前的「待中继」⇒ **按 §9 表取活者会重做**，两侧已因此碰撞一次（六分钟互不可见）。改为「✅ 已交付 ｜⚠️ 未判闭合」并新增 **§9.1 回执**：docker 两条验收**未实跑**（本机复核 `docker: command not found`），补验需装了 docker 的机器，**判闭合归架构师 A**。归属：两侧共用同一 git 账号 ⇒ 提交身份不作凭据，只记「已交付」不判「谁写的」。DW-3/DW-4/DW-5 未开工不变 |
 
 ---
 
@@ -324,25 +324,34 @@ P2-1 / P2-2（协议已就绪，可并行）
 
 ---
 
-## 9. 生产切换清单 ②–⑦ 工作项（v1.11 登记，部署侧）
+## 9. 生产切换清单 ②–⑦ 工作项（v1.11 登记 / v1.12 更新状态列，部署侧）
 
 > 依据：`DESIGN.md §10` 生产切换清单 ②–⑦（① 的**代码侧**已由 `c5ff7bb` 闭合，协议 §25.2）。**真源 = 本节**；
 > `AGENTS.md §一` 只镜像活队列。**责任人一律「后端 agent」**；其中 **DW-3 / DW-4 / DW-5 含用户决策项**，
 > 决策未落前**不得开工**（见各行「待用户定」）。
-> 派发（2026-10-11 架构师 A）：**DW-2 / DW-6 已拆分就绪、待派**——架构师 A 经 harness 向 `flash-后端-G`
-> （会话 `66281830-7eb4-496a-99bd-2008d13cf76a`）派发两次均**被拒**（政策：delegated-turn 不得向其他会话
-> 转发消息、也不得新建嵌套会话）⇒ **需 G 或用户中继**（payload 已备，见本条末）。**DW-3 / DW-4 / DW-5 保持未开工**，
-> 等用户回话；**DW-7 已闭合**。架构师**不写实现代码**。
+> 派发与交付（2026-10-11）：DW-2 / DW-6 经**两侧管家中继**后落码（`d969a1e`，21:49:34；看板登记 `2055e56`；README 自纠 `dcc8862`）。
+> 架构师 A 本人向 `flash-后端-G`（会话 `66281830-…`）派发**两次均被 harness 拒**（政策：delegated-turn 不得向其他会话转发消息、也不得新建嵌套会话）⇒「A 组织派发」这条链当时不通，实际由管家侧中继完成。
+> **归属**：两侧共用同一 git 账号，**提交身份不作凭据**，本节只记「已交付」、不判「谁写的」。**DW-3 / DW-4 / DW-5 未开工**（待用户定）；**DW-7 已闭合**。架构师**不写实现代码**。
 
 | # | 对应 §10 | 项 | 责任人 | 具体动作 | 验收标准 | 阻塞了什么 | 状态 |
 |---|---|---|---|---|---|---|---|
-| **DW-2** | ② | compose 增补 `model-service` + 内网隔离 | 后端 | `deploy/docker-compose.yml` 增 `model-service` 服务（`build: ../model-service`、**不映射宿主端口**、仅挂内部网络）；`server` 经 `MODEL_SERVICE_BASE_URL=http://model-service:8000` 访问；env 用 `${VAR:-默认}` 形态**保持现状（仍 mock，不翻转）** | `docker compose config` 通过；`up` 后 server 能解析 `model-service` 且该服务**不暴露宿主端口**；提交后 `git status` 干净 | DW-4 的切换依赖它 | 📝 拆分就绪・待派（派发被 harness 拦，待 G 中继） |
-| **DW-6** | ⑥ | 幂等窗容量按 H3 定值 | 后端 | 按 `max_entries ≥ 峰值RPS × MS_IDEMPOTENCY_WINDOW_SECONDS` 给 `MS_IDEMPOTENCY_CACHE_MAX_ENTRIES`/`MAX_CHARS` 定值，写进 compose（并 `deploy/.env.example`）；把**峰值 RPS 假设 + 算例**补进 `model-service/README.md` | compose 中该 env 可见且值有据；README 有公式与按假设 RPS 的算例；运维信号「淘汰 WARNING 正常为零」在 README 明示 | 无（与 DW-2 同批） | 📝 拆分就绪・待派（派发被 harness 拦，待 G 中继） |
+| **DW-2** | ② | compose 增补 `model-service` + 内网隔离 | 后端 | `deploy/docker-compose.yml` 增 `model-service` 服务（`build: ../model-service`、**不映射宿主端口**、仅挂内部网络）；`server` 经 `MODEL_SERVICE_BASE_URL=http://model-service:8000` 访问；env 用 `${VAR:-默认}` 形态**保持现状（仍 mock，不翻转）** | `docker compose config` 通过；`up` 后 server 能解析 `model-service` 且该服务**不暴露宿主端口**；提交后 `git status` 干净 | DW-4 的切换依赖它 | ✅ **已交付** `d969a1e`（+`dcc8862`）｜⚠️ **未判闭合**：docker 两条验收**未实跑**（本机无 docker），见 §9.1 |
+| **DW-6** | ⑥ | 幂等窗容量按 H3 定值 | 后端 | 按 `max_entries ≥ 峰值RPS × MS_IDEMPOTENCY_WINDOW_SECONDS` 给 `MS_IDEMPOTENCY_CACHE_MAX_ENTRIES`/`MAX_CHARS` 定值，写进 compose（并 `deploy/.env.example`）；把**峰值 RPS 假设 + 算例**补进 `model-service/README.md` | compose 中该 env 可见且值有据；README 有公式与按假设 RPS 的算例；运维信号「淘汰 WARNING 正常为零」在 README 明示 | 无（与 DW-2 同批） | ✅ **已交付** `d969a1e`（compose 注入基线档 6000 条/9e6 字符；`dcc8862` 修正假设口径）｜⚠️ **未判闭合**（同 DW-2） |
 | **DW-3** | ③ | `MODEL_SERVICE_TOKEN` 生成并注入双方 | 后端（+**用户定落点**） | 生成 ≥32 字节随机 token；写入**不入库**的 `deploy/.env`（`.gitignore` 已排除 `.env`/`.env.*`）；提交 `deploy/.env.example` 模板（占位符）；两处注入：model-service `MS_SERVICE_TOKENS`、server `MODEL_SERVICE_TOKEN`（§3 静态 Bearer） | `git check-ignore deploy/.env` 命中；`git grep <token>` 无命中；双方启动自检通过 | 任何 `remote` 联通 | ⏸ **未派**（待用户定 token 落点） |
 | **DW-4** | ④ | 翻到 `remote`（**生产变更**） | 后端（+**用户定**） | `LLM_BACKEND=remote` + `MODEL_SERVICE_MODE=native` + `APP_ENV=prod`；确认启动自检（协议版本 / 内层<外层超时 / 目录同步）通过 | prod 下 `mock` 被拒启动守卫生效；端到端一次真上游流式成功 | 生产可用 | ⏸ **未派**（待用户定是否切/用何凭证） |
 | **DW-5** | ⑤ | 凭证迁入 + 两列废弃迁移（S6） | 后端（+**用户定**） | provider 凭证迁入模型服务 env；`llm_models.api_key`/`api_base` 废弃迁移 | 迁移**有备份/回滚方案**；两列不再被读 | 生产凭证不再散落平台库 | ⏸ **未派**（改库、不可逆，建议**单独立项**） |
 | **DW-7** | ⑦ | 前端确认已消费「三」通告 | — | 无（已完成） | `0c5869e` 验收通过（协议 §25.3） | — | ✅ 已闭合 |
 
-**路径占用（供 G 落租约 / 向 C 侧发让路通告）**：DW-2 / DW-6 预计只动
-`deploy/docker-compose.yml`、新增 `deploy/.env.example`，以及 `model-service/README.md`；
-**不碰** `server/`（④ 的 env 翻转未派）与 `model-service/msvc/*.py`（⑥ 走 env，**不改代码**）。
+**路径占用（实际落地，供租约/让路核对）**：DW-2 / DW-6 只动了
+`deploy/docker-compose.yml`、新增 `deploy/.env.example`、以及 `model-service/README.md`；
+**未碰** `server/`（④ 的 env 翻转未开工）与 `model-service/msvc/*.py`（⑥ 走 env，**不改代码**）。
+
+### 9.1 交付回执与未闭合项（2026-10-11 · 架构师 A 登记）
+
+- **DW-2 / DW-6 已交付**：`d969a1e`（`deploy/docker-compose.yml`＋新增 `deploy/.env.example`＋`model-service/README.md`，144+/0−）。与本节验收一致：`model-service` **不写 `ports:`**（`expose: "8000"` 仅声明容器间端口）、刻意**不用 `internal: true`**（否则 `MS_UPSTREAM=litellm` 出不了站，取舍写进 compose 注释）；`server` 只加 `MODEL_SERVICE_BASE_URL=http://model-service:8000`，`LLM_BACKEND` 仍 `${…:-mock}` **不翻转**；DW-3/DW-4 的开关在 compose 里**留占位注释、未激活**。DW-6 在 compose 注入**基线档 6000 条 / 9e6 字符**（假设峰值 10 RPS × 600s；`dcc8862` 把 2 RPS 由「硬上限」改为「默认上限 + 重算触发条件」）。**代码默认值仍是保守的 256 / 1e6**——不注入 env 就等于单机自测量级。
+- **⚠️ 未闭合项（原样写明，不写成已完成）**：本节 DW-2 的两条验收——① `docker compose config` 通过；② `up` 后 `server` 能解析 `model-service` 且该服务**不暴露宿主端口**——**均未实跑**。**架构师 A 在本机复核确认无 docker**（`docker: command not found`、`docker compose version` 同）。已做的替代是**结构校验**：YAML 解析 + 断言 `model-service` 无 `ports:`、healthcheck 片段可编译、`${VAR:-默认}` 两条插值路径自洽、红线8 三个内层超时 15/30/60 < 90、**14 个 `MS_*` env 逐一实测绑定到 `Settings` 字段**（防 pydantic `extra=ignore` 静默吞掉拼错的名字）。结构校验只证明「字段与取值自洽」，**不证明 docker 接受该 compose 语义**。
+- **补验条件与判闭合归属**：需一台**装了 docker** 的机器补跑三条命令——
+  `docker compose -f deploy/docker-compose.yml config`（应无 `ports` 出现在 `model-service` 下）、
+  `docker compose up -d` + `docker compose ps`（看 `model-service` 无宿主端口）、
+  server 容器内 `python -c "import socket;socket.create_connection(('model-service',8000))"`。
+  **判闭合归架构师（A）**：补验通过后摘掉 DW-2/DW-6 两行的 ⚠️；**在此之前记为「已交付、未判闭合」**。
