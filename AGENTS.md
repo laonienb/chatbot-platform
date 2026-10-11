@@ -55,7 +55,7 @@
 | Agent | 模块 | 状态 | 更新时间 |
 |---|---|---|---|
 | 架构师A+B | 模型服务契约治理（收官态） | ✅ 协议 **v1.7-澄清4** 定稿；契约项 P0/P1/P2 全闭合；§8.2.1「在飞位释放义务」已会签并入（§25.1）；真实上游流式与错误映射已交付并验收（`c5ff7bb`）。**仅余部署侧**（见下行） | 2026-10-11 |
-| 后端 | **生产切换清单 ②–⑦**（工单 `docs/model-service-work-order.md` §9 的 DW-2…DW-7） | 🔄 **DW-2(compose)、DW-6(幂等窗容量) 已派 `flash-后端-G`**（会话 `66281830-…`）：路径 `deploy/docker-compose.yml`、新增 `deploy/.env.example`、`model-service/README.md`，**不碰** `server/` 与 `model-service/msvc/*.py`。⏸ **DW-3(token 落点)/DW-4(翻 remote)/DW-5(改库迁移) = 待用户定，未派**。DW-7 前端消费已闭合（`0c5869e`） | 2026-10-11 |
+| 后端 | **生产切换清单 ②–⑦**（工单 `docs/model-service-work-order.md` §9 的 DW-2…DW-7） | 📝 **DW-2(compose)、DW-6(幂等窗容量) 已拆分就绪、待派**——架构师 A 的跨会话派发被 harness 拒绝（政策：delegated-turn 不得向其他会话转发消息、也不得新建嵌套会话），**需 G 或用户中继**（派发 payload 已备）。路径：`deploy/docker-compose.yml`、新增 `deploy/.env.example`、`model-service/README.md`，**不碰** `server/` 与 `model-service/msvc/*.py`。⏸ **DW-3(token 落点)/DW-4(翻 remote)/DW-5(改库迁移) = 待用户定，未开工**。DW-7 前端消费已闭合（`0c5869e`） | 2026-10-11 |
 
 ## 二、前端 → 后端 接口需求
 
