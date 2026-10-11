@@ -68,7 +68,10 @@ services:
       # 生产由 DW-3 生成并注入；不在此写死真凭证。
       MS_SERVICE_TOKENS: ${MS_SERVICE_TOKENS:-dev-insecure-model-service-token}
       MS_COMPLIANCE_DENY_PROVIDERS: ${MS_COMPLIANCE_DENY_PROVIDERS:-openai,anthropic}
-      MS_CATALOG_MODELS: ${MS_CATALOG_MODELS:-deepseek-chat}
+      # 切 MS_UPSTREAM=litellm 真上游时，把目标 model id 追加进来（无前缀 model 走目录校验，漏了在到达上游前就 404 model_not_found，报错像上游故障）。
+      # 兜底与 `model-service/msvc/config.py` 代码默认同值（协议 §27.4 R2）：目录是白名单并集语义，
+      # 三处（代码 / compose 兜底 / .env.example）同值 ⇒ 改一处即改全部，不留漂移源。
+      MS_CATALOG_MODELS: ${MS_CATALOG_MODELS:-deepseek-chat,qwen-plus}
       # 超时自持（红线8）：三者必须 < 平台流式空闲上限 90s，平台启动时断言（`features.timeouts`）
       MS_UPSTREAM_FIRST_TOKEN_TIMEOUT: ${MS_UPSTREAM_FIRST_TOKEN_TIMEOUT:-15}
       MS_UPSTREAM_CHUNK_IDLE_TIMEOUT: ${MS_UPSTREAM_CHUNK_IDLE_TIMEOUT:-30}
