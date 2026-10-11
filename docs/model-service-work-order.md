@@ -289,6 +289,7 @@ P2-1 / P2-2（协议已就绪，可并行）
 | v1.10 | 2026-10-11 | 架构师 A | **SW-1…SW-5 终轮验收：全部通过**（交付 `c5ff7bb`，协议 §25.2）。冻结快照内实跑服务侧 **64 passed**；五处证伪各自只打红对应用例（SW-1→6、SW-4 映射→4、SW-4 释放→8 含旧 T7/P1-11、SW-5→1、SW-2→2），**关键实证：把真上游流式改回 `NotImplementedError` 时，契约用例（`FakeUpstream`）全绿、只有新文件红** ⇒ R4 的「真实 provider 零覆盖」被正面证实。会签 §24.3 提案并入 §8.2.1（协议 §25.1，v1.7-澄清4）。`DESIGN.md §10 ①` 代码侧闭合，剩余②–⑦为部署/运维。前端 `0c5869e` 同批验收通过（web 30 passed，证伪 2/1/7/1），`server` 180 passed 无回归 |
 | v1.12 | 2026-10-11 | 架构师 A | **更正 §9 DW-2 / DW-6 状态列**（响应管家 G 的防重做单 `harness/proposals/G-dispatch-fix-dw2-dw6-status.md`，租约 `harness/bridge/leases/G/DW-status-fix.docs.json`）：两项**已交付**（`d969a1e`；看板 `2055e56`；README 自纠 `dcc8862`），而原状态列停留在 `8f32ce3` 之前的「待中继」⇒ **按 §9 表取活者会重做**，两侧已因此碰撞一次（六分钟互不可见）。改为「✅ 已交付 ｜⚠️ 未判闭合」并新增 **§9.1 回执**：docker 两条验收**未实跑**（本机复核 `docker: command not found`），补验需装了 docker 的机器，**判闭合归架构师 A**。归属：两侧共用同一 git 账号 ⇒ 提交身份不作凭据，只记「已交付」不判「谁写的」。DW-3/DW-4/DW-5 未开工不变 |
 | v1.13 | 2026-10-11 | 架构师 A | **新增 §9.2：真上游（xiaomimimo）实测 + DW-5 前置决策**（用户提供一次性调试凭证；**api_key 不入库/不入总线**）。只读 httpx 探针实测纠正了三处：<br>① **坑1 前提不成立**——无 `max_tokens` 时 `content` **非空**（非流式 50 字符 + reasoning 52 字符；流式亦然，`finish_reason=stop`）；真正的坑是**小 `max_tokens`（实测 8）被 reasoning 吃光 ⇒ content 空 + `finish_reason=length`**。故决策从「要不要透传 reasoning」收窄为「**给 reasoning 留足预算**」+「是否透传 `reasoning_content`」。<br>② **坑3 数值成立**——首 token **0.5 / 4.5 / 9.8s**（非流式 1.3–2.2s），默认 15s 仅 ~1.5× 余量 ⇒ 冒烟临时放大、别改默认值。<br>③ **坑2 静态证实**——`_check_compliance`（`main.py:139`）按 `model.split("/")[0]` 撞 `deny=openai,anthropic`，而 litellm 打 OpenAI 兼容端点需 `openai/` 前缀 ⇒ 会被自家红线5 403。<br>三项决策（provider 命名/deny、reasoning 对外语义、env 落位）**均标用户定**；DW-5 验收标准据此细化；冒烟**当前不可执行**（受决策①阻塞 + A 跨会话派发被 harness 拒），需用户直启轮或 G/用户转发 |
+| v1.14 | 2026-10-11 | 架构师 A | **新增 §9.3：甲/乙/丙按用户新规则分流 + A 立场**（立场与给 B 的问题同时写入协议 §26，本地 git 即广播）。并用 **litellm 直连探针**把服务级冒烟的可行性钉死：`custom_llm_provider="openai"` ＋ **无前缀 model** ＋ `api_base` **实测跑通**（`finish_reason=stop`、content 29 字符 ＋ reasoning 49 字符、首 token 0.86s）⇒ ① litellm **不需要** `openai/` 前缀；② 甲的"content 恒空"前提不成立（只有小 `max_tokens` 被 reasoning 吃光才空）；③ 丙的不碰红线接法 **A-1** 可行（请求 model 无前缀 ⇒ `_check_compliance` 不命中 deny）。乙**不需用户裁决**；丙的"放宽"降为最后一张牌 |
 
 ---
 
@@ -367,9 +368,20 @@ P2-1 / P2-2（协议已就绪，可并行）
 - **`delta.content` 并非一直为 null（与初始判断不符，已更正）**：无 `max_tokens` 时非流式 `message.content` **有正文**（50 字符）且 `reasoning_content` 也有（52 字符）；流式同样 content 与 reasoning 并存，`finish_reason` 正常为 `stop`。**真正的坑**是：`max_tokens` 太小（实测 `8`）时**预算被 reasoning 吃光** ⇒ `content=""` + `finish_reason="length"`。⇒ 坑1 的决策点**从「要不要透传 reasoning」收窄为**「**给 reasoning 模型留足推理预算**（别把 `max_tokens` 设小）」＋ 是否**透传 `reasoning_content`**（可选增强）。
 - **坑2（静态已证）**：`msvc/main.py:139 _check_compliance` 取 `model.split("/")[0]` 与 `compliance_deny_providers=openai,anthropic` 比对；而 litellm 打 OpenAI 兼容端点通常需 `openai/<model>` 前缀 ⇒ **会被自家红线5 403**。
 
-**决策项（用户定；未决前 DW-5 与真上游冒烟均不推进）**：
+**决策项（分流见 §9.3：甲/乙 归两位架构师定、丙 留用户但须先给不碰红线的接法；未决前 DW-5 不推进）**：
 1. **provider 命名 × 合规 deny**（坑2）：可选——自定义 provider 名 / 改 `litellm_default_model` 写法 / 调 `compliance_deny_providers` 列表（**合规策略，仅用户可定**）/ 或在 `LiteLLMProvider` 传 `custom_llm_provider`（**代码改动**，归后端）。
 2. **对外语义**：是否透传 `reasoning_content`、reasoning 预算下限——属「平台↔客户端」形态，按〇走 `AGENTS.md`「三」通告（**用户定**）。
 3. **env 落位**：`MS_*` 落 `deploy/.env`（**compose 插值入口**，`${MS_*}` 从它取；`.gitignore` 已覆盖）为**主**；`model-service/.env` 仅用于**容器外单跑**（`msvc/config.py env_file=".env"` 按 CWD 解析）。两处都不得入库、且**不要把同一密钥维护成两份**（建议只留 `deploy/.env`，本地单跑改用进程 env 注入）。
 
 **冒烟（待决策①后）**：需在**有网络**处跑一次真上游冒烟（**只用临时 env、不改默认配置**），把首 token 延迟与 content/reasoning 形态写进本单回执。**当前不可执行**：① 受决策①（合规 provider 命名）阻塞；② 架构师 A 的跨会话派发被 harness 拒（见 §9 派发段）⇒ 需在**用户直启**的轮里派，或由 G/用户发。若走 `custom_llm_provider` 代码路线，涉及路径 `model-service/msvc/provider.py`。
+
+### 9.3 甲/乙/丙 定案进程与 A 的立场（2026-10-11 · 协议 §26）
+
+> 按用户新规则（「遇事由两位架构师商量，只有重大或三轮不定才报用户」）重新分流。**立场与给 B 的问题已写入协议 §26**（本地 git 即广播），本节记实施项与分流。
+
+- **甲（reasoning 是否透传）→ 两位架构师定**。A 立场：**不透传**，保持 `delta.content` 为唯一正文位；留可选开关。见 §26.2。**待 B 会签**。
+- **乙（临时冒烟）→ 两位架构师定，A 已把 litellm 层冒烟做完**（首 token 0.86s、`finish_reason=stop`、content 29 字符 + reasoning 49 字符）。**服务级冒烟**待 **A-1** 落地后用临时 env 跑；**不改默认值**。见 §26.4。
+- **丙（`deny` ∩ `openai/` 前缀）→ 合规放宽属重大，仍留用户**，但**先给不碰红线的接法**：**A-1（推荐）**＝`LiteLLMProvider` 加 `custom_llm_provider`（配置 `MS_LITELLM_PROVIDER`，默认 `openai`）+ **请求 model 名保持无前缀** ⇒ `_check_compliance` 不受影响、**红线未被放宽**（冲突是「协议名 vs 供应商名」的命名冲突）。备选 A-2（provider 归一化映射表，慎）/ A-3（不可行）。见 §26.3。
+- **④ 翻 `remote`（生产变更）/ ⑤ 改库迁移（不可逆）→ 仍留用户**，A+B 只出方案与风险：④＝取消 compose 注释 + 启动自检过，风险为生产链路切换、需可回滚，且**依赖 ③token 与 A-1**；⑤＝三阶段（加列/双写 → 切读 → 删列）可回滚，风险为改库不可逆、需备份与回滚脚本，**建议单独立项**。
+
+**A-1 实施的落点（待 B 会签后交后端）**：`model-service/msvc/provider.py`（传 `custom_llm_provider`）、`model-service/msvc/config.py`（新增 `MS_LITELLM_PROVIDER`）；若走配置路线，**不新增**其它路径。冒烟只用临时 env ⇒ **不落盘**。

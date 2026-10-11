@@ -620,6 +620,7 @@ key 后**必须**通过 header 传给模型服务，保证「平台重试 ≠ �
 | v1.7-澄清2 | 2026-10-10 | 架构师 B（采纳架构师 A 的 P1-9 预审 ⑦a/⑦b） | **两处契约小缺口澄清（不改行为语义、不升线协议版本）**：① **§7 错误体新增可选 `retry_after_s`**（加法字段）——流内错误帧没有 HTTP header，`Retry-After` 在流式路径失效，该字段是流式传递退避时长的唯一手段；HTTP 层与 header 并存时以 header 为准（解 ⑦a）。② **§8.1 明确「上游总超时 60s 仅约束非流式」**——持续产 token 的流可合法超 60s，流式由「首 token 15s + 中途空闲 30s（新增行，O1 定案值，capabilities 必须暴露）+ 平台绝对上限 180s」三层约束（解 ⑦b，并与 P1-9 预审⑥的启动断言 `chunk_idle < 90s` 对齐） |
 | v1.7-交叉复核 | 2026-10-10 | 架构师 B | **§24 复核架构师 A 的 §23**（审计留痕，**未改任何线协议条文**）：冻结快照独立实跑确认 R1（真实上游流式 → 裸 500）、R2/R3；**另发现 R4 🔴**——`_map_upstream_error` 只认 `FakeUpstream` 的 `_ScenarioError`、两个 handler 无 catch-all，真实上游异常逃逸 ⇒ ①响应违反 §7（裸 500 无 code）②**幂等在飞位永久泄漏**，同 key 后续请求恒 409（兼容面指纹键 ⇒ 同一条消息在重启前永久发不出）。对照组与快照内补丁双向验证：根因是「异常在 `_finish_window` 前逃出」，窗口逻辑本身正确；打补丁前后契约基线均 40 全绿 ⇒ 用例对该类缺陷双向皆盲。处置：工作单新增 **SW-4 🔴 / SW-5 🟢**、SW-1 验收扩至错误路径、`DESIGN.md §10 ①` 扩写；附**一条待 A 会签的 §8.2.1 澄清提案**（在飞位必须在任何退出路径释放） |
 | v1.7-澄清4 | 2026-10-11 | 架构师 A | **§25 会签 B 的 §24.3 提案 + SW-1…SW-5 终轮验收**（不改行为、不升线协议版本）：① **会签通过**，把「在飞位必须在**任何**退出路径释放（`try/finally` 或等价 catch-all，先释放后返回）」写入 **§8.2.1 正文**——它本是该节的隐含义务（在飞位语义=防并发，非永久拒绝），此前只是未写明；R4 的实现侧修复不需要它（§7/§8.2.1 已足以判缺陷），本条为**澄清**。② **`c5ff7bb`（SW-1…SW-5）验收通过**：服务侧 `64 passed`（独立实跑）；四处证伪各自只打红对应用例（SW-1 流式改回 NotImplementedError → 6 红全在 `test_real_upstream.py`、契约用例全绿；SW-4 映射改回裸抛 → 4 红；SW-5 TTL 关掉 → 1 红；SW-2 去 `retry_after_s` → 2 红）。③ **`0c5869e`（前端消费）验收通过**：`web` 30 用例；证伪三处（读 `retry_after_s` 置空 → 2 红；截断判定去掉 → 1 红；残留缓冲不补解析 → 1 红）。平台侧 `server` 全量 `180 passed` 无回归 |
+| v1.7-待会签 | 2026-10-11 | 架构师 A | **§26 待会签：真上游 reasoning 模型的对外语义 ＋ 合规前缀冲突接法**（审计留痕，**未改任何线协议条文**）。只读实测（httpx + litellm，未改配置/策略/代码）**纠正三处流传判断**：① `content` **非空**（与 reasoning 并存，`finish_reason=stop`）；真正的坑是 **小 `max_tokens` 被 reasoning 吃光**（实测 8 → content 空 + `finish_reason=length`）；② litellm **不需要** `openai/` 前缀（`custom_llm_provider` + 无前缀 model 实测跑通）；③ 首 token 0.5–9.8s 波动 ⇒ 15s 仅 ~1.5× 余量。A 立场：**甲**＝不透传 `reasoning_content`（保持兼容面唯一正文位 `delta.content`，留可选开关）、**丙**＝接法 A-1（无前缀 model ＋ `custom_llm_provider`，**不触碰红线5**——冲突是"协议名 vs 供应商名"的命名冲突，非政策冲突）、**乙**＝litellm 层冒烟已完成、服务级待 A-1。请架构师 B 会签（分歧或三轮不定则交用户） |
 
 ---
 
@@ -1522,3 +1523,50 @@ R4 暴露出 §8.2.1 只写了在飞位的**获取**与**并发语义**，没写
   （compose 落地、token、配置、S5/S6 迁移等**部署/运维**项）。
 - 工作单 §8 SW-1…SW-5 **全部验收通过**，见 §8 回执。
 - `AGENTS.md` 后端／前端两行**闭环删除**（〇.1-4），历史留 git（`c5ff7bb`／`0c5869e`）与本协议。
+
+---
+
+## 26. 待会签：真上游 reasoning 模型的对外语义 ＋ 合规前缀冲突接法（架构师 A · 2026-10-11）
+
+> 背景：用户 2026-10-11 提供一次性调试凭证（`base_url=https://api.xiaomimimo.com/v1`；**api_key 不入库、不入总线**）。
+> 架构师 A 只读实测（httpx 裸探针 ＋ litellm 探针；**未改配置/策略/代码**）。**性质：待架构师 B 会签/裁决**；本轮不改线协议条文；分歧或三轮不定 → 交用户。
+
+### 26.1 实测事实（先纠正三处流传的判断）
+
+| 流传判断 | 实测 |
+|---|---|
+| 「`delta.content` 全程 null，正文在 `reasoning_content`」 | **不成立**：不设 `max_tokens` 时 `content` **有正文**（httpx 非流式 50 字符、流式 32 字符；litellm 层 29 字符），与 `reasoning_content` **并存**，`finish_reason=stop` |
+| — | **真正的坑**：`max_tokens` 过小（实测 `8`）→ **推理预算被吃光** ⇒ `content=""` ＋ `finish_reason="length"`。**平台默认 `max_tokens=None`（不设）**，故正常路径不受影响 |
+| 「litellm 必须 `openai/` 前缀」 | 前缀**非必须**：`custom_llm_provider="openai"` ＋ **无前缀 model** ＋ `api_base` **实测跑通**（这恰是绕开合规前缀冲突的接法，见 26.3） |
+| 首 token | **波动大**：httpx 0.5 / 4.5 / 9.8s；litellm 层 0.86s。默认 `MS_UPSTREAM_FIRST_TOKEN_TIMEOUT=15` 仅 ~1.5× 余量 |
+
+litellm 层实测（`custom_llm_provider="openai"`、`model="mimo-v2.6-flash"`）：`finish_reason=stop`、content 29 字符、reasoning 49 字符、首 token 0.86s、usage 含 `completion_tokens_details.reasoning_tokens`。另：litellm 启动会尝试拉远端 cost map（`raw.githubusercontent.com`）失败 → 回落本地备份 ⇒ 受限网络下需确认 `LITELLM_LOCAL_MODEL_COST_MAP`（`gateway.py` 已提该变量）。
+
+### 26.2 甲：`reasoning_content` 是否透传给最终用户？——**A 立场：不透传，留可选开关**
+
+理由：① 对外流式契约（`AGENTS.md`「三」）已定为 OpenAI chunk，`choices[].delta.content` 是**唯一**正文位，前端/AstrBot/第三方解析器都按此，塞厂商扩展字段会污染既有解析器；② reasoning 是模型内部推理，直给终端用户易误导、也暴露模型行为；③ 无产品需求。
+**"最小预算"**：平台默认不设 `max_tokens`、content 正常有值 ⇒ **不作为契约条款**；但须在「三」与文档写明**小 `max_tokens` 陷阱**（reasoning 吃光 ⇒ 空正文 ＋ `finish_reason=length`），并**建议平台对 reasoning 模型做下限保护**（如 <N 则抬到 N）——那是平台策略，不进模型服务契约。
+**问 B**：a) 同意「只转 `content`、不透传 reasoning」？ b) 是否在 §6.6 附近加一条**可观测告警**建议（`finish_reason=length` 且 content 空 → 服务侧 WARNING）？ c) 可选开关（请求头/参数）要在 v1 预留下字段位，还是完全留到 v2？
+
+### 26.3 丙：`compliance_deny_providers` 与 `openai/` 前缀相撞 —— **不碰红线的接法**
+
+现状：`msvc/main.py:139 _check_compliance` 按 `model.split("/")[0]` 与 `deny={openai,anthropic}` 比对；用 `openai/<model>` 打 OpenAI 兼容端点 ⇒ 被自家红线5 403。
+**根因是「协议名 vs 供应商名」的命名冲突，不是政策冲突**：xiaomimimo 是**境内**供应商，正是红线5 想保护的方向；`openai` 在此只是 litellm 的**兼容协议**名，被 deny 误当作供应商名。
+
+- **A-1（A 推荐，已实测可行）**：`LiteLLMProvider` 传 `custom_llm_provider`（新增配置 `MS_LITELLM_PROVIDER`，默认 `openai`），**请求 model 名保持无前缀**（`mimo-v2.6-flash`）⇒ `_check_compliance` 得空串、**不命中 deny**。**不放宽任何合规**；改动仅 `msvc/provider.py` ＋ `config.py`。
+- A-2：合规判定前做 provider **归一化映射表**（`openai→mimo`）。更通用，但要动 guard 语义，**慎**。
+- A-3：改用 litellm 已知的其它前缀 —— 无 `xiaomimimo` 内置 provider，需 `register_model`，**不可行**。
+- **最后一张牌（用户定）**：调整 `compliance_deny_providers`。
+- **A 的请求**：请 B 交叉确认 **A-1 不构成红线5 的放宽**（判定对象仍是请求里的 model 前缀，语义未变），并指出漏洞（例如平台若给该模型加 `openai/` 前缀仍会被拦 —— 这是**期望行为**）。
+
+### 26.4 乙：临时冒烟能否做？——**A 立场：能做，litellm 层已完成；服务级待 A-1**
+
+- **litellm 层冒烟已完成**（26.1 数据）⇒ 集成可行、真实响应形状与延迟量级均有据。
+- **服务级冒烟**（`MS_UPSTREAM=litellm` 走 `msvc/main.py`）**当前仍不可**：无前缀 model 到 litellm 需 `custom_llm_provider`，msvc 未传 ⇒ 需 A-1；**不阻塞于丙的"放宽"**。
+- 结论：**乙不需用户裁决**；A-1 落地后用**临时 env**（不改默认）跑一次即可；预算不足只写进工作单、**不改默认值**。
+
+### 26.5 处置
+
+- 本条为**待会签**：请 B 就 **26.2（甲）** 与 **26.3（丙·A-1 是否等价于放宽）** 出具意见（可 `decision` 进总线）。
+- 未会签前：不改线协议条文；A-1 实施（`provider.py`/`config.py`）**待 B 意见**后交后端。
+- **分歧或三轮不定 → 交用户**（丙的"是否放宽"本就是用户的最后一张牌）。
