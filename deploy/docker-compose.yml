@@ -1,5 +1,10 @@
 # M0 开发环境：postgres + redis + server
 # napcat / astrbot / litellm / web 在 M1-M2 里程碑加入
+#
+# DW-2（工作单 §9 / 生产切换清单 ②）：加入独立的 `model-service`，**不发布任何宿主端口**，
+# 平台经容器网络以 `http://model-service:8000` 访问它。此刻 `LLM_BACKEND` 仍是 mock
+# （env 一律 `${VAR:-默认}`，不翻转）——把平台切到 remote 是 **DW-4**，token 落点是 **DW-3**，
+# 两项都「待用户定、未开工」，所以本文件里只预留注释，不激活。
 services:
   postgres:
     image: postgres:16-alpine
@@ -32,6 +37,14 @@ services:
       LLM_API_KEY: ${LLM_API_KEY:-}
       SECRET_KEY: ${SECRET_KEY:-dev-insecure-secret-change-me}
       CORS_ORIGINS: http://localhost:3000
+      # DW-2：只配「地址」，不切「开关」。`LLM_BACKEND` 仍是 mock ⇒ 这行此刻不被使用。
+      MODEL_SERVICE_BASE_URL: ${MODEL_SERVICE_BASE_URL:-http://model-service:8000}
+      # ↓ DW-4（待用户定，未开工）：切换生产时取消注释并核对启动自检
+      # LLM_BACKEND: remote
+      # MODEL_SERVICE_MODE: native
+      # APP_ENV: prod
+      # ↓ DW-3（待用户定，未开工）：服务间 token 的落点与生成
+      # MODEL_SERVICE_TOKEN: ${MODEL_SERVICE_TOKEN:-}
     ports:
       - "8000:8000"
     depends_on:
@@ -39,6 +52,55 @@ services:
         condition: service_healthy
     volumes:
       - ../server/app:/app/app  # 开发热重载
+
+  model-service:
+    build: ../model-service
+    # ⚠️ 刻意**不写 `ports:`** —— 这是 DW-2 的验收点：不向宿主发布任何端口，只有 compose
+    # 内部网络可达（`server` 用 `http://model-service:8000`）。`expose` 仅声明容器间端口、
+    # 不发布到宿主，留着是让读 compose 的人一眼看出意图。
+    # 也刻意**不用 `internal: true`**：`MS_UPSTREAM=litellm` 时本服务必须能出站打真实 provider，
+    # internal 网络会掐断出站，把「宿主不可达」误做成「外网也不可达」。
+    expose:
+      - "8000"
+    environment:
+      MS_UPSTREAM: ${MS_UPSTREAM:-fake}
+      # 双 token 逗号分隔（协议 §3）。留占位默认值＝与 msvc/config.py 的内置 dev 值一致，
+      # 生产由 DW-3 生成并注入；不在此写死真凭证。
+      MS_SERVICE_TOKENS: ${MS_SERVICE_TOKENS:-dev-insecure-model-service-token}
+      MS_COMPLIANCE_DENY_PROVIDERS: ${MS_COMPLIANCE_DENY_PROVIDERS:-openai,anthropic}
+      MS_CATALOG_MODELS: ${MS_CATALOG_MODELS:-deepseek-chat}
+      # 超时自持（红线8）：三者必须 < 平台流式空闲上限 90s，平台启动时断言（`features.timeouts`）
+      MS_UPSTREAM_FIRST_TOKEN_TIMEOUT: ${MS_UPSTREAM_FIRST_TOKEN_TIMEOUT:-15}
+      MS_UPSTREAM_CHUNK_IDLE_TIMEOUT: ${MS_UPSTREAM_CHUNK_IDLE_TIMEOUT:-30}
+      MS_UPSTREAM_TOTAL_TIMEOUT: ${MS_UPSTREAM_TOTAL_TIMEOUT:-60}
+      # ---- DW-6（生产切换清单 ⑥）：幂等窗容量按 H3 公式定值 ----
+      # 依据与算例见 `model-service/README.md`「幂等窗容量定值（DW-6）」一节，不在此重复推导。
+      # 假设峰值 10 RPS（= 5 个持续活跃身份 × 平台 `rpm_default=120`/60s）× 窗长 600s ⇒ 6000 条；
+      # 字符上限与之配套：6000 × 平均 1500 字符 ≈ 9e6。两个上限谁先到就按插入序淘汰。
+      MS_IDEMPOTENCY_WINDOW_SECONDS: ${MS_IDEMPOTENCY_WINDOW_SECONDS:-600}
+      MS_IDEMPOTENCY_CACHE_MAX_ENTRIES: ${MS_IDEMPOTENCY_CACHE_MAX_ENTRIES:-6000}
+      MS_IDEMPOTENCY_CACHE_MAX_CHARS: ${MS_IDEMPOTENCY_CACHE_MAX_CHARS:-9000000}
+      # SW-5 的在飞位兜底（防持有者泄漏后 409 永久化），默认对齐上游总超时
+      MS_IDEMPOTENCY_INFLIGHT_TTL_SECONDS: ${MS_IDEMPOTENCY_INFLIGHT_TTL_SECONDS:-60}
+      # 真实上游接线（MS_UPSTREAM=litellm）时才需要；凭证落点属 DW-3/DW-5，此处仅留空位
+      MS_LITELLM_API_BASE: ${MS_LITELLM_API_BASE:-}
+      MS_LITELLM_API_KEY: ${MS_LITELLM_API_KEY:-}
+      MS_LITELLM_DEFAULT_MODEL: ${MS_LITELLM_DEFAULT_MODEL:-}
+    healthcheck:
+      # 镜像是 python:3.12-slim，没有 curl；用标准库探活（端点见协议 §2）
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/liveness', timeout=3).read()",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    # 不列入 server 的 depends_on：LLM_BACKEND 仍是 mock，平台没有理由因模型服务未就绪而
+    # 起不来。等 DW-4 真切 remote 时再补 `condition: service_healthy`。
 
 volumes:
   pgdata:
