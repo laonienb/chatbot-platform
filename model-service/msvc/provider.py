@@ -9,8 +9,12 @@
 
 import asyncio
 import time
+from contextlib import suppress
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Any, AsyncIterator
+
+from msvc.errors import from_upstream_exception
 
 # 极简费率表（USD/token），仅供 fake provider 产出「exact」成本演示。
 _RATE_TABLE: dict[str, tuple[float, float]] = {
@@ -24,6 +28,8 @@ class UpstreamResult:
     content: str
     usage: dict[str, Any]
     x_model_service: dict[str, Any]
+    # 非流式收尾原因（§6.6）：真实上游给 `stop`/`length`；缺失才回落到默认值。
+    finish_reason: str = "stop"
 
 
 @dataclass
@@ -162,30 +168,200 @@ def _scenario_error(err: dict[str, Any]) -> _ScenarioError:
 
 
 class LiteLLMProvider:
-    """生产上游（lazy import litellm）。失败映射 §7。"""
+    """真实上游（lazy import litellm）。
+
+    SW-1：`stream()` 必须实现——native 模式下流式是**主路径**，此前抛
+    `NotImplementedError` 会让 `LLM_BACKEND=remote` 切换后所有流式请求裸 500。
+    SW-4：所有上游异常统一经 `from_upstream_exception` 映射为带 §7 `code` 的
+    `ServiceError`，绝不把 litellm 异常族裸抛给 handler。
+
+    读事件同时支持「对象属性」与「dict」两种形态（真实 litellm 给对象，测试注入给 dict），
+    因此测试可以针对**本类本体**跑，而不必退回 `FakeUpstream`。
+    """
 
     name = "litellm"
 
-    async def complete(self, body: dict, scenario: Scenario) -> UpstreamResult:  # pragma: no cover - 依赖网络
+    def _kwargs(self, body: dict, scenario: Scenario) -> dict[str, Any]:
+        from msvc.config import get_settings
+
+        s = get_settings()
+        kw: dict[str, Any] = {"model": body["model"], "messages": body["messages"]}
+        for key in ("temperature", "top_p", "max_tokens"):
+            if body.get(key) is not None:
+                kw[key] = body[key]
+        if s.litellm_api_base:
+            kw["api_base"] = s.litellm_api_base
+        if s.litellm_api_key:
+            kw["api_key"] = s.litellm_api_key
+        return kw
+
+    def _xms(
+        self, *, requested_model: str, used_model: str | None, usage: dict[str, Any] | None, latency_ms: int
+    ) -> dict[str, Any]:
+        from msvc.config import get_settings
+
+        used = used_model or requested_model
+        block: dict[str, Any] = {
+            "provider": used.split("/")[0] if "/" in used else get_settings().litellm_default_model.split("/")[0],
+            "model_used": used,
+            "model_requested": requested_model,
+            "fallback_used": False,
+            "upstream_latency_ms": latency_ms,
+            "cached": bool((usage or {}).get("prompt_tokens_details", {}).get("cached_tokens")),
+        }
+        # 成本口径（红线2）：能实测才算 exact；算不出 → null + unknown，**绝不返回 0**。
+        try:
+            import litellm
+
+            pin, pout = litellm.cost_per_token(
+                model=used,
+                prompt_tokens=int((usage or {}).get("prompt_tokens", 0) or 0),
+                completion_tokens=int((usage or {}).get("completion_tokens", 0) or 0),
+            )
+            block["cost_usd"] = str(Decimal(str(pin)) + Decimal(str(pout)))
+            block["cost_status"] = "exact"
+        except Exception:  # 无价格表/上游未给 usage → unknown
+            block["cost_usd"] = None
+            block["cost_status"] = "unknown"
+        return block
+
+    async def complete(self, body: dict, scenario: Scenario) -> UpstreamResult:
         import litellm
 
-        resp = await litellm.acompletion(
-            model=body["model"],
-            messages=body["messages"],
-            api_base=scenario.__dict__.get("api_base") or None,
+        t0 = time.monotonic()
+        try:
+            resp = await litellm.acompletion(**self._kwargs(body, scenario))
+        except Exception as exc:
+            raise from_upstream_exception(exc) from exc
+        usage = _norm_usage(_get(resp, "usage"))
+        choice = _first(_get(resp, "choices")) or {}
+        message = _as_dict(choice.get("message") if isinstance(choice, dict) else None)
+        finish = choice.get("finish_reason") or "stop"
+        xms = self._xms(
+            requested_model=body["model"],
+            used_model=_get(resp, "model"),
+            usage=usage,
+            latency_ms=int((time.monotonic() - t0) * 1000),
         )
-        usage = {
-            "prompt_tokens": resp.usage.prompt_tokens,
-            "completion_tokens": resp.usage.completion_tokens,
-            "total_tokens": resp.usage.total_tokens,
-        }
-        xms = {
-            "provider": body["model"].split("/")[0],
-            "model_used": resp.model,
-            "cost_status": "unknown",
-            "cost_usd": None,
-        }
-        return UpstreamResult(content=resp.choices[0].message.content or "", usage=usage, x_model_service=xms)
+        return UpstreamResult(
+            content=message.get("content") or "",
+            usage=usage or {},
+            x_model_service=xms,
+            finish_reason=finish,
+        )
 
-    async def stream(self, body: dict, scenario: Scenario):  # pragma: no cover
-        raise NotImplementedError("LiteLLM 流式 provider 在生产接线时补全")
+    async def stream(self, body: dict, scenario: Scenario) -> AsyncIterator[dict[str, Any]]:
+        """真实上游流式：逐块转发内容 → 收尾 `finish_reason` → usage → 终止事件 → done。
+
+        事件顺序与 `FakeUpstream` 严格一致（§6.6/P1-8：finish chunk 必须**先于** usage chunk
+        且携带非 null finish_reason），否则平台侧 `StreamDone.finish_reason` 在生产路径失效。
+        """
+        import litellm
+
+        kw = self._kwargs(body, scenario)
+        kw["stream"] = True
+        kw["stream_options"] = {"include_usage": True}
+        t0 = time.monotonic()
+        try:
+            resp = await litellm.acompletion(**kw)
+        except Exception as exc:  # 首字节**前**失败 → 交由 handler 返回 HTTP 错误状态（§6.7）
+            raise from_upstream_exception(exc) from exc
+
+        used_model: str | None = None
+        finish_reason: str | None = None
+        usage: dict[str, Any] | None = None
+        try:
+            async for chunk in resp:
+                used_model = _get(chunk, "model") or used_model
+                choice = _first(_get(chunk, "choices"))
+                if choice:
+                    delta = choice.get("delta") if isinstance(choice, dict) else _obj(choice, "delta")
+                    delta = delta if isinstance(delta, dict) else _as_dict(delta)
+                    text = delta.get("content")
+                    if text:
+                        yield {"kind": "chunk", "content": text}
+                    if choice.get("finish_reason") or _obj(choice, "finish_reason"):
+                        finish_reason = choice.get("finish_reason") or _obj(choice, "finish_reason")
+                raw_usage = _get(chunk, "usage")
+                if raw_usage:
+                    usage = _norm_usage(raw_usage) or usage
+            yield {"kind": "finish", "finish_reason": finish_reason or "stop"}
+            if usage:
+                yield {"kind": "usage", "usage": usage}
+            yield {
+                "kind": "terminate",
+                "x_model_service": self._xms(
+                    requested_model=body["model"],
+                    used_model=used_model,
+                    usage=usage,
+                    latency_ms=int((time.monotonic() - t0) * 1000),
+                ),
+            }
+            yield {"kind": "done"}
+        except asyncio.CancelledError:
+            # 红线6：平台断连 → 必须中止上游，不得让它继续烧 token
+            aclose = getattr(resp, "aclose", None) or getattr(resp, "close", None)
+            if aclose is not None:
+                with suppress(Exception):
+                    await aclose()
+            raise
+        except Exception as exc:  # 首字节**后**失败 → handler 发流内错误帧 + [DONE]（§6.7）
+            aclose = getattr(resp, "aclose", None) or getattr(resp, "close", None)
+            if aclose is not None:
+                with suppress(Exception):
+                    await aclose()
+            raise from_upstream_exception(exc) from exc
+
+
+def _obj(obj: Any, attr: str) -> Any:
+    return getattr(obj, attr, None)
+
+
+def _as_dict(obj: Any) -> dict:
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        return obj
+    to_dict = getattr(obj, "model_dump", None) or getattr(obj, "dict", None)
+    if callable(to_dict):
+        with suppress(Exception):
+            return to_dict()
+    return {k: v for k, v in vars(obj).items() if not k.startswith("_")} if hasattr(obj, "__dict__") else {}
+
+
+def _get(obj: Any, attr: str) -> Any:
+    """同时支持 dict 与对象两种形态（真实 litellm 给对象，测试注入可给 dict）。"""
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj.get(attr)
+    return getattr(obj, attr, None)
+
+
+def _first(choices: Any) -> dict | None:
+    if not choices:
+        return None
+    return _as_dict(choices[0])
+
+
+def _norm_usage(raw: Any) -> dict[str, Any] | None:
+    if not raw:
+        return None
+    d = _as_dict(raw) if not isinstance(raw, dict) else raw
+    out: dict[str, Any] = {
+        "prompt_tokens": int(d.get("prompt_tokens", 0) or 0),
+        "completion_tokens": int(d.get("completion_tokens", 0) or 0),
+        "total_tokens": int(d.get("total_tokens", 0) or 0)
+        or int(d.get("prompt_tokens", 0) or 0) + int(d.get("completion_tokens", 0) or 0),
+    }
+    details = d.get("prompt_tokens_details")
+    if details:
+        dd = details if isinstance(details, dict) else _as_dict(details)
+        if dd.get("cached_tokens") is not None:
+            out["prompt_tokens_details"] = {"cached_tokens": int(dd["cached_tokens"] or 0)}
+    cdetails = d.get("completion_tokens_details")
+    if cdetails:
+        cd = cdetails if isinstance(cdetails, dict) else _as_dict(cdetails)
+        if cd.get("reasoning_tokens") is not None:
+            out["completion_tokens_details"] = {"reasoning_tokens": int(cd["reasoning_tokens"] or 0)}
+    return out

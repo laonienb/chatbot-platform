@@ -36,6 +36,9 @@ class Settings(BaseSettings):
     # 被淘汰的 key 后续重发按未命中处理（会真实调用上游）——语义已声明于 README。
     idempotency_cache_max_entries: int = 256
     idempotency_cache_max_chars: int = 1_000_000
+    # SW-5：在飞位 TTL 兜底。默认对齐上游总超时（60s）——超过它还在"飞"，说明那次调用
+    # 已经丢了（异常漏放 finally），此时必须放行，否则同 key 永久 409。
+    idempotency_inflight_ttl_seconds: float = 60.0
 
     protocol_version: int = 1
     implementation_name: str = "model-service"

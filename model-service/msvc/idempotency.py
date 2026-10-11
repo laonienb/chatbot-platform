@@ -76,13 +76,20 @@ class IdempotencyWindow:
         *,
         max_entries: int = 256,
         max_chars: int = 1_000_000,
+        inflight_ttl_seconds: float = 60.0,
     ):
         self.window_seconds = window_seconds
         # §8.2.2-3：缓存必须有**条数/体积上限**（本节两个上限）。
         self.max_entries = max_entries
         self.max_chars = max_chars
+        # SW-5 纵深防御：在飞位**必须有过期机制**。此前只有 `finish()`/`clear()` 能清，
+        # 于是"任何一条漏放 finally 的路径"都会把该 key 变成**永久 409**（协议 §24.2 R4
+        # 实测：兼容面指纹键下，一次上游抖动让同一条消息在进程重启前永久发不出）。
+        # 记 `monotonic` 时间戳，超过 `inflight_ttl_seconds`（默认取上游总超时 60s）
+        # 即视为陈旧并放行——宁可放行一次可能的重复调用，也不永久拒死用户。
+        self.inflight_ttl_seconds = inflight_ttl_seconds
         self._store: dict[str, CachedResponse] = {}
-        self._inflight: set[str] = set()
+        self._inflight: dict[str, float] = {}
         self._chars = 0
 
     def get(self, key: str) -> CachedResponse | None:
@@ -95,19 +102,39 @@ class IdempotencyWindow:
             return None
         return hit
 
+    def _inflight_fresh(self, key: str) -> bool:
+        """在飞位是否存在且**未过期**。过期即视为陈旧（SW-5）。"""
+        started_at = self._inflight.get(key)
+        if started_at is None:
+            return False
+        if time.monotonic() - started_at >= self.inflight_ttl_seconds:
+            logger.warning(
+                "幂等窗在飞位陈旧（key=%s，已 %0.1fs > TTL %0.1fs）→ 放行同 key 请求，"
+                "视为上游调用已丢失（SW-5 兜底；正常路径应在 finally 释放）",
+                key,
+                time.monotonic() - started_at,
+                self.inflight_ttl_seconds,
+            )
+            del self._inflight[key]
+            return False
+        return True
+
     def begin(self, key: str) -> bool:
         """返回 False 表示已有同 key 请求在飞（并发）——调用方应 409。
 
         §8.2.2-2：在飞位语义对**流式同样适用**（防同 key 并发双流各自真实调用上游）。
         """
-        if key in self._inflight:
+        if self._inflight_fresh(key):
             return False
-        self._inflight.add(key)
+        self._inflight[key] = time.monotonic()
         return True
 
     def finish(self, key: str, resp: CachedResponse | None) -> None:
-        """resp=None 表示「不入窗」（瞬时/本地/未送达失败、或终态未知）→ 仅清除在飞标记。"""
-        self._inflight.discard(key)
+        """resp=None 表示「不入窗」（瞬时/本地/未送达失败、或终态未知）→ 仅清除在飞标记。
+
+        在飞位**最先**清除：入窗逻辑即便抛异常，也不会把 key 永久卡在 409。
+        """
+        self._inflight.pop(key, None)
         if resp is None:
             return
         old = self._store.pop(key, None)

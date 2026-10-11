@@ -16,7 +16,7 @@ from starlette.routing import Route
 
 from msvc.auth import require_auth
 from msvc.config import get_settings
-from msvc.errors import CODE_HTTP, ServiceError
+from msvc.errors import CODE_HTTP, ServiceError, from_upstream_exception
 from msvc.guards import guard_request
 from msvc.idempotency import CachedResponse, IdempotencyWindow, StreamTerminal
 from msvc.provider import FakeUpstream, LiteLLMProvider, Scenario, UpstreamResult, _ScenarioError
@@ -28,17 +28,27 @@ def _make_upstream():
     return LiteLLMProvider() if get_settings().upstream == "litellm" else FakeUpstream()
 
 
-async def _map_upstream_error(exc: _ScenarioError) -> ServiceError:
-    payload: dict[str, Any] = exc.payload
-    code = payload.get("code", "upstream_error")
-    retryable = bool(payload.get("retryable", False))
-    return ServiceError(
-        code,
-        payload.get("message", f"上游错误 {code}"),
-        err_type=payload.get("type", "api_error"),
-        retry_after=payload.get("retry_after"),
-        retryable=retryable,
-    )
+def _map_upstream_error(exc: BaseException) -> ServiceError:
+    """把上游异常映射为 ServiceError。
+
+    - `_ScenarioError`：假桩的声明式错误（保留 code/retryable/retry_after 语义）；
+    - `ServiceError`：真实 provider 已映射过，原样透传；
+    - **其余一切异常**：走 `from_upstream_exception`（SW-4）——真实 litellm 异常族此前
+      无人认领，直接逃逸成裸 500，并让幂等在飞位永久泄漏。
+    """
+    if isinstance(exc, ServiceError):
+        return exc
+    if isinstance(exc, _ScenarioError):
+        payload: dict[str, Any] = exc.payload
+        return ServiceError(
+            payload.get("code", "upstream_error"),
+            payload.get("message", f"上游错误 {payload.get('code', 'upstream_error')}"),
+            err_type=payload.get("type", "api_error"),
+            param=payload.get("param"),
+            retry_after=payload.get("retry_after"),
+            retryable=bool(payload.get("retryable", False)),
+        )
+    return from_upstream_exception(exc)
 
 
 def _build_completion(res: UpstreamResult, requested_model: str) -> dict:
@@ -50,7 +60,8 @@ def _build_completion(res: UpstreamResult, requested_model: str) -> dict:
             {
                 "index": 0,
                 "message": {"role": "assistant", "content": res.content},
-                "finish_reason": "stop",
+                # §6.6：真实上游给什么就记什么（`stop`/`length`），不再硬编码 `stop`。
+                "finish_reason": getattr(res, "finish_reason", None) or "stop",
             }
         ],
     }
@@ -93,15 +104,24 @@ def _error_payload(
     err_type: str = "api_error",
     param: str | None = None,
     retryable: bool = False,
+    retry_after_s: int | None = None,
 ) -> dict:
-    """§7 错误体（流内错误帧的 `error` 值）。"""
-    return {
+    """§7 错误体（流内错误帧的 `error` 值）。
+
+    `retry_after_s`（v1.7-澄清2 加法字段，SW-2）：**流内错误帧没有 HTTP header 可带**，
+    这是流式路径传递退避时长的唯一手段。**只有上游真给了值才出现该键**——缺省不给，
+    不得凭空造一个 0 或默认值（否则平台会把"没有退避信息"误读成"立刻可重试"）。
+    """
+    payload: dict[str, Any] = {
         "message": message,
         "type": err_type,
         "code": code,
         "param": param,
         "retryable": retryable,
     }
+    if retry_after_s is not None:
+        payload["retry_after_s"] = int(retry_after_s)
+    return payload
 
 
 def _error_event(err: dict, usage: dict | None = None) -> dict:
@@ -136,7 +156,17 @@ async def chat_completions(request: Request) -> Response:
     app_state = request.app.state
     settings = get_settings()
     try:
-        body = await request.json()
+        try:
+            body = await request.json()
+        except Exception as exc:
+            raise ServiceError(
+                "invalid_request", f"请求体不是合法 JSON：{exc}",
+                err_type="invalid_request_error",
+            ) from exc
+        if not isinstance(body, dict):
+            raise ServiceError(
+                "invalid_request", "请求体必须是 JSON object", err_type="invalid_request_error"
+            )
         require_auth(request.headers.get("Authorization"))
         guard_request(body)  # 红线1/10：P0-3 入站禁字段校验（先于任何上游调用）
         _check_compliance(body)
@@ -148,6 +178,10 @@ async def chat_completions(request: Request) -> Response:
             )
     except ServiceError as e:
         return e.to_response()
+    except Exception as exc:
+        # SW-4：入口段的任何意外异常也要产出 §7 的 code，**不得**留裸 500 给 ASGI 默认处理器。
+        # 此处尚未 begin()，没有在飞位需要释放。
+        return _map_upstream_error(exc).to_response()
 
     idem = request.headers.get("Idempotency-Key")
     window: IdempotencyWindow = app_state.window
@@ -236,31 +270,38 @@ async def _handle_nonstream(request, body, model, scenario, idem) -> Response:
         res = await asyncio.wait_for(upstream.complete(body, scenario), timeout=settings.upstream_total_timeout)
     except asyncio.TimeoutError:
         err = ServiceError("upstream_timeout", "上游总超时（自持，§8.1）", retryable=False)
-        _finish_window(window, idem, err.http_status, err.retryable, reached_upstream, err.to_response())
-        return err.to_response()
-    except _ScenarioError as exc:
-        err = await _map_upstream_error(exc)
-        _finish_window(window, idem, err.http_status, err.retryable, reached_upstream, err.to_response())
-        return err.to_response()
-    except ServiceError as err:
-        _finish_window(window, idem, err.http_status, err.retryable, reached_upstream, err.to_response())
-        return err.to_response()
-
-    resp = JSONResponse(_build_completion(res, model))
-    _finish_window(window, idem, 200, False, reached_upstream, resp, cache_body=True)
-    return resp
+    except Exception as exc:  # SW-4 catch-all：ServiceError 直透、其余按 §7 映射，**绝不裸抛**
+        err = _map_upstream_error(exc)
+    else:
+        resp = JSONResponse(_build_completion(res, model))
+        _finish_window(window, idem, 200, False, reached_upstream, resp, cache_body=True)
+        return resp
+    _finish_window(window, idem, err.http_status, err.retryable, reached_upstream, err.to_response())
+    return err.to_response()
 
 
 def _finish_window(window, idem, status, retryable, reached_upstream, response, *, cache_body=False):
+    """终结幂等窗：**任何情况下都必须释放在飞位**（SW-4 硬条款）。
+
+    入窗只是"顺带缓存"；在飞位漏放会让同 key 之后恒 409（兼容面指纹键 ⇒ 用户的同一条
+    消息在进程重启前永久发不出）。故本函数**自带兜底**：入窗逻辑若抛异常，退化为
+    `finish(idem, None)`（不入窗但清在飞），绝不让异常把在飞位留在集合里。
+    """
     if not idem:
         return
-    should = window.should_cache(status, retryable, reached_upstream)
-    if should and cache_body:
-        window.finish(idem, CachedResponse(status, response_body(response), {}, time.monotonic() + window.window_seconds))
-    elif should and not cache_body:
-        window.finish(idem, CachedResponse(status, _error_body(response), _response_headers(response), time.monotonic() + window.window_seconds))
-    else:
-        window.finish(idem, None)  # 不入窗：仅清除在飞标记
+    try:
+        should = window.should_cache(status, retryable, reached_upstream)
+        if should:
+            body = response_body(response)
+            headers = _response_headers(response)
+            window.finish(
+                idem,
+                CachedResponse(status, body, headers, time.monotonic() + window.window_seconds),
+            )
+            return
+    except Exception:  # 记账失败不能连带泄漏在飞位
+        pass
+    window.finish(idem, None)  # 不入窗 / 兜底：仅清除在飞标记
 
 
 def response_body(response: JSONResponse) -> dict:
@@ -269,12 +310,13 @@ def response_body(response: JSONResponse) -> dict:
     return _json.loads(response.body.decode())
 
 
-def _error_body(response: JSONResponse) -> dict:
-    return response_body(response)
-
-
 def _response_headers(response: JSONResponse) -> dict[str, str]:
     return {k: v for k, v in response.headers.items() if k.lower() == "retry-after"}
+
+
+async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """SW-4 兜底：任何逃逸到 ASGI 层的异常都渲染成 §7 错误体，绝不裸 500。"""
+    return _map_upstream_error(exc).to_response()
 
 
 async def _handle_stream(request, body, model, scenario, idem) -> Response:
@@ -300,13 +342,11 @@ async def _handle_stream(request, body, model, scenario, idem) -> Response:
         # 首字节前的失败 → 走 §8.2.1 三分表（结果不明 ⇒ 入窗；瞬时拒绝 ⇒ 不入窗）
         _finish_window(window, idem, err.http_status, err.retryable, True, err.to_response())
         return err.to_response()
-    except _ScenarioError as exc:
+    except Exception as exc:
+        # SW-4 catch-all（首字节**前**）：真实 litellm 异常族此前从这里逃逸成裸 500，
+        # 且因为没走 `_finish_window` 而把幂等在飞位永久留在集合里（同 key 恒 409）。
         await _aclose(agen)
-        err = await _map_upstream_error(exc)
-        _finish_window(window, idem, err.http_status, err.retryable, True, err.to_response())
-        return err.to_response()
-    except ServiceError as err:
-        await _aclose(agen)
+        err = _map_upstream_error(exc)
         _finish_window(window, idem, err.http_status, err.retryable, True, err.to_response())
         return err.to_response()
 
@@ -356,15 +396,16 @@ async def _handle_stream(request, body, model, scenario, idem) -> Response:
                     )
                     await _aclose(agen)  # 红线6：别让上游生成器悬空
                     break
-                except _ScenarioError as exc:
-                    err = await _map_upstream_error(exc)
-                    terminal.error = _error_payload(
-                        err.code, err.message, err_type=err.err_type, param=err.param,
-                        retryable=err.retryable,
-                    )
+                except Exception as exc:
+                    # SW-4：假桩的 `_ScenarioError`、真实 provider 的 `ServiceError`、
+                    # 以及任何未映射异常，都在此收敛成 §7 错误帧（此前只认 `_ScenarioError`，
+                    # 真实上游中途报错会**逃出** event_gen ⇒ 既无错误帧也无 `[DONE]`）。
+                    err = _map_upstream_error(exc)
+                    terminal.error = err.to_payload()  # 含 retry_after_s（§6.7 流式唯一退避通道）
                     # §6.7 G3-2：错误帧**可**携带实测部分 usage（加法字段）
-                    if isinstance(exc.payload.get("usage"), dict):
-                        terminal.usage = exc.payload["usage"]
+                    usage_extra = getattr(exc, "payload", {})
+                    if isinstance(usage_extra, dict) and isinstance(usage_extra.get("usage"), dict):
+                        terminal.usage = usage_extra["usage"]
                     await _aclose(agen)
                     break
             if terminal.error is not None:
@@ -430,6 +471,7 @@ async def readiness(request: Request) -> Response:
 
 
 def create_app() -> Starlette:
+    settings = get_settings()
     app = Starlette(
         routes=[
             Route("/healthz", healthz),
@@ -438,13 +480,17 @@ def create_app() -> Starlette:
             Route("/v1/capabilities", capabilities),
             Route("/v1/models", list_models),
             Route("/v1/chat/completions", chat_completions, methods=["POST"]),
-        ]
+        ],
+        # SW-4 最后一道网：连 handler 都没兜住的异常也必须产出 §7 错误体（裸 500 会让
+        # 平台拿不到 `error.code`，退避/熔断/归因全瞎）。
+        exception_handlers={Exception: _unhandled_exception_handler},
     )
     app.state.upstream = _make_upstream()
     app.state.window = IdempotencyWindow(
-        get_settings().idempotency_window_seconds,
-        max_entries=get_settings().idempotency_cache_max_entries,
-        max_chars=get_settings().idempotency_cache_max_chars,
+        settings.idempotency_window_seconds,
+        max_entries=settings.idempotency_cache_max_entries,
+        max_chars=settings.idempotency_cache_max_chars,
+        inflight_ttl_seconds=settings.idempotency_inflight_ttl_seconds,
     )
     app.state.scenario = Scenario()
     return app

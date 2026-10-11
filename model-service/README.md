@@ -1,7 +1,7 @@
 # 模型服务（Model Service, S3）
 
-独立、无状态的模型调用服务。契约 = `../docs/model-service-protocol.md` v1；平台经
-`LLM_BACKEND=remote` 的 `RemoteBackend` 调用它。
+独立、无状态的模型调用服务。契约 = `../docs/model-service-protocol.md` **v1.7-澄清3**
+（线协议仍为 v1）；平台经 `LLM_BACKEND=remote` 的 `RemoteBackend` 调用它。
 
 ## 边界铁律
 - **永不认识用户**：请求出现 `user_id` / `conversation_id` / `persona` 等禁字段 → 400
@@ -47,14 +47,25 @@
   的 `features.timeouts` 暴露实际值供平台启动断言「内层 < 外层」。
 
 ## Provider
-- `FakeUpstream`（默认，`MS_UPSTREAM=fake`）：离线确定性，测试/本地。
+- `FakeUpstream`（默认，`MS_UPSTREAM=fake`）：离线确定性，供本地与契约测试。
 - `LiteLLMProvider`（`MS_UPSTREAM=litellm`）：真实上游，lazy import。
+  **流式已实现**（工作单 SW-1）——此前 `stream()` 抛 `NotImplementedError`，而 native 模式
+  流式是主路径，`LLM_BACKEND=remote` 切换后所有流式请求会裸 500（协议 §24.1 R1 实测）。
+  现逐块转发内容 → 收尾 `finish_reason`（§6.6，位于 usage chunk **之前**）→ usage →
+  `x_model_service` 终止事件 → done；成本走 `litellm.cost_per_token`，算不出即
+  `null + unknown`（红线2）。所有上游异常统一经 `errors.from_upstream_exception` 映射为
+  带 §7 `code` 的 `ServiceError`（SW-4），不再裸抛。
+  ⚠️ 未在真实 provider 上做联网冒烟：本仓库网络受限时以**注入的假 `litellm` 模块**为边界，
+  被测对象是 `LiteLLMProvider` 本体而非 `FakeUpstream`（见 `tests/test_real_upstream.py`）。
+  接线真实上游时仍需确认密钥/端点与价格表命中情况。
 
 ## 配置（env，前缀 `MS_`）
 `MS_SERVICE_TOKENS`（逗号分隔，双 token）、`MS_UPSTREAM`、`MS_COMPLIANCE_DENY_PROVIDERS`、
-`MS_CATALOG_MODELS`、`MS_UPSTREAM_FIRST_TOKEN_TIMEOUT`、`MS_UPSTREAM_TOTAL_TIMEOUT`、
-`MS_IDEMPOTENCY_WINDOW_SECONDS`、`MS_IDEMPOTENCY_CACHE_MAX_ENTRIES`、
-`MS_IDEMPOTENCY_CACHE_MAX_CHARS`。
+`MS_CATALOG_MODELS`、`MS_UPSTREAM_FIRST_TOKEN_TIMEOUT`、`MS_UPSTREAM_CHUNK_IDLE_TIMEOUT`、
+`MS_UPSTREAM_TOTAL_TIMEOUT`、`MS_IDEMPOTENCY_WINDOW_SECONDS`、
+`MS_IDEMPOTENCY_CACHE_MAX_ENTRIES`、`MS_IDEMPOTENCY_CACHE_MAX_CHARS`、
+`MS_IDEMPOTENCY_INFLIGHT_TTL_SECONDS`（SW-5 在飞位兜底，默认对齐上游总超时 60s）、
+`MS_LITELLM_API_BASE` / `MS_LITELLM_API_KEY` / `MS_LITELLM_DEFAULT_MODEL`（真实上游）。
 
 ## 流式错误语义（§6.7，v1.7）
 - **首字节之前**的失败（尚未写出任何事件）→ **HTTP 错误状态**（同 §7 表：
@@ -66,5 +77,10 @@
 ## 运行 / 测试
 ```bash
 uvicorn msvc.main:app --host 0.0.0.0 --port 8000
-pytest            # 对真实服务跑 T1–T11（test_contract.py）
+pytest            # 服务侧契约测试
 ```
+- `tests/test_contract.py`：T1–T11（含 P0-3 入站禁字段、§8.2.1 入窗边界）。
+- `tests/test_real_upstream.py`：**T12**（①`test_t12_pre_first_byte_error_returns_http_status`
+  / ②③`test_t12_post_first_byte_error_frame_then_done`）+ 真实 provider（SW-1）与
+  SW-2/4/5 防线。⚠️ §10 要求 T12「两侧各配用例」：平台侧在
+  `server/tests/test_model_service_contract.py`，服务侧此前**缺**、由本文件补齐。
