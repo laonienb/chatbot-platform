@@ -81,9 +81,19 @@
   `x_model_service` 终止事件 → done；成本走 `litellm.cost_per_token`，算不出即
   `null + unknown`（红线2）。所有上游异常统一经 `errors.from_upstream_exception` 映射为
   带 §7 `code` 的 `ServiceError`（SW-4），不再裸抛。
-  ⚠️ 未在真实 provider 上做联网冒烟：本仓库网络受限时以**注入的假 `litellm` 模块**为边界，
-  被测对象是 `LiteLLMProvider` 本体而非 `FakeUpstream`（见 `tests/test_real_upstream.py`）。
-  接线真实上游时仍需确认密钥/端点与价格表命中情况。
+  **联网冒烟已跑过一次**（2026-10-11，A-1/协议 §26.6-乙，端点为 OpenAI 兼容网关的 reasoning
+  模型，12 次真调用）：流式 5/5 成功、`finish_reason=stop`、`[DONE]` 齐全，
+  `usage.completion_tokens_details.reasoning_tokens` 每次都带（23–194），
+  成本 `cost_status=unknown` / `cost_usd=null`（litellm 价表无此 model，红线2 的**正确**行为，
+  平台按 §5.1 回落自己的价格表）。**一条运维必读**：上游首 *content* token 实测
+  **3.9–11.3s**（首 reasoning token 0.5–9.7s），而 `MS_UPSTREAM_FIRST_TOKEN_TIMEOUT=15` 量的是
+  **首个对外事件**——reasoning chunk 不产出事件，故这 15s 实为「整段推理的预算」，最坏余量仅 1.3×。
+  超时后按 §8.2.1 **入窗**（同 Idempotency-Key 在窗口内重发一律回放 504，即使上游已恢复），
+  判据用例：`tests/test_a1_upstream_identity.py::test_b_consequence_first_token_timeout_enters_window_and_replays_504`。
+  离线防线仍保留：以**注入的假 `litellm` 模块**为边界跑 `LiteLLMProvider` 本体
+  （`tests/test_real_upstream.py`、`tests/test_a1_upstream_identity.py`），不依赖网络。
+  ⚠️ 进程内 `httpx.ASGITransport` 会**攒完整个响应体**才返回，量不到 chunk 间时序——
+  流式计时必须以真 uvicorn 为准（本仓库的 T6 取消用例早就为此用真连接）。
 
 ## 配置（env，前缀 `MS_`）
 `MS_SERVICE_TOKENS`（逗号分隔，双 token）、`MS_UPSTREAM`、`MS_COMPLIANCE_DENY_PROVIDERS`、
@@ -91,7 +101,40 @@
 `MS_UPSTREAM_TOTAL_TIMEOUT`、`MS_IDEMPOTENCY_WINDOW_SECONDS`、
 `MS_IDEMPOTENCY_CACHE_MAX_ENTRIES`、`MS_IDEMPOTENCY_CACHE_MAX_CHARS`、
 `MS_IDEMPOTENCY_INFLIGHT_TTL_SECONDS`（SW-5 在飞位兜底，默认对齐上游总超时 60s）、
-`MS_LITELLM_API_BASE` / `MS_LITELLM_API_KEY` / `MS_LITELLM_DEFAULT_MODEL`（真实上游）。
+`MS_LITELLM_API_BASE` / `MS_LITELLM_API_KEY` / `MS_LITELLM_DEFAULT_MODEL`（真实上游）、
+`MS_LITELLM_PROVIDER`（**协议名**，默认 `openai`）/ `MS_UPSTREAM_VENDOR`（**供应商名**，默认空）。
+
+### 真实上游的两个名字：协议名 ≠ 供应商名（A-1，协议 §26.6-丙 五项）
+
+「OpenAI 兼容」是**协议**，「小蜜/DeepSeek/…」是**供应商**。此前两者挤在 model 字符串的
+前缀里，于是只有两条坏路：发 `openai/xxx` 会撞自家红线5 的 deny 前缀判定（403），发无前缀
+model 则 litellm 定不出 provider、归因字段回落到 `MS_LITELLM_DEFAULT_MODEL` 的前缀。拆成
+两个显式字段后：
+
+| 落点 | 字段/env | 行为 |
+|---|---|---|
+| 1 | `provider._kwargs` | model **无斜杠**时传 `custom_llm_provider=MS_LITELLM_PROVIDER`；有斜杠时**不传**（litellm 在两者不一致时会再拼一层前缀，把 model id 弄错） |
+| 2 | `MS_LITELLM_PROVIDER` | 协议名，默认 `openai` |
+| 3 | `MS_CATALOG_MODELS` | **必须含目标 model id**：无前缀 model 走目录校验（带 `/` 才免检），漏配 ⇒ 到达上游前就 404 `model_not_found`，报错看着像上游问题 |
+| 4 | `MS_UPSTREAM_VENDOR` | 供应商名。`MS_UPSTREAM=litellm` 且该名字命中 `MS_COMPLIANCE_DENY_PROVIDERS` ⇒ **拒绝启动**；未声明 ⇒ 只打 WARNING |
+| 5 | `provider._xms` | `x_model_service.provider` 取 `MS_UPSTREAM_VENDOR`（该字段经平台进 `usage_logs.provider` 与供应商统计，回落前缀＝静默错账） |
+
+第 4 项为什么必须有：A-1 之后请求里的 model 不带前缀 ⇒ `_check_compliance` 的「前缀 ∈ deny」
+那条臂对真实流量恒不命中，而真实出口由 `MS_LITELLM_API_BASE` 决定、合规检查从不读它。
+**实测过的失明判据**：`MS_LITELLM_API_BASE=https://api.openai.com/v1` + `MS_UPSTREAM_VENDOR=xiaomimimo`
++ 无前缀 model → 服务照常启动、`/v1/models` 正常（2026-10-11 本机跑过，未向该端点发任何 chat 请求）。
+⇒ vendor 是**声明**不是**验证**：它把「真实出口是谁」变成一条启动期会对账、日志会警告的显式配置，
+但要真正封住「声明与实际不一致」仍需按 `api_base` 主机名判定，那是协议决策，未在本轮实现。
+
+冒烟用的临时 env（**不落 git**，凭证不入库）：
+```bash
+MS_UPSTREAM=litellm MS_LITELLM_API_BASE=<端点> MS_LITELLM_API_KEY=<一次性调试 key> \
+MS_LITELLM_PROVIDER=openai MS_UPSTREAM_VENDOR=<真实供应商名> \
+MS_CATALOG_MODELS="deepseek-chat,qwen-plus,<目标model>" \
+LITELLM_LOCAL_MODEL_COST_MAP=True uvicorn msvc.main:app --port 8000
+```
+`LITELLM_LOCAL_MODEL_COST_MAP=True` 必须带：本服务不读平台的 env，缺它时 litellm 会先联网拉
+远端价表（失败重试 3 次），那段耗时直接叠在首 token 预算上。
 
 ## 流式错误语义（§6.7，v1.7）
 - **首字节之前**的失败（尚未写出任何事件）→ **HTTP 错误状态**（同 §7 表：

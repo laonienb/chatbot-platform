@@ -185,7 +185,8 @@ class LiteLLMProvider:
         from msvc.config import get_settings
 
         s = get_settings()
-        kw: dict[str, Any] = {"model": body["model"], "messages": body["messages"]}
+        model = body["model"]
+        kw: dict[str, Any] = {"model": model, "messages": body["messages"]}
         for key in ("temperature", "top_p", "max_tokens"):
             if body.get(key) is not None:
                 kw[key] = body[key]
@@ -193,6 +194,13 @@ class LiteLLMProvider:
             kw["api_base"] = s.litellm_api_base
         if s.litellm_api_key:
             kw["api_key"] = s.litellm_api_key
+        # A-1 第1项（协议 §26.6-丙）：**无前缀** model 必须由部署侧显式声明走哪种协议，
+        # 否则 litellm 定不出 provider（实测 `mimo-v2.6-flash` 裸 model 直接报错）。
+        # 有前缀时**不传** `custom_llm_provider`：litellm 在两者不一致时会把 provider 再拼
+        # 一层（`deepseek/deepseek-chat` + `openai` ⇒ `openai/deepseek/deepseek-chat`），
+        # 反而把 model id 弄错。前缀本身已经是 litellm 的 provider 语法。
+        if "/" not in model:
+            kw["custom_llm_provider"] = s.litellm_provider
         return kw
 
     def _xms(
@@ -200,9 +208,16 @@ class LiteLLMProvider:
     ) -> dict[str, Any]:
         from msvc.config import get_settings
 
+        s = get_settings()
         used = used_model or requested_model
+        # A-1 第5项（架构师 B 2.3 🔴 **静默错账**）：`provider` 是**供应商名**，必须取部署
+        # 声明的 `MS_UPSTREAM_VENDOR`。此前无前缀 model 会回落到 `litellm_default_model` 的
+        # 前缀 ⇒ 打小蜜端点却记 `provider=="deepseek"`，而该字段经 `remote.py` →
+        # `ledger.py` 进 `usage_logs.provider` 与供应商统计，错了没人发现。
+        # vendor 未声明才保留旧回落（升级期不炸既有部署）。
+        inferred = used.split("/")[0] if "/" in used else s.litellm_default_model.split("/")[0]
         block: dict[str, Any] = {
-            "provider": used.split("/")[0] if "/" in used else get_settings().litellm_default_model.split("/")[0],
+            "provider": (s.upstream_vendor.strip() or inferred),
             "model_used": used,
             "model_requested": requested_model,
             "fallback_used": False,

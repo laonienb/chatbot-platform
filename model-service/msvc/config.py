@@ -1,8 +1,12 @@
 """模型服务配置（环境变量注入，§3/§8.1/§9）。无凭证入 git；生产由部署侧提供。"""
 
+import logging
 from functools import lru_cache
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger("msvc.config")
 
 
 class Settings(BaseSettings):
@@ -16,10 +20,25 @@ class Settings(BaseSettings):
     litellm_api_key: str = ""
     litellm_default_model: str = "deepseek/deepseek-chat"
 
+    # ── A-1（协议 §26.6-丙）：**协议名与供应商名分开建模** ─────────────────────────
+    # 「OpenAI 兼容端点」是**协议**，「小蜜/xiaomimimo」是**供应商**；此前两者被混成
+    # model 字符串的前缀，导致要么必须发 `openai/...`（撞红线5 的 deny 前缀判定），
+    # 要么让 litellm 猜 provider。拆成两个显式字段后：协议名进 `custom_llm_provider`，
+    # 供应商名进 `x_model_service.provider`（归因/用量统计），请求里的 model 保持无前缀。
+    # (2) 协议名：交给 litellm 的 `custom_llm_provider`，默认 openai 兼容。
+    litellm_provider: str = "openai"
+    # (4) 供应商名：**部署侧声明**，进 `provider` 归因与红线5 的启动期对账。字段名决定
+    # env 名（`MS_` + 大写 ⇒ `MS_UPSTREAM_VENDOR`）；改成别的名字会被 `extra="ignore"`
+    # 静默吞掉，配置看着生效、其实没绑上。
+    # 默认空 = 未声明 ⇒ 启动 WARNING（不 fail-fast：旧部署没有这个 env，升级期不能起不来）。
+    upstream_vendor: str = ""
+
     # 合规硬策略（§4.3）：命中 deny 列表的 provider 一律 403，调用方不可放宽（红线5）。
     compliance_deny_providers: str = "openai,anthropic"
 
     # 目录（§9）：本服务对外声明的模型集合，逗号分隔（真实由上游/provider 注册表决定）。
+    # ⚠️ **无前缀** model 会走 `main.py` 的目录校验（有 "/" 才免检）⇒ 接真实上游时
+    # 目标 model id 必须列进这里，否则请求在到达上游之前就 404 `model_not_found`（§26.6-丙 第3项）。
     catalog_models: str = "deepseek-chat,qwen-plus"
 
     # 超时（§8.1，模型服务侧自持，红线8：内层 < 平台流式空闲上限 90s）。
@@ -55,6 +74,38 @@ class Settings(BaseSettings):
     @property
     def models(self) -> list[str]:
         return [m.strip() for m in self.catalog_models.split(",") if m.strip()]
+
+    @model_validator(mode="after")
+    def _reconcile_upstream_vendor_with_compliance(self) -> "Settings":
+        """A-1 第4项（协议 §26.6-丙 / 架构师 B 2.4）：红线5 对**真实出口**的启动期对账。
+
+        为什么需要：A-1 之后请求里的 model **不带** provider 前缀 ⇒ `_check_compliance`
+        的「model 前缀 ∈ deny」那条判定臂对真实流量恒不命中，而平台不发 `routing`
+        ⇒ allow 臂也是死的；真实出口由 env（`MS_LITELLM_API_BASE`）决定，那里**从不**被
+        合规检查读到。于是条文一字未放宽，红线5 却对真实出口失明。本断言把这条臂搬到
+        启动期：**供应商名命中 deny 列表 ⇒ 拒绝启动**（不是请求期 403——请求期已经晚了，
+        且会被误读成上游问题）。
+
+        `vendor` 未声明只给 WARNING、不 fail-fast：升级窗口里旧部署没有这个 env。
+        """
+        if self.upstream != "litellm":
+            return self
+        vendor = self.upstream_vendor.strip().lower()
+        if not vendor:
+            logger.warning(
+                "MS_UPSTREAM=litellm 但未声明 MS_UPSTREAM_VENDOR：provider 归因将回落到 model/"
+                "MS_LITELLM_DEFAULT_MODEL 的前缀 ⇒ usage_logs.provider 记的可能不是真实出口，"
+                "且红线5 的启动期供应商对账被跳过。生产部署必须显式声明供应商名。"
+            )
+            return self
+        if vendor in self.deny_providers:
+            raise ValueError(
+                f"合规硬策略冲突：真实上游供应商 MS_UPSTREAM_VENDOR={vendor!r} 命中 "
+                f"MS_COMPLIANCE_DENY_PROVIDERS={sorted(self.deny_providers)}（红线5）。"
+                f"拒绝启动——请把供应商名改为真实值，或改 MS_LITELLM_API_BASE 换出口；"
+                f"放宽 deny 列表是运营决策，不在本服务配置里静默做。"
+            )
+        return self
 
 
 @lru_cache
