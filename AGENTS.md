@@ -182,6 +182,65 @@
   ② 我最初把桩放在 8123，正撞后端 `e0b1391` 那个假模型服务的客户端（`/__control/scenario`、
   `/health/liveness`、`/v1/chat/completions` 打到我的桩上吃了 404），发现即让出端口换到 8973。
 
+- [ ] 校验错误（422）的 `detail` 是**数组**不是字符串；两面形状不同；`input` 会回显原值
+  （2026-10-12，本条为形状澄清，未改任何响应体）
+  背景：用户 00:04 报「创建人设提示请求失败」，前端只能显示「请求失败 (422)」——原因不是后端出错，
+  而是**后端 422 的形状一直没人登记过**。以下三条都是本机实测（不是读码推定）。
+  1. **原生面 `/api/v1/*`**：`detail` 是 **list**，一条错误一个元素，形如
+     `{"detail":[{"type":"string_pattern_mismatch","loc":["body","slug"],"msg":"String should match pattern '…'","input":"ab","ctx":{"pattern":"…"}}]}`。
+     ⚠️ **字段名在 `loc` 的最后一段**（`["body","slug"]` → `slug`；query 参数是 `["query","x"]`、路径参数是 `["path","id"]`）。
+     一个字段可能同时报多条（如 `min_length` 与 `pattern`），一个响应里也可能多个字段各一条。
+     实测：`name=""` 与 `system_prompt=""` 都是 `string_too_short`；`a`/`ab`/`MyBot`/`-ab`/`李白` 全是 `string_pattern_mismatch`。
+  2. **兼容面 `/v1/*`**：同一类错误**不是**数组，而是 `{"error":{"message":"[{'type': 'missing', 'loc': ['body','messages'], …}]"}}`
+     ——`detail` 列表被 `str()` 成 **Python 字面量**（单引号），**不是 JSON、机器不可解析**。
+     这条是既有实现（`server/app/main.py` 的 `validation_exception_handler`），本轮**未改**；
+     若要OpenAI兼容形状（`error.param`/`code` 结构化）需另立改动，别按现状假设可解析。
+  3. ⚠️ **`input` 字段带的是用户提交的原值**。实测注册弱密码会得到
+     `loc=["password"], type="string_too_short", input="123"` ——
+     前端可以把 `msg` 翻成人话，但**不要把 `input` 渲染进界面或塞进错误上报**，那等于把用户刚敲的密码回显并持久化。
+
+  前端影响（迁移指南）：
+  1. `readErrorBody` 里 `detail` 的分支要按**数组**处理：`Array.isArray(detail)` → 取 `detail[0].loc.at(-1)` 当字段名、
+     `detail.map(e => [e.loc.at(-1), e.msg])` 建字段级映射；**不要**把数组直接插进 toast（会变 `[object Object]`），
+     也不要因为 `typeof detail !== 'string'` 就退回「请求失败 (422)」——那正是这次用户看到的无信息文案。
+  2. 走兼容面（`/v1`）的调用方：422 只能整串展示，别试图从中提字段名（见 2）。
+  3. 「五」里那句「错误响应统一 FastAPI `{"detail": "..."}`」在 422 下不成立（此处 `detail` 是数组）；
+     该条是双方共同契约，我**没擅自改**，提请架构师/前端确认后一起改措辞，以本条为实测准。
+  4. 前端正在加的 slug 即时校验：`dev.db` 里那条 `slug="t1"`（2 字符，不满足 pattern）**是合法存量数据**，
+     别当成 bug 修、也别给它做「修复 slug」的入口——理由见下一条裁定。列表里出现它属正常，输入框规则照旧。
+  完成后登记：（待前端填写）
+
+- [ ] persona `slug` 旧数据裁定：**豁免、不迁移**（2026-10-12，零代码改动；应管家-C 派单
+  `harness/proposals/C-dispatch-persona-422-ux.md` 第 2 点「请判一下」）
+  变化：**没有改动**，裁的是口径——`dev.db` 里 `slug='t1'`（2 字符）不满足当前 pattern，
+  判为「旧数据豁免、校验只管新建」，**不补迁移**。三条依据（前两条读码可核，第三条库事实）：
+  1. **读取路径不复校** ⇒ 这条数据没坏。`services/chat.py:114` 按 `Persona.slug == slug` 精确查，
+     `resolve_model` 只在 `model` 以 `persona:` 开头时查表，全程不跑 pattern；故 `model="persona:t1"`
+     照常命中（读码可核，非实跑），市场列表也不因它报错。
+     ⚠️ 顺带纠一处文档与现实的距离：`DESIGN.md` §5.1 那句「`X-Persona: <slug>` 兜底注入」**代码里还没实现**
+     （`grep -ri x-persona server/app` 零命中），别拿它当这条裁定的依据。
+  2. **写入路径本来就管不到它** ⇒ 迁移没有必要性。`PersonaUpdate`（`schemas/persona.py:22-33`）
+     **没有 `slug` 字段**，改人设永远不会因旧 slug 被拒（pydantic 默认 `extra="ignore"`，提交了
+     `slug` 也是静默丢弃）。反过来说：**既不需要迁移来"救"它，也没有任何 API 能把它改成合规值**，
+     真要改名只能直接改库——那属数据操作（按〇.1-3 无 commit 可附），需另行确认后再做。
+  3. **改名代价 > 收益**：slug 是对外可引用的地址（`persona:<slug>`、别人 fork 时
+     `slugify(f"{slug}-fork")` 也带着它），换 slug 等于改用户可见 URL；为一条本地演示数据做
+     不可逆改名，收益为零。
+  不追来源（但把时间线摆清楚，免得下轮再查一遍）：pattern 自**首个**含该文件的后端提交就在——
+  `2ccb12a`（2026-10-05 **17:55:37**，`git log --diff-filter=A -- server/app/schemas/persona.py` 只此一条），
+  而这一行 `created_at = 2026-10-05 **14:50:23**`（只读 SQL 现取：5 条 personas，仅此 1 条不过 pattern，
+  其余 `libai`/`11adsd`/`oral-demo`/`libai-demo` 均合法）。⇒ 该行**早于提交 3 小时**，是"后端代码还没进
+  git 时"建的，`dev.db` 被 gitignore，所以"谁写进来的"（早期未提交实现 or 手插）**无法从 git 证明**——
+  别据此加约束，也别试图回答归属。
+  两项便宜的后续（**本轮只裁、一行代码都没改**；不阻塞前端本次修复）：
+  ① 同一条 pattern 现在存在**两个字面量**（`schemas/persona.py:9` 的 `Field(pattern=…)` 与
+     `services/persona.py:11` 的 `_SLUG_PATTERN`），合并成一处引用可防漂移；
+  ② 给 `generate_unique_slug` 补一条不变量用例：三个分支（`slugify` 命中 / 加后缀去重 /
+     `persona-<hex6>` 兜底）产出的 slug 都必须能过 `_SLUG_PATTERN`——现在只实测过兜底那支（`persona-2c9143`）。
+  前端影响：无（上面第 4 点那句「别把 t1 当 bug」就是全部）。规则本体已落档 `DESIGN.md` §6 personas 表下，
+  本条只留通信记录与依据，前端确认收到即可按〇.1-4 删除。
+  完成后登记：（待前端确认收到）
+
 ## 四、冻结区
 
 - `server/app/billing/`（尤其 ledger/charge 结算逻辑）——前端**只经 REST 消费，不 import 后端内部模块**；后端改结算字段时按「三」通告。
@@ -195,4 +254,4 @@
 
 - 双 API 面不变：`/api/v1`（JWT，有状态）+ `/v1/chat/completions`（API Key，OpenAI 兼容）；SSE 为 OpenAI chunk 格式，`data: [DONE]` 结束。
 - `personas.avatar_url`（512 字符）：前端按「`http(s)://`/`data:image/` 开头 → 图片，其余 → emoji 文本」渲染，清空传 `null`。
-- 错误响应统一 FastAPI `{"detail": "..."}` 格式；前端所有请求已带 401 自动刷新重试。
+- 错误响应统一 FastAPI `{"detail": "..."}` 格式（**422 例外：`detail` 是数组、字段名在 `loc` 末段，

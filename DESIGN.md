@@ -225,6 +225,13 @@ usage_logs(
 
 预留：知识库用 `pgvector` 扩展（`documents`/`chunks` 表，M4 阶段加）；长期记忆 `memories(user_id, persona_id, content, embedding)`。
 
+**`personas.slug` 口径（2026-10-12 裁定，零代码改动）**：写入校验
+`^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$`（3–64 字符、首尾不得为连字符）**只管新建**——`PersonaCreate`
+校它，`PersonaUpdate` 根本没有 `slug` 字段，读取路径（`resolve_model` 按 `slug` 精确查表）也不复校。
+⇒ 存量里不满足 pattern 的旧行（本地 `dev.db` 有 1 条 `slug='t1'`，建行比该 pattern 进 git 还早 3 小时）
+**继续可用、不做迁移**；代价是**也没有任何 API 能把旧 slug 改成合规值**，真要改名只能直接改库（数据操作）。
+依据与两项便宜的后续见 `AGENTS.md`「三」同日条目。
+
 ## 7. 关键流程
 
 ### 7.1 Web 聊天（有状态）
