@@ -61,7 +61,7 @@ chatbot-platform/
 - [x] 聊天增强 — 会话级模型切换、模型注册表、停止/重新生成、Markdown、局域网访问（同源代理）
 - [x] 计费与计量 — 归因/双阶段账本/费率/钱包扣费/准入/对账与毛利监控（`docs/compose/spec/billing-wiring.md`）；余额查询与展示已上线，用户侧充值未做
 - [x] **模型服务解耦（2026-10-10 全单闭合）** — 独立 `model-service/` + 平台 `RemoteBackend`，契约 v1.7（`docs/model-service-protocol.md`），契约测试双侧全绿（40+180）；生产切换清单见 DESIGN.md §10
-- [ ] 生产切换 — compose 落地 model-service + 补全真实上游流式实现 + 切换清单七步（**契约侧已就绪；真实上游 provider 流式待补，见 DESIGN.md §10 ①**）
+- [ ] 生产切换 — compose 落地 model-service + 切换清单（**代码侧①真实上游流式与错误映射已闭合 `c5ff7bb`**；余为部署/运维，见 DESIGN.md §10）
 - [ ] M2 机器人接入 — AstrBot + NapCat 部署（兼容层已就位）
 - [ ] M3 剩余 — 小程序端
 - [ ] M4 剩余 — 蒸馏流水线（真实 LLM 通路已就绪，阻塞解除）、RAG 知识库、工具调用
@@ -106,7 +106,7 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
   -d '{"model":"persona:人设slug","messages":[{"role":"user","content":"你好"}]}'
 ```
 
-接入真实模型（生产目标态）：起 `model-service/`（provider 凭证配在它那边），平台 `.env` 设 `LLM_BACKEND=remote` + `MODEL_SERVICE_BASE_URL` + `MODEL_SERVICE_TOKEN` + `MODEL_SERVICE_MODE=native`；生产切换清单见 `DESIGN.md` §10（⚠️ 真实上游 provider 的**流式**实现与**错误映射**待补——`DESIGN.md` §10 ①、工作单 SW-1/SW-4——补全前勿切 `remote`）。旧直连方式（`LLM_BACKEND=litellm` + `LITELLM_API_KEY`/`LITELLM_API_BASE`）仍可用但退役中。
+接入真实模型（生产目标态）：起 `model-service/`（provider 凭证配在它那边），平台 `.env` 设 `LLM_BACKEND=remote` + `MODEL_SERVICE_BASE_URL` + `MODEL_SERVICE_TOKEN` + `MODEL_SERVICE_MODE=native`；生产切换清单见 `DESIGN.md` §10（真实上游流式与错误映射**已实现并验收** `c5ff7bb`——SW-1/SW-4；切换前请确认 §10 ②–⑦ 就绪）。旧直连方式（`LLM_BACKEND=litellm` + `LITELLM_API_KEY`/`LITELLM_API_BASE`）仍可用但退役中。
 
 Docker 方式（PostgreSQL + Redis + server）：
 

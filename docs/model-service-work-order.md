@@ -286,10 +286,11 @@ P2-1 / P2-2（协议已就绪，可并行）
 | v1.7 | 2026-10-09 | 架构师 A | **§19 第六轮评审会签后同步**（协议升 v1.7）：① **新增 P1-10（🔴）**——流式不入幂等窗（`msvc/main.py:114` 注释自缩范围）⇒ 兼容面指纹键重发**真实重调上游 + 平台重复 `reserve_usage`**，双烧上游且重复扣用户；定案**入窗分类与传输形态无关**，回放形态取**「终态重放」**（内容/usage/终止事件一致、chunk 边界可不同；不采用事件序列回放——缓存无界；不采用 409——把重发失败暴露给客户端）。**② P1-9 追加范围**：G3-1 错误帧后必须发 `[DONE]`、G3-2 错误帧可携带实测 `usage`、**O1 真实缺陷**（首字节后 chunk 间隔超时硬编码 1.0s 且归因文案错误 → 真实上游中途停顿 >1s 被误杀）；并记明 P1-9 与 P1-10 **改同一段代码、建议同一方连续做完**。**③ 新增 P1-11**——`should_cache` 仍是被 §8.2.1 明禁的状态码白名单（上游 401/403 不入窗），强制两布尔化 + 证伪。P1 计数 9→11；**四项流式待办全部闭合前 S3 不得接管生产流量** |
 | v1.8 | 2026-10-10 | 架构师 A | **复核架构师 B 的文档收编（`a8958c8`，协议 §23）后新增「生产切换前置项」**：R1 🔴 `msvc/provider.py:191` `LiteLLMProvider.stream()` 抛 `NotImplementedError`——**唯一真实上游不能流式**，而 native 模式流式是主路径，`DESIGN.md §10` 切换清单原六步无一步覆盖；契约测试只跑 `FakeUpstream`（`# pragma: no cover`）故 40 全绿照不到。R3 🟡 `model-service/README.md` 仍写 `v1`/`T1–T11`。R2 🟡 看板行「收编中」自相矛盾（架构师 A 已就地改）。**本单不新增 P 级编号**（P0/P1/P2 仍全闭合），前置项见 §8 |
 | v1.9 | 2026-10-10 | 架构师 B | **冻结快照复核 A 的 §23（协议 §24）后扩充 §8**：R1/R2/R3 **全部确认成立**（快照内基线 `40 passed`；真上游流式实测裸 `500`）。**另发现 R4 🔴 → 新增 SW-4**：`_map_upstream_error` 只认 `FakeUpstream` 的 `_ScenarioError`，两个 handler 无 catch-all、无全局异常处理器 ⇒ litellm 异常族全部逃逸，既违反 §7（裸 500 无 `code`），又让 `_finish_window` 不被调用 ⇒ **幂等在飞位永久泄漏**（实测：同 key 第二次恒 `409`，`_inflight` 事后仍含该 key；兼容面指纹键 ⇒ 同一条消息在重启前永久发不出）。**对照组 + 快照内补丁双向验证**：窗口逻辑本身正确（可映射错误 → 429/429、`_inflight` 清空），根因唯一为「异常在 `_finish_window` 前逃出」；打补丁前后基线均 40 全绿 ⇒ 用例对该类缺陷**双向皆盲**。同批：**SW-1 验收扩至错误路径**、新增 **SW-5 🟢**（`_inflight` TTL 兜底）。另附**一条待 A 会签的 §8.2.1 澄清提案**（在飞位必须在任何退出路径释放）。**本单仍不新增 P 级编号**（P0/P1/P2 保持全闭合），R4 属实现/部署缺口 |
+| v1.10 | 2026-10-11 | 架构师 A | **SW-1…SW-5 终轮验收：全部通过**（交付 `c5ff7bb`，协议 §25.2）。冻结快照内实跑服务侧 **64 passed**；五处证伪各自只打红对应用例（SW-1→6、SW-4 映射→4、SW-4 释放→8 含旧 T7/P1-11、SW-5→1、SW-2→2），**关键实证：把真上游流式改回 `NotImplementedError` 时，契约用例（`FakeUpstream`）全绿、只有新文件红** ⇒ R4 的「真实 provider 零覆盖」被正面证实。会签 §24.3 提案并入 §8.2.1（协议 §25.1，v1.7-澄清4）。`DESIGN.md §10 ①` 代码侧闭合，剩余②–⑦为部署/运维。前端 `0c5869e` 同批验收通过（web 30 passed，证伪 2/1/7/1），`server` 180 passed 无回归 |
 
 ---
 
-## 8. 生产切换前置项（v1.8 登记 / v1.9 扩充，归后端）
+## 8. 生产切换前置项（v1.8 登记 / v1.9 扩充 / v1.10 验收通过，归后端）
 
 > 性质：**部署/实现缺口，非契约缺陷**。P0/P1/P2 契约项仍 **3/3、11/11、3/3 全闭合**，
 > 门槛「S3 不得接管生产流量」的**契约条件**已满足；下列为 `LLM_BACKEND=remote` **实际切换前**必须补齐。
@@ -304,3 +305,18 @@ P2-1 / P2-2（协议已就绪，可并行）
 | **SW-3** | `model-service/README.md`：契约版本 `v1` → `v1.7-澄清3`、用例列表 `T1–T11` → `T1–T12`，并注明真实 provider 流式未实现 | 🟡 | 后端（S3） | 该 README 与协议/代码一致（`DESIGN.md §10 ⑥` 引用它取 H3 公式） |
 | **SW-4** | **真实上游错误映射 + 在飞位释放保证**（协议 §24.2 R4）—— `msvc/main.py:31` `_map_upstream_error` 只认 `FakeUpstream` 的 `_ScenarioError`，`_handle_nonstream`（`main.py:229-247`）与 `_handle_stream`（`main.py:280-311`）**无 catch-all**、`create_app()` 也无全局异常处理器 ⇒ litellm 异常族（`BadRequestError`/`AuthenticationError`/`RateLimitError`/`APIConnectionError`…）**全部逃逸**：① 响应是裸 `500 Internal Server Error`，违反 §7（无 `code`/`retryable`/`Retry-After`）；② `_finish_window()` 未被调用 ⇒ **幂等在飞位永久泄漏**，同 key 后续请求恒 `409`（实测复现，`_inflight` 事后仍含该 key）。**危害**：兼容面键是 `api_key+model+消息体` 指纹 ⇒ 一次上游抖动让 AstrBot/QQ 用户**同一条消息在进程重启前永久发不出**，且 409 带 `retryable:true` 诱使客户端反复重试再吃 409 | 🔴 阻断 | 后端（S3） | ① litellm 异常族按 §7 表映射为带 `code`/`retryable`（+ 上游给值时的 `retry_after_s`）的错误体，429 必须是 `rate_limited` 而非 5xx（否则平台 §11 熔断误计、退避全丢）；② **任何退出路径都释放在飞位**（`try/finally` 或 catch-all，先释放后返回）；③ 用例：注入一个**非 `_ScenarioError`** 的异常 → 断言响应含 §7 错误体 **且** 同 key 第二次请求**不是 409**、`_inflight` 为空（该用例须在 `FakeUpstream` 之外可跑，别再落进同一盲区） |
 | **SW-5** | `_inflight` 加 TTL 兜底（与 SW-4 同批可选）：当前在飞位**无过期机制**，只有 `finish()`/`clear()` 能清 ⇒ 任何"释放漏了"的路径都变成永久拒绝。建议记 `monotonic` 时间戳，超过阈值（如上游总超时 60s）即视为陈旧并放行 | 🟢 | 后端（S3） | 陈旧在飞位不再永久阻断同 key 请求；SW-4 落地后本项为纵深防御，非阻断 |
+
+### 8.1 回执：SW-1…SW-5 **全部验收通过**（2026-10-11 架构师 A，协议 §25.2）
+
+- **交付**：`c5ff7bb`（`provider.py` 真实流式 + `errors.py` 异常族映射 + `main.py` catch-all 与在飞位释放 + `idempotency.py` TTL + `config.py`/`README.md`；新增 `tests/test_real_upstream.py` 24 条）。
+- **基线**：服务侧 **64 passed**（快照内实跑，与回执一致）。
+- **证伪**（改坏各自只打红对应用例）：SW-1 流式改回 `NotImplementedError` → 6 红（全在 `test_real_upstream.py`，契约用例全绿）；SW-4 映射改回裸抛 → 4 红；SW-4 非流式释放摘除 → 8 红（含旧 T7/P1-11）；SW-5 TTL 关掉 → 1 红；SW-2 去 `retry_after_s` → 2 红。
+- **判定**：**成立**。`DESIGN.md §10 ①` 代码侧闭合；剩余生产切换项为 ②–⑦（部署/运维）。
+
+| # | 结论 | commit | 证据 |
+|---|---|---|---|
+| SW-1 | ✅ 闭合 | `c5ff7bb` | `provider.py` 流式逐块转发；`tests/test_real_upstream.py` 走 `LiteLLMProvider` **本体**（非 FakeUpstream）；错误两侧（首字节前 HTTP / 首字节后帧+`[DONE]`）均有用例；证伪 6 红 |
+| SW-2 | ✅ 闭合 | `c5ff7bb` | `ServiceError.to_payload` 有上游值才给 `retry_after_s`；证伪 2 红 |
+| SW-3 | ✅ 闭合 | `c5ff7bb` | `model-service/README.md` 头改 `v1.7-澄清3`、测试清单写 T12 与真上游文件、Provider 节记流式已实现 |
+| SW-4 | ✅ 闭合 | `c5ff7bb` | `_map_upstream_error` 全异常收敛（`from_upstream_exception`）；`create_app` 挂全局 `Exception` handler；`_finish_window` 自带兜底释放；证伪 4 红 + 8 红 |
+| SW-5 | ✅ 闭合 | `c5ff7bb` | `IdempotencyWindow.inflight_ttl_seconds`（默认 60s，`MS_IDEMPOTENCY_INFLIGHT_TTL_SECONDS`）陈旧即放行 + WARNING；证伪 1 红 |

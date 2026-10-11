@@ -296,7 +296,7 @@ chatbot-platform/
 
 单机 Compose 起步，服务：`server`（8000）、`web`（Nginx 托管静态+反代）、`postgres`、`redis`、**`model-service`（仅内网，不暴露公网；compose 尚未落地，属生产切换前置项）**、`napcat`（QQ 协议端）、`astrbot`。
 
-**生产切换清单（模型服务上线前置，v0.3 登记；R1 复核后由六步改七步）**：① **补全真实上游的流式实现与错误映射** —— `msvc/provider.py:LiteLLMProvider.stream()` 现为 `NotImplementedError`，而 native 模式流式是主路径（契约测试只覆盖 `FakeUpstream`，故 40 条全绿照不到），不补则 `LLM_BACKEND=remote` 后流式请求必失败（实测裸 `500`）；**同一盲区还藏着 R4**：`_map_upstream_error` 只认假桩的 `_ScenarioError`、handler 无 catch-all ⇒ 真实上游异常逃逸，既违反协议 §7（无 `code` 的裸 500），又让幂等**在飞位永久泄漏**（同 key 后续恒 `409`，兼容面指纹键 ⇒ 用户同一条消息在进程重启前永久发不出）。补完应以真上游 smoke 用例锁住**成功与错误两条路径**（工作单 SW-1/SW-4，协议 §24.2）。② compose 增补 `model-service` 服务与内网隔离；③ `MODEL_SERVICE_TOKEN` 生成注入双方（≥32 字节随机，不落 git）；④ 平台侧 `LLM_BACKEND=remote` + `MODEL_SERVICE_MODE=native` + `APP_ENV=prod`（mock 生产禁启守卫已实现）；⑤ provider 凭证迁入模型服务、`llm_models.api_key/api_base` 两列废弃迁移（S6 收尾）；⑥ 幂等窗容量按 `max_entries ≥ 峰值RPS×600` 配置（H3 公式，见 model-service/README）；⑦ 前端确认已消费「三」流式错误通告。⚠️ **①未完成前不得切换 `LLM_BACKEND=remote`**。
+**生产切换清单（模型服务上线前置，v0.3 登记；R1 复核后由六步改七步）**：① ✅ **补全真实上游的流式实现与错误映射** —— 已由 `c5ff7bb` 交付、2026-10-11 验收通过（协议 §25.2）：`msvc/provider.py` 流式逐块转发 ＋ `finish_reason`；`errors.from_upstream_exception` 把 litellm 异常族映射为 §7 `code`；handler 加 catch-all ＋ 全局异常处理器；在飞位在 `finally` 释放（SW-1/SW-4）。新增 `tests/test_real_upstream.py` 走 `LiteLLMProvider` **本体**，成功与错误两条路径均有用例。② compose 增补 `model-service` 服务与内网隔离；③ `MODEL_SERVICE_TOKEN` 生成注入双方（≥32 字节随机，不落 git）；④ 平台侧 `LLM_BACKEND=remote` + `MODEL_SERVICE_MODE=native` + `APP_ENV=prod`（mock 生产禁启守卫已实现）；⑤ provider 凭证迁入模型服务、`llm_models.api_key/api_base` 两列废弃迁移（S6 收尾）；⑥ 幂等窗容量按 `max_entries ≥ 峰值RPS×600` 配置（H3 公式，见 model-service/README）；⑦ 前端确认已消费「三」流式错误通告。⚠️ **①代码侧已闭合（`c5ff7bb`）；能否切换仍取决 ②–⑦ 是否全部就绪**（部署/配置/迁移/前端确认）。
 
 小程序/微信侧的现实约束（影响部署而非架构）：
 
@@ -331,7 +331,7 @@ chatbot-platform/
 
 计费后续（尚未做）：**用户侧充值**（余额查询 API 与 Web 展示已上线）、订阅 plan 维度费率、per-user 额度。
 
-未开始（按建议优先级，v0.3 重排）：**① 生产切换**（compose 落地 model-service + 补全真实上游流式与错误映射 + §10 切换清单七步；**契约侧已就绪，部署侧尚缺真实上游的流式与错误映射，见 §10 ①**）→ **② 聊天记录蒸馏流水线**（§13.2 用户核心需求；原「需先接真实 LLM」的阻塞已被模型服务解除）→ ③ M2 机器人接入（AstrBot+NapCat 部署文档）→ ④ 小程序端 → ⑤ M4 剩余（RAG/工具调用）→ ⑥ PostgreSQL 生产切换。
+未开始（按建议优先级，v0.3 重排）：**① 生产切换**（compose 落地 model-service + §10 切换清单；**代码侧①「真实上游流式与错误映射」已闭合 `c5ff7bb`**，余为 ②–⑦ 部署/运维）→ **② 聊天记录蒸馏流水线**（§13.2 用户核心需求；原「需先接真实 LLM」的阻塞已被模型服务解除）→ ③ M2 机器人接入（AstrBot+NapCat 部署文档）→ ④ 小程序端 → ⑤ M4 剩余（RAG/工具调用）→ ⑥ PostgreSQL 生产切换。
 
 ## 12. 风险与对策
 
