@@ -86,6 +86,14 @@ services:
       MS_LITELLM_API_BASE: ${MS_LITELLM_API_BASE:-}
       MS_LITELLM_API_KEY: ${MS_LITELLM_API_KEY:-}
       MS_LITELLM_DEFAULT_MODEL: ${MS_LITELLM_DEFAULT_MODEL:-}
+      # ---- A-1（协议 §26.6-丙）：协议名 ≠ 供应商名，两个都是**部署侧声明** ----
+      # 协议名：交给 litellm 的 `custom_llm_provider`，只在请求里的 model **不带 `/` 前缀**时使用
+      # （带前缀时前缀本身就是 litellm 的 provider 语法，再传会拼成 `openai/deepseek/...`）。
+      MS_LITELLM_PROVIDER: ${MS_LITELLM_PROVIDER:-openai}
+      # 供应商名：进 `x_model_service.provider`，经平台落 `usage_logs.provider` 与供应商统计。
+      # 留空＝未声明 ⇒ 启动只打 WARNING；`MS_UPSTREAM=litellm` 且该值命中
+      # `MS_COMPLIANCE_DENY_PROVIDERS` ⇒ **拒绝启动**（红线5 对真实出口的启动期对账）。
+      MS_UPSTREAM_VENDOR: ${MS_UPSTREAM_VENDOR:-}
     healthcheck:
       # 镜像是 python:3.12-slim，没有 curl；用标准库探活（端点见协议 §2）
       test:
