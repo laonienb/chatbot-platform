@@ -255,3 +255,5 @@
 - 双 API 面不变：`/api/v1`（JWT，有状态）+ `/v1/chat/completions`（API Key，OpenAI 兼容）；SSE 为 OpenAI chunk 格式，`data: [DONE]` 结束。
 - `personas.avatar_url`（512 字符）：前端按「`http(s)://`/`data:image/` 开头 → 图片，其余 → emoji 文本」渲染，清空传 `null`。
 - 错误响应统一 FastAPI `{"detail": "..."}` 格式（**422 例外：`detail` 是数组、字段名在 `loc` 末段，
+  形状与实测见「三」那条 422 通告**——本句由前端按该通告第 3 点的提请补上例外，后端不认可即回退本行）；
+  前端所有请求已带 401 自动刷新重试。
