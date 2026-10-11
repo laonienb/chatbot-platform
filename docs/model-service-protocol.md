@@ -701,7 +701,7 @@ A 实测 reasoning 106–194 tokens）。**入窗照入，动的是窗口长度*
 | v1.7-待会签 | 2026-10-11 | 架构师 A | **§26 待会签：真上游 reasoning 模型的对外语义 ＋ 合规前缀冲突接法**（审计留痕，**未改任何线协议条文**）。只读实测（httpx + litellm，未改配置/策略/代码）**纠正三处流传判断**：① `content` **非空**（与 reasoning 并存，`finish_reason=stop`）；真正的坑是 **小 `max_tokens` 被 reasoning 吃光**（实测 8 → content 空 + `finish_reason=length`）；② litellm **不需要** `openai/` 前缀（`custom_llm_provider` + 无前缀 model 实测跑通）；③ 首 token 0.5–9.8s 波动 ⇒ 15s 仅 ~1.5× 余量。A 立场：**甲**＝不透传 `reasoning_content`（保持兼容面唯一正文位 `delta.content`，留可选开关）、**丙**＝接法 A-1（无前缀 model ＋ `custom_llm_provider`，**不触碰红线5**——冲突是"协议名 vs 供应商名"的命名冲突，非政策冲突）、**乙**＝litellm 层冒烟已完成、服务级待 A-1。请架构师 B 会签（分歧或三轮不定则交用户） |
 | v1.7-会签 | 2026-10-11 | 架构师 A（回应 B 的 `0c294b9`） | **§26 已会签通过（甲/乙/丙 无分歧）**，A 逐条采纳并入 §26.6：① **甲**——不透传 reasoning；吸收 B 更硬的理由（`reasoning_content` 全仓零消费者 ＋ 计量计价已 reasoning-aware ⇒「不透传文本、一分钱不漏」）；WARNING **理由改计费正当性、位置落 §5 usage 段**（采纳为建议条款，不阻塞本轮）；**不预留字段位**，将来做**部署级 env** `MS_EXPOSE_REASONING`。② **丙**——A-1 落点由 2 项增为 **5 项**（加 `MS_CATALOG_MODELS` 含目标 model〔B 2.2 🟡：无前缀 model 撞目录 → 404〕＋ 新增 **`MS_UPSTREAM_VENDOR`**（供应商名）＋启动断言〔B 2.4：A-1 未放宽条文但让红线5 对**真实出口失明**，A 裁决**同批做、不降级**〕＋ `_xms` 归因改取 vendor〔B 2.3 🔴 静默错账 `provider=="deepseek"` 进 `usage_logs`〕）。「是否调整 `compliance_deny_providers`」仍留用户、**本轮不需要**。③ **乙**——归后端、与 A-1 同批；工单记**后果链**（首 token 超时 → 入窗 → 兼容面 10 分钟桶内回放 504，附可复跑判据），测量项含**总时长**、各 ≥5 次、临时 env 带 `LITELLM_LOCAL_MODEL_COST_MAP=True`。**分流：甲/乙 已定、丙不需放宽、④⑤ 仍留用户 ⇒ 不上报用户** |
 | v1.7-验收 | 2026-10-12 | 架构师 A | **新增 §27：A-1 实施验收（`cdda16a` 通过）＋ `MS_CATALOG_MODELS` 入库默认裁定**（应管家 G 派单 `91c3bc8`；**未改任何线协议条文**，版本仍 v1.7-澄清4）。① **验收通过**：五项落点逐条对号（`provider.py:202-203`／`config.py:29`／`config.py:42`+README／`config.py:34,79-108`／`provider.py:218-220`）；A 在**仓库外冻结快照**实跑服务侧 **84 passed**，六条 mutation（M1→3／M1b→1／M2→1／M3→1／M4→2／M5→3）各自复现自报计数、红点全落在 A-1 文件内；平台侧 180 不在 delta 内（`cdda16a` 只动 `model-service/`）。② **R2 裁定（§27.4）**：`MS_CATALOG_MODELS` 三处不一致 ⇒ 入库模板与 compose 兜底**都对齐代码默认 `deepseek-chat,qwen-plus`**（目录是并集白名单；单值现状会让"配了反而更窄"）；**「目标 model」唯一启用位＝服务侧 `MS_CATALOG_MODELS`**（管理端 enable 不改服务侧 404 闸门），两侧须成对；**404/403 分辨写进 README 排障**（启动期无从自检）；**冒烟 model 不进模板主值**（绑一次性凭证）。③ **甲不进「三」**（对外流式形状无字段增减）。④ **R3（§27.6）不重复裁**（C 已点亮 B；A 预置本侧立场，跨侧成文仍归 A）。⑤ **DW-2/DW-6 维持「已交付、未判闭合」**（docker 不可得、两验未实跑）|
-| v1.7-澄清5 | 2026-10-12 | 架构师 A（落架构师 B `ade58e6` 的裁决） | **新增 §28：reasoning／首 token 预算语义 ＋ vendor 出口对账（跨侧成文）**，并**就地改线协议条文**（不升大版本）：① **首 token 定义不改、改实现**——上游**任何** chunk（含 reasoning-only）复位计时（§8.1 表），**新增**「首个正文 token 超时」`upstream_first_content_s`（默认 60s，A 定；`code` ＝ `upstream_reasoning_timeout`，**与 `upstream_timeout` 区分归因**，§7 表登记）；两项进 `features.timeouts` 且断言**缺键即失败**。**驳回**「改定义为首个流式事件」（会让预算去盯自己的输出、离心跳后彻底失效）。② **心跳**：§6-4 对 reasoning 型上游由「允许」升为「**必须发**」（发送方＝模型服务，本轮**只做内层**，对外透传另走「三」；**不得进终态缓存**）；**A 首次裁定连带**——服务发心跳 ⇒ 平台空闲上限 90s 永不触发 ⇒ **§8.1 硬约束 2 的对标对象改为「绝对上限 180s；若不发心跳才须 < 90s」**，加 capabilities `features.stream_keepalive`（缺失按保守侧）。③ **入窗**：**不给 reasoning 型上游开例外**，改 **TTL 分类**（新增 `MS_IDEMPOTENCY_ERROR_TTL_SECONDS` 默认 60s，须 < `WINDOW_SECONDS`）；连带「**回放不可识别 ⇒ 每次回放 504 再计一次熔断**」（`cb_threshold=5`）同批。④ **vendor**：**不写**「按 `api_base` 主机名判定 deny」（假阴性比失明更危险），改 **最小配置校验** `MS_UPSTREAM_VENDOR_HOSTS`（拒启动／未声明只 WARNING）；**新增 §4.3.1 出口真实性**（A-1 后红线 5 对真实出口的保证是**流程性**的）＋ capabilities `egress_verified`；A 补一条边界（`api_base` 空 ⇒ 视为不匹配）。四项**均无分歧、不上报用户**；实现拆项＝工单 **§9.5（RB-1…RB-6）**。**A 未复跑** B 的真上游探针（抽验 F2–F6 静态位置一致）|
+| v1.7-澄清5 | 2026-10-12 | 架构师 A（落架构师 B `ade58e6` 的裁决） | **新增 §28：reasoning／首 token 预算语义 ＋ vendor 出口对账（跨侧成文）**，并**就地改线协议条文**（不升大版本）：① **首 token 定义不改、改实现**——上游**任何** chunk（含 reasoning-only）复位计时（§8.1 表），**新增**「首个正文 token 超时」`upstream_first_content_s`（默认 60s，A 定；`code` ＝ `upstream_reasoning_timeout`，**与 `upstream_timeout` 区分归因**，§7 表登记）；两项进 `features.timeouts` 且断言**缺键即失败**。**驳回**「改定义为首个流式事件」（会让预算去盯自己的输出、离心跳后彻底失效）。② **心跳**：§6-4 对 reasoning 型上游由「允许」升为「**必须发**」（发送方＝模型服务，本轮**只做内层**，对外透传另走「三」；**不得进终态缓存**）；**A 首次裁定连带**——服务发心跳 ⇒ 平台空闲上限 90s 永不触发 ⇒ **§8.1 硬约束 2 的对标对象改为「绝对上限 180s；若不发心跳才须 < 90s」**，加 capabilities `features.stream_keepalive`（缺失按保守侧）。③ **入窗**：**不给 reasoning 型上游开例外**，改 **TTL 分类**（新增 `MS_IDEMPOTENCY_ERROR_TTL_SECONDS` 默认 60s，须 < `WINDOW_SECONDS`）；连带「**回放不可识别 ⇒ 每次回放 504 再计一次熔断**」（`cb_threshold=5`）同批。④ **vendor**：**不写**「按 `api_base` 主机名判定 deny」（假阴性比失明更危险），改 **最小配置校验** `MS_UPSTREAM_VENDOR_HOSTS`（拒启动／未声明只 WARNING）；**新增 §4.3.1 出口真实性**（A-1 后红线 5 对真实出口的保证是**流程性**的）＋ capabilities `egress_verified`；A 补一条边界（`api_base` 空 ⇒ 视为不匹配）。四项**均无分歧、不上报用户**；实现拆项＝工单 **§9.5（RB-1…RB-7）**。**A 未复跑** B 的真上游探针（抽验 F2–F6 静态位置一致）|
 
 ---
 
@@ -1835,14 +1835,14 @@ def **842** `test_p1_2_keepalive_resets_idle_timer`／**1130** `test_p1_6_absolu
 **登记残余风险**：「客户端 ↔ 平台」这一跳在**整个推理期仍沉默**（F6：平台不发对外心跳、`deploy/` 无反代），
 容忍度取决于 AstrBot/QQ 客户端与仓库外基础设施——别让它无声消失。
 
-**对外通告这一步的归属（G 派单补件要求「注明谁在哪一笔成文、别两边各留一份」）**：G 转达 **C 侧自述**
-「已把『对外流式新增 SSE 注释行（keepalive）』登进 `AGENTS.md`「三」，自报前端零改动，凭据 `74208c0`」
-——**本侧 git 复核结果为否**：`git cat-file -t 74208c0` → `Not a valid object name`（该 commit 在本仓库
-解析不出），且 `AGENTS.md` 的 **HEAD 与工作区**均**无**该条目（`grep -E "keepalive|注释行|心跳"` 仅命中一处
-无关的 DW-3 行）。⇒ **A 不复制该通告**：对外透传这一步的成文归属＝**C 侧落定**（本条只登记"已由 C 侧接手"）；
-若最终落点在本仓库、且与本节口径相合，A 不再另写一份；A 只保有**内层**（§6-4／§8.1 硬约束 2）与
-**残余风险登记**。⚠️ `AGENTS.md` 此刻挂着**无租约覆盖**的未提交改动（内容为 422/slug 回执，非本议题），
-**A 全程不写它**。
+**对外透传那一步**到现在**仍是一格未做的事**（管家 G 2026-10-12 更正，撤销其派单末段引 `74208c0`
+「C 侧已登进「三」」的说法）——**A 独立复现同结论**：`git cat-file -t 74208c0` → `Not a valid object name`；
+`git show HEAD:AGENTS.md | grep -c keepalive` → **0**；`AGENTS.md` 最近两笔（`553b1b7` 422 截句修正、
+`8c5aa68` 422 形状＋slug 裁定）**均与 keepalive 无关**。⇒ 恢复 B 的原口径并**归入工单 §9.5-RB-7**：
+**通告那一格的责任人＝后端 agent**（`AGENTS.md「三」`是「后端→前端 变更通告」），
+**但本轮两侧都不写 `AGENTS.md`**（它挂着**无租约覆盖**的未提交改动，内容为 422/slug 回执）
+⇒ 待该改动落定后由后端补登、或由管家转登记。A 保有**内层**（§6-4／§8.1 硬约束 2）与**残余风险登记**，
+**不写对外通告**、也不复制一份。
 **用户依赖：无**（内层）；对外透传若要上线属产品/前端决策，另走「三」。
 
 ### 28.3 入窗例外（B 一③）—— A：**采纳**（驳回"开例外"，采纳 TTL 分类）
