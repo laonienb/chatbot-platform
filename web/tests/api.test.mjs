@@ -223,8 +223,120 @@ describe("SSE 解析：内容收集、宽松忽略、流内错误不静默", () 
   });
 
   test("无 content 的收尾 chunk（usage / finish_reason）不产生增量也不抛", async () => {
+    // 通告 a639446 之后 [DONE] 是唯一收尾信号，故本例必须带上 [DONE]，
+    // 否则它测的就是「截断」而不是「usage chunk 被容忍」了。
     const tail = `data: ${JSON.stringify({ choices: [], usage: { total_tokens: 7 } })}\n\n`;
-    assert.equal(await collect(sse(chunk("只有我"), tail)), "只有我");
+    assert.equal(await collect(sse(chunk("只有我"), tail, "data: [DONE]\n\n")), "只有我");
+  });
+});
+
+/**
+ * AGENTS「三」通告 a639446「流式错误语义上线」的四条前端要求，逐条锁死。
+ * 形状取自通告正文与后端假桩（native_stream / compat_stream）。
+ */
+describe("流式错误语义：retry_after_s、[DONE] 为唯一收尾信号", () => {
+  const errFrame = (body) => `data: ${JSON.stringify(body)}\n\n`;
+  const done = "data: [DONE]\n\n";
+
+  const rejectSSE = async (...frames) => {
+    let text = "";
+    try {
+      await streamSSE(sse(...frames), { onDelta: (t) => (text += t) });
+    } catch (e) {
+      return { e, text };
+    }
+    throw new Error("预期抛错，实际正常返回");
+  };
+
+  test("★ 退避时长改读错误体的 retry_after_s（流式拿不到 Retry-After header）", async () => {
+    const { e, text } = await rejectSSE(
+      chunk("前半"),
+      errFrame({ error: { message: "上游限流", type: "api_error", code: "rate_limited", param: null, retryable: true, retry_after_s: 30 } }),
+      done
+    );
+    assert.equal(e.kind, "rate_limit");
+    assert.equal(e.retryAfter, 30, "retry_after_s 必须转成退避秒数，否则前端无从退避");
+    assert.equal(text, "前半", "已产出的部分内容不能丢掉");
+  });
+
+  test("retry_after_s 缺失时不凭空造退避值（协议：有才给）", async () => {
+    const { e } = await rejectSSE(errFrame({ error: { message: "限流", code: "rate_limited" } }), done);
+    assert.equal(e.kind, "rate_limit");
+    assert.equal(e.retryAfter, undefined);
+  });
+
+  test("retry_after_s 非法值（字符串 / 0 / 负数 / NaN）不当作退避依据", async () => {
+    for (const bad of ["30", 0, -5, Number.NaN]) {
+      const { e } = await rejectSSE(
+        errFrame({ error: { message: "限流", code: "rate_limited", retry_after_s: bad } }),
+        done
+      );
+      assert.equal(e.retryAfter, undefined, `非法值 ${String(bad)} 不应被当成退避秒数`);
+    }
+  });
+
+  test("code 优先仍成立：budget_exhausted 判 quota，且不带退避值（重试无用）", async () => {
+    const { e } = await rejectSSE(
+      errFrame({ error: { message: "预算耗尽", code: "budget_exhausted", retry_after_s: 12 } }),
+      done
+    );
+    assert.equal(e.kind, "quota");
+    assert.equal(e.retryAfter, undefined, "额度/预算语义下不该把 retry_after_s 当退避依据");
+  });
+
+  test("retry_after_s 放在顶层（原生面信封变体）也要认", async () => {
+    const { e } = await rejectSSE(
+      errFrame({ error: { message: "限流", code: "rate_limited" }, retry_after_s: 45 }),
+      done
+    );
+    assert.equal(e.kind, "rate_limit");
+    assert.equal(e.retryAfter, 45);
+  });
+
+  test("★ 没收到 [DONE] 就断连必须报错（旧实现静默 return，用户以为回复正常结束）", async () => {
+    let text = "";
+    await assert.rejects(
+      streamSSE(sse(chunk("半截内容")), { onDelta: (t) => (text += t) }),
+      (e) => {
+        assert.ok(e instanceof ApiError);
+        assert.equal(e.kind, "truncated");
+        return true;
+      }
+    );
+    assert.equal(text, "半截内容", "中断前已产出的内容仍应保留");
+  });
+
+  test("★ 绝对上限中断是合法状态：无 error 帧但有 [DONE] ⇒ 不得当解析失败", async () => {
+    // 协议 §8.1.1：stream_max_duration 不发错误帧，对外仍是「回复中断 + [DONE]」
+    let text = "";
+    await streamSSE(sse(chunk("被上限切断的回复"), done), { onDelta: (t) => (text += t) });
+    assert.equal(text, "被上限切断的回复");
+  });
+
+  test("★ [DONE] 落在没有空行终止的残留缓冲里时，不得误判为截断", async () => {
+    const resp = new Response(
+      new ReadableStream({
+        start(c) {
+          const enc = new TextEncoder();
+          c.enqueue(enc.encode(chunk("完整回复")));
+          c.enqueue(enc.encode("data: [DONE]")); // 服务端未以 \n\n 收尾
+          c.close();
+        },
+      }),
+      { status: 200 }
+    );
+    let text = "";
+    await streamSSE(resp, { onDelta: (t) => (text += t) });
+    assert.equal(text, "完整回复");
+  });
+
+  test("错误帧之后仍带 [DONE] 时，抛的是错误语义而非截断", async () => {
+    const { e } = await rejectSSE(
+      errFrame({ error: { message: "上游炸了", code: "upstream_error" } }),
+      done
+    );
+    assert.equal(e.kind, "service");
+    assert.notEqual(e.kind, "truncated", "收尾完整，问题在错误帧本身");
   });
 });
 

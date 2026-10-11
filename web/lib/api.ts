@@ -32,6 +32,8 @@ export function clearTokens() {
  * - context        上下文超长（413）：需用户裁剪输入，重试无用
  * - forbidden      合规否决（403 compliance_denied）：该模型不可用，重试无用
  * - model_missing  模型不存在（404 model_not_found）：重试无用
+ * - truncated      流未收到 [DONE] 就结束：连接被提前掐断，可重试
+ *                  （注意与「绝对上限中断」区分 —— 后者按协议仍发 [DONE]，不属此类）
  */
 export type ApiErrorKind =
   | "balance"
@@ -40,7 +42,8 @@ export type ApiErrorKind =
   | "service"
   | "context"
   | "forbidden"
-  | "model_missing";
+  | "model_missing"
+  | "truncated";
 
 export class ApiError extends Error {
   status: number;
@@ -70,7 +73,10 @@ export class ApiError extends Error {
  * - 兼容面：`{"error": {"message": "...", "code": "rate_limited"}}`
  * 错误体本身可能就是流式里的帧，这里只负责已解析的 JSON 对象。
  */
-function readErrorBody(body: unknown, fallback: string): { message: string; code?: string } {
+function readErrorBody(
+  body: unknown,
+  fallback: string
+): { message: string; code?: string; retryAfterS?: number } {
   if (!body || typeof body !== "object") return { message: fallback };
   const b = body as Record<string, unknown>;
   const err = b.error as Record<string, unknown> | undefined;
@@ -86,7 +92,14 @@ function readErrorBody(body: unknown, fallback: string): { message: string; code
     (typeof err?.code === "string" && err.code) ||
     (typeof b.code === "string" && b.code) ||
     undefined;
-  return { message, code };
+  // 流式路径拿不到 Retry-After header（响应头在错误发生前就发完了），退避时长
+  // 只能读错误体的 retry_after_s（协议 v1.7-澄清2 的加法字段，有才给）。
+  const rawRetry = err?.retry_after_s ?? b.retry_after_s;
+  const retryAfterS =
+    typeof rawRetry === "number" && Number.isFinite(rawRetry) && rawRetry > 0
+      ? Math.round(rawRetry)
+      : undefined;
+  return { message, code, retryAfterS };
 }
 
 /**
@@ -196,14 +209,21 @@ export async function api<T = unknown>(path: string, init: RequestInit = {}, ret
   return resp.json();
 }
 
-/** 解析 SSE 流（OpenAI chunk 格式），逐个产出 content 增量；[DONE] 结束。
+/** 解析 SSE 流（OpenAI chunk 格式），逐个产出 content 增量；`[DONE]` 是唯一正常收尾信号。
  *
  * 宽松解析（协议 §6）：`: keepalive` 注释行与未知命名事件一律忽略——
  * 本实现只认 `data: ` 行，天然满足（模型服务协议会发 `event: model_service`
  * 终止事件与心跳注释，都不应被当成内容或错误）。
  *
- * 流内错误：兼容面在流中途会发 `data: {"error": {...}}`（HTTP 已是 200，
- * 无法再改状态码）。此时必须抛出，否则错误被静默吞掉、用户只看到空回复。
+ * 流内错误（协议 §6.7，AGENTS「三」a639446）：两面在流中途都会发
+ * `data: {"error": {...}}`（HTTP 已是 200，无法再改状态码），其后必随 `[DONE]`。
+ * 此时必须抛出，否则错误被静默吞掉、用户只看到空回复；抛出时已产出的部分内容
+ * 保留在调用方状态里（并由服务端结算落库）。退避时长只能从错误体的
+ * `retry_after_s` 读 —— 响应头早在错误发生前就发完了。
+ *
+ * 截断判定以「有没有 `[DONE]`」为准，不以「最后一个 chunk 是不是 content」为准：
+ * 绝对上限（§8.1.1 stream_max_duration）按协议**不发**错误帧，只给"中断内容 +
+ * `[DONE]`"，那是合法收尾，不能当解析失败。
  */
 export async function streamSSE(
   resp: Response,
@@ -212,6 +232,31 @@ export async function streamSSE(
   const reader = resp.body!.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+
+  /** 处理一个 SSE 帧；返回 true 表示收到 `[DONE]`（正常收尾）。 */
+  const handleFrame = (frame: string): boolean => {
+    const line = frame.trim();
+    if (!line.startsWith("data: ")) return false;
+    const payload = line.slice(6);
+    if (payload === "[DONE]") return true;
+    let obj: unknown;
+    try {
+      obj = JSON.parse(payload);
+    } catch {
+      return false; // 跳过无法解析的帧
+    }
+    const body = obj as Record<string, unknown> | null;
+    if (body && typeof body === "object" && body.error) {
+      const { message, code, retryAfterS } = readErrorBody(body, "生成失败");
+      // 流已开始，HTTP 状态无从更改：以 200 传入，判读主要由 code 决定
+      throw classify(resp.status, code, retryAfterS, message);
+    }
+    const content = (body?.choices as { delta?: { content?: unknown } }[] | undefined)?.[0]?.delta
+      ?.content;
+    if (typeof content === "string" && content) opts.onDelta(content);
+    return false;
+  };
+
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -219,27 +264,14 @@ export async function streamSSE(
     const frames = buffer.split("\n\n");
     buffer = frames.pop() ?? "";
     for (const frame of frames) {
-      const line = frame.trim();
-      if (!line.startsWith("data: ")) continue;
-      const payload = line.slice(6);
-      if (payload === "[DONE]") return;
-      let obj: unknown;
-      try {
-        obj = JSON.parse(payload);
-      } catch {
-        continue; // 跳过无法解析的帧
-      }
-      const body = obj as Record<string, unknown> | null;
-      if (body && typeof body === "object" && body.error) {
-        const { message, code } = readErrorBody(body, "生成失败");
-        // 流已开始，HTTP 状态无从更改：以 200 传入，判读主要由 code 决定
-        throw classify(resp.status, code, undefined, message);
-      }
-      const content = (body?.choices as { delta?: { content?: unknown } }[] | undefined)?.[0]?.delta
-        ?.content;
-      if (typeof content === "string" && content) opts.onDelta(content);
+      if (handleFrame(frame)) return;
     }
   }
+  // 连接已关闭：末尾可能残留没有 `\n\n` 终止的帧（`[DONE]` 恰好落在其中时，
+  // 不处理它会把正常收尾误判成截断），先冲掉解码器再收尾解析一次。
+  buffer += decoder.decode();
+  if (handleFrame(buffer)) return;
+  throw new ApiError(resp.status, "回复被中断（连接提前结束），请重试", { kind: "truncated" });
 }
 
 // ---------- 类型 ----------
