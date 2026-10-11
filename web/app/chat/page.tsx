@@ -6,8 +6,11 @@ import Link from "next/link";
 import { createPortal } from "react-dom";
 import Markdown from "@/components/Markdown";
 import {
+  ApiError,
   clearTokens,
   getAccessToken,
+  PERSONA_SLUG_PATTERN,
+  PERSONA_SLUG_RULE,
   platformApi,
   regenerateStream,
   sendMessageStream,
@@ -739,12 +742,21 @@ function PersonaForm({
   const [visibility, setVisibility] = useState(persona?.visibility ?? "private");
   const [avatar, setAvatar] = useState(persona?.avatar_url ?? "");
   const [error, setError] = useState<string | null>(null);
+  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
+
+  // 与后端同一条 pattern（api.ts 里那份），别等提交吃了 422 才知道规则
+  const slugIssue = slug.trim() && !PERSONA_SLUG_PATTERN.test(slug.trim()) ? `slug ${PERSONA_SLUG_RULE}` : null;
+  const missing = [!name.trim() && "名称", !systemPrompt.trim() && "System Prompt"].filter(Boolean) as string[];
+  const guard = missing.length ? `还需填写：${missing.join("、")}` : slugIssue;
+  // 表单里没有对应输入框的字段（如 avatar_url / tags）不能悄悄丢掉，仍要在整表级显示
+  const inlineFields = new Set(["name", "slug", "system_prompt"]);
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     setBusy(true);
     setError(null);
+    setFieldErrors({});
     try {
       const tagList = tags
         .split(/[,，\s]+/)
@@ -766,7 +778,17 @@ function PersonaForm({
         : await platformApi.createPersona({ ...body, slug: slug || undefined });
       onSaved(saved, !isEdit);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "保存失败");
+      // 422 的字段级原因落到各自输入框；其余（余额/限流/服务忙）仍走整表单级提示
+      const fields = err instanceof ApiError ? err.fieldErrors : undefined;
+      if (fields && Object.keys(fields).length) {
+        setFieldErrors(fields);
+        const orphan = Object.entries(fields)
+          .filter(([f]) => !inlineFields.has(f))
+          .map(([, text]) => text);
+        setError(orphan.length ? orphan.join("；") : null);
+      } else {
+        setError(err instanceof Error ? err.message : "保存失败");
+      }
     } finally {
       setBusy(false);
     }
@@ -810,12 +832,28 @@ function PersonaForm({
         </div>
         <label>
           名称 *
-          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="如：李白" required />
+          <input
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="如：李白"
+            aria-invalid={Boolean(fieldErrors.name)}
+            required
+          />
+          {fieldErrors.name && <p className="field-error">{fieldErrors.name}</p>}
         </label>
         {!isEdit && (
           <label>
             slug（可选，用于 model=&quot;persona:slug&quot;，留空自动生成）
-            <input value={slug} onChange={(e) => setSlug(e.target.value)} placeholder="libai" />
+            <input
+              value={slug}
+              onChange={(e) => setSlug(e.target.value)}
+              placeholder="libai"
+              aria-invalid={Boolean(slugIssue || fieldErrors.slug)}
+            />
+            <p className="hint">{`留空自动生成。规则：${PERSONA_SLUG_RULE}`}</p>
+            {(slugIssue || fieldErrors.slug) && (
+              <p className="field-error">{fieldErrors.slug ?? slugIssue}</p>
+            )}
           </label>
         )}
         <label>
@@ -825,8 +863,10 @@ function PersonaForm({
             onChange={(e) => setSystemPrompt(e.target.value)}
             placeholder="你是诗仙李白，说话豪放洒脱…"
             rows={4}
+            aria-invalid={Boolean(fieldErrors.system_prompt)}
             required
           />
+          {fieldErrors.system_prompt && <p className="field-error">{fieldErrors.system_prompt}</p>}
         </label>
         <label>
           开场白（可选）
@@ -872,6 +912,7 @@ function PersonaForm({
           </label>
         </div>
         {error && <p className="auth-error">{error}</p>}
+        {guard && <p className="hint">{guard}</p>}
         <div className="modal-actions">
           {isEdit && (
             <button type="button" className="danger" onClick={remove}>
@@ -882,7 +923,7 @@ function PersonaForm({
           <button type="button" onClick={onClose}>
             取消
           </button>
-          <button type="submit" className="primary" disabled={busy || !name || !systemPrompt}>
+          <button type="submit" className="primary" disabled={busy || Boolean(guard)}>
             {busy ? "保存中…" : isEdit ? "保存" : "创建并开始对话"}
           </button>
         </div>

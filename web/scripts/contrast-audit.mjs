@@ -464,7 +464,7 @@ const HARNESS = () => {
       <div class="emoji-grid"><button type="button" class="emoji-opt">🐱</button><button type="button" class="emoji-opt picked">🦊</button></div>
     </div>
   </div>
-  <div class="field-row"><label>名称<input type="text" value="产品经理助理"></label><label>可见性<div class="select-trigger"><span class="select-trigger-label">公开（发布到人设市场）</span></div></label></div>
+  <div class="field-row"><label>名称<input type="text" value="产品经理助理"><p class="field-error">名称不能为空</p></label><label>slug（可选）<input type="text" value="MyBot"><p class="hint">留空自动生成。规则：只能用小写字母、数字和连字符，长度 3–64，且不能以连字符开头或结尾</p><p class="field-error">slug 只能用小写字母、数字和连字符，长度 3–64，且不能以连字符开头或结尾</p></label><label>可见性<div class="select-trigger"><span class="select-trigger-label">公开（发布到人设市场）</span></div></label></div>
   <label class="check-row"><input type="checkbox" checked><span>同步展示到人设市场</span></label>
   <p class="saved-hint">已保存 ✓</p>
   <div class="modal-actions"><button type="button" class="danger">删除</button><span class="spacer"></span><button type="button">取消</button><button class="primary" type="submit">保存</button></div>

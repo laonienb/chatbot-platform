@@ -52,33 +52,146 @@ export class ApiError extends Error {
   retryAfter?: number;
   /** 平台 / 模型服务的机器可判语义码（协议 §7），无则为 undefined */
   code?: string;
+  /**
+   * 仅 422：后端字段级校验原因，键是后端字段名（`loc` 末段）、值是人话。
+   * 表单据此把错误落到具体输入框，而不是只甩一句「请求失败 (422)」。
+   */
+  fieldErrors?: Record<string, string>;
   constructor(
     status: number,
     message: string,
-    opts?: { kind?: ApiErrorKind; retryAfter?: number; code?: string }
+    opts?: {
+      kind?: ApiErrorKind;
+      retryAfter?: number;
+      code?: string;
+      fieldErrors?: Record<string, string>;
+    }
   ) {
     super(message);
     this.status = status;
     this.kind = opts?.kind;
     this.retryAfter = opts?.retryAfter;
     this.code = opts?.code;
+    this.fieldErrors = opts?.fieldErrors;
   }
+}
+
+/** 后端 slug 校验用的就是这条 pattern：3–64 位，首尾须是字母或数字，中间可带连字符。 */
+export const PERSONA_SLUG_PATTERN = /^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$/;
+export const PERSONA_SLUG_RULE =
+  "只能用小写字母、数字和连字符，长度 3–64，且不能以连字符开头或结尾";
+
+/** 后端字段名 → 界面用语；认不出来的直接回退字段名本身，不编标签。 */
+const FIELD_LABELS: Record<string, string> = {
+  name: "名称",
+  slug: "slug",
+  system_prompt: "System Prompt",
+  opening_message: "开场白",
+  model: "底层模型",
+  temperature: "温度",
+  tags: "标签",
+  visibility: "可见性",
+  avatar_url: "头像",
+  content: "消息内容",
+  persona_id: "人设",
+  conversation_id: "会话",
+};
+
+const labelOf = (field: string) => FIELD_LABELS[field] ?? field;
+
+/**
+ * FastAPI 校验错误的单项 → 人话。
+ * `loc` 形如 `["body","name"]`，**最后一段才是字段名**（前面是位置，不是字段）。
+ * 只认 pydantic 那几种稳定的 `type`，认不出的退回后端原话并保留字段名——
+ * 宁可给一句带字段名的英文，也不能把字段丢了。
+ */
+function describeValidation(item: Record<string, unknown>): { field: string; text: string } {
+  const loc = Array.isArray(item.loc) ? item.loc : [];
+  const field = typeof loc[loc.length - 1] === "string" ? (loc[loc.length - 1] as string) : "";
+  const label = field ? labelOf(field) : "输入";
+  const ctx = (item.ctx && typeof item.ctx === "object" ? item.ctx : {}) as Record<string, unknown>;
+  const bound = (v: unknown) =>
+    typeof v === "number" && Number.isFinite(v) ? String(Math.round(v * 1000) / 1000) : undefined;
+  const raw = typeof item.msg === "string" ? item.msg : "格式不正确";
+
+  switch (item.type) {
+    case "missing":
+      return { field, text: `${label}不能为空` };
+    case "string_too_short": {
+      const min = Number(ctx.min_length);
+      return {
+        field,
+        text: min > 1 ? `${label}至少 ${min} 个字符` : `${label}不能为空`,
+      };
+    }
+    case "string_too_long": {
+      const max = Number(ctx.max_length);
+      return {
+        field,
+        text: Number.isFinite(max) ? `${label}最多 ${max} 个字符` : `${label}内容过长`,
+      };
+    }
+    case "string_pattern_mismatch":
+      return {
+        field,
+        text: field === "slug" ? `slug ${PERSONA_SLUG_RULE}` : `${label}格式不正确：${raw}`,
+      };
+    case "greater_than":
+    case "greater_than_equal":
+    case "less_than":
+    case "less_than_equal": {
+      const type = item.type as string;
+      const key = { greater_than: "gt", greater_than_equal: "ge", less_than: "lt", less_than_equal: "le" }[
+        type
+      ] as string | undefined;
+      const v = bound(ctx[key ?? ""]);
+      if (v === undefined) return { field, text: `${label}超出允许范围` };
+      const word = (type.startsWith("greater") ? "大于" : "小于") + (type.endsWith("_equal") ? "或等于" : "");
+      return { field, text: `${label}需${word} ${v}` };
+    }
+    default:
+      return { field, text: `${label}：${raw}` };
+  }
+}
+
+/** 422 的 detail 数组 → 人话文案 + 按字段归并的错误表。 */
+function readValidationDetail(items: unknown[]): { message: string; fieldErrors: Record<string, string> } {
+  const described = items
+    .filter((i): i is Record<string, unknown> => Boolean(i) && typeof i === "object")
+    .map(describeValidation);
+  const fieldErrors: Record<string, string> = {};
+  for (const d of described) if (d.field && !(d.field in fieldErrors)) fieldErrors[d.field] = d.text;
+  const MAX_SHOWN = 3;
+  const head = described.slice(0, MAX_SHOWN).map((d) => d.text);
+  const rest = described.length - head.length;
+  const message = described.length
+    ? head.join("；") + (rest > 0 ? `；另有 ${rest} 处不符合要求` : "")
+    : "提交的内容不符合要求";
+  return { message, fieldErrors };
 }
 
 /**
  * 从响应体取「可展示文案 + 机器可判 code」。
  *
- * 两种面形状都要认（已核实后端实现，非猜测）：
+ * 三种面形状都要认（已核实后端实现，非猜测）：
  * - 原生面：`{"detail": "...", "code": "rate_limited"}`
  * - 兼容面：`{"error": {"message": "...", "code": "rate_limited"}}`
+ * - 校验面（422）：`{"detail": [{"loc": ["body", "name"], "msg": ..., "type": ...}]}`
+ *   ⇒ 额外产出 `fieldErrors`，供表单落到具体输入框。
  * 错误体本身可能就是流式里的帧，这里只负责已解析的 JSON 对象。
  */
 function readErrorBody(
   body: unknown,
   fallback: string
-): { message: string; code?: string; retryAfterS?: number } {
+): { message: string; code?: string; retryAfterS?: number; fieldErrors?: Record<string, string> } {
   if (!body || typeof body !== "object") return { message: fallback };
   const b = body as Record<string, unknown>;
+  // FastAPI 的 422 把字段级原因放在 **数组** 里（`{"detail":[{"loc":[…,"name"],…}]}`）；
+  // 旧实现只认字符串 detail，于是整条链落到兜底文案，用户只看到「请求失败 (422)」四个字。
+  if (Array.isArray(b.detail)) {
+    const { message, fieldErrors } = readValidationDetail(b.detail);
+    return { message, fieldErrors };
+  }
   const err = b.error as Record<string, unknown> | undefined;
   // 兼容面把文案放在 error.message；原生面在顶层 detail
   const message =
@@ -115,10 +228,11 @@ function classify(
   status: number,
   code: string | undefined,
   retryAfter: number | undefined,
-  message: string
+  message: string,
+  fieldErrors?: Record<string, string>
 ): ApiError {
   const withKind = (kind: ApiErrorKind, text: string, extra?: { retryAfter?: number }) =>
-    new ApiError(status, text, { kind, code, ...extra });
+    new ApiError(status, text, { kind, code, fieldErrors, ...extra });
 
   switch (code) {
     case "rate_limited":
@@ -151,7 +265,7 @@ function classify(
   if (status === 413) return withKind("context", "对话上下文过长，请精简后重试（或开新会话）");
   if (status === 403) return withKind("forbidden", "该模型当前不可用，请更换模型");
   if (status === 404) return withKind("model_missing", "模型不存在或已下线，请刷新模型列表");
-  return new ApiError(status, message, { code });
+  return new ApiError(status, message, { code, fieldErrors });
 }
 
 /**
@@ -162,15 +276,16 @@ function classify(
 async function interpretError(resp: Response): Promise<ApiError> {
   let message = `请求失败 (${resp.status})`;
   let code: string | undefined;
+  let fieldErrors: Record<string, string> | undefined;
   try {
-    ({ message, code } = readErrorBody(await resp.json(), message));
+    ({ message, code, fieldErrors } = readErrorBody(await resp.json(), message));
   } catch {
     /* 非 JSON 响应体：保留兜底文案 */
   }
   const ra = resp.headers.get("Retry-After");
   const secs = ra !== null ? Number(ra) : NaN;
   const retryAfter = Number.isFinite(secs) && secs > 0 ? Math.round(secs) : undefined;
-  return classify(resp.status, code, retryAfter, message);
+  return classify(resp.status, code, retryAfter, message, fieldErrors);
 }
 
 async function refreshTokens(): Promise<boolean> {

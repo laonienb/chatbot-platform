@@ -175,6 +175,171 @@ describe("错误判读：code 优先，缺失才回退状态码 + Retry-After", 
   });
 });
 
+/**
+ * 422 的字段级原因。载荷形状逐字取自本机实测（AGENTS.md「三」那条 422 通告，
+ * 直打后端 POST /api/v1/personas 拿到的响应体），不是按 pydantic 文档拟的。
+ */
+const SLUG_PATTERN = "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$";
+const tooShort = (field) => ({
+  type: "string_too_short",
+  loc: ["body", field],
+  msg: "String should have at least 1 character",
+  input: "",
+  ctx: { min_length: 1 },
+});
+const badSlug = (input) => ({
+  type: "string_pattern_mismatch",
+  loc: ["body", "slug"],
+  msg: `String should match pattern '${SLUG_PATTERN}'`,
+  input,
+  ctx: { pattern: SLUG_PATTERN },
+});
+const v422 = (...items) => json(422, { detail: items });
+const createPersona = () =>
+  captureError("/api/v1/personas", { method: "POST", body: JSON.stringify({ name: "x" }) });
+
+describe("422 校验错误：字段级原因要翻成人话并指明字段（派单 C-dispatch-persona-422-ux）", () => {
+  test("★ 名称留空：不再是「请求失败 (422)」，而是「名称不能为空」并落到 name 字段", async () => {
+    stubFetch(v422(tooShort("name")));
+    const e = await createPersona();
+    assert.equal(e.message, "名称不能为空");
+    assert.deepEqual(e.fieldErrors, { name: "名称不能为空" });
+    assert.equal(e.status, 422);
+    assert.equal(e.kind, undefined, "422 不该被塞进既有的语义 kind 里");
+  });
+
+  test("★ System Prompt 留空：指明字段", async () => {
+    stubFetch(v422(tooShort("system_prompt")));
+    const e = await createPersona();
+    assert.match(e.message, /System Prompt/);
+    assert.match(e.message, /不能为空/);
+    assert.ok("system_prompt" in e.fieldErrors);
+  });
+
+  for (const bad of ["a", "ab", "MyBot", "-ab", "李白"]) {
+    test(`★ slug「${bad}」不合规则：说清规则而不是丢一句请求失败`, async () => {
+      stubFetch(v422(badSlug(bad)));
+      const e = await createPersona();
+      assert.match(e.message, /slug/);
+      assert.match(e.message, /3–64/);
+      assert.match(e.message, /小写字母/);
+      assert.ok(!/请求失败/.test(e.message), "不得退回兜底文案");
+      assert.deepEqual(Object.keys(e.fieldErrors), ["slug"]);
+    });
+  }
+
+  test("多个字段同时报错：每条都进文案，字段表按字段归并", async () => {
+    stubFetch(v422(tooShort("name"), badSlug("My Bot"), tooShort("system_prompt")));
+    const e = await createPersona();
+    assert.deepEqual(Object.keys(e.fieldErrors), ["name", "slug", "system_prompt"]);
+    assert.match(e.message, /名称不能为空/);
+    assert.match(e.message, /slug/);
+    assert.match(e.message, /System Prompt/);
+  });
+
+  test("字段整体缺失（type=missing，无 ctx）也说得出字段名", async () => {
+    stubFetch(
+      v422({
+        type: "missing",
+        loc: ["body", "name"],
+        msg: "Field required",
+        input: { system_prompt: "x" },
+      })
+    );
+    const e = await createPersona();
+    assert.equal(e.message, "名称不能为空");
+  });
+
+  test("数值越界（temperature=9）翻成范围话术", async () => {
+    stubFetch(
+      v422({
+        type: "less_than_equal",
+        loc: ["body", "temperature"],
+        msg: "Input should be less than or equal to 2",
+        input: 9,
+        ctx: { le: 2.0 },
+      })
+    );
+    const e = await createPersona();
+    assert.equal(e.message, "温度需小于或等于 2");
+  });
+
+  test("认不出的 type：保留字段名 + 后端原话，不崩也不空", async () => {
+    stubFetch(
+      v422({ type: "extra_forbidden", loc: ["body", "is_admin"], msg: "Extra inputs are not permitted", input: true })
+    );
+    const e = await createPersona();
+    assert.equal(e.message, "is_admin：Extra inputs are not permitted");
+    assert.deepEqual(e.fieldErrors, { is_admin: "is_admin：Extra inputs are not permitted" });
+  });
+
+  test("★ loc 末段才是字段名：query/path 参数与嵌套（body→字段）都不把 \"body\" 当字段", async () => {
+    stubFetch(
+      v422(
+        { type: "int_parsing", loc: ["path", "persona_id"], msg: "Input should be a valid integer", input: "abc" },
+        { type: "missing", loc: ["query", "days"], msg: "Field required" }
+      )
+    );
+    const e = await captureError("/api/v1/personas/abc");
+    assert.deepEqual(Object.keys(e.fieldErrors), ["persona_id", "days"]);
+    assert.ok(!/"?body"?/.test(e.message), "文案里不该出现 body 这种位置名");
+  });
+
+  test("★ 不把 input 回显给用户：弱密码被拒时不得把刚敲的密码印到界面（「三」422 通告第 3 点）", async () => {
+    stubFetch(
+      json(422, {
+        detail: [
+          {
+            type: "string_too_short",
+            loc: ["body", "password"],
+            msg: "String should have at least 8 characters",
+            input: "123",
+            ctx: { min_length: 8 },
+          },
+        ],
+      })
+    );
+    const e = await captureError("/api/v1/auth/register", { method: "POST" });
+    assert.equal(e.message, "password至少 8 个字符");
+    assert.ok(!e.message.includes("123"), "用户刚敲的密码不得出现在文案里");
+    assert.ok(!JSON.stringify(e.fieldErrors).includes("123"));
+  });
+
+  test("detail 仍是字符串的 422（如 body 解析失败）：原样展示，不套数组逻辑", async () => {
+    stubFetch(json(422, { detail: "There was an error parsing the body" }));
+    const e = await createPersona();
+    assert.equal(e.message, "There was an error parsing the body");
+    assert.equal(e.fieldErrors, undefined);
+  });
+
+  test("非 422 路径不变：code 优先 + Retry-After header 仍照旧，且不带字段表", async () => {
+    stubFetch(
+      json(429, { error: { message: "上游限流", code: "rate_limited" } }, { "Retry-After": "30" })
+    );
+    const e = await captureError("/api/v1/personas", { method: "POST" });
+    assert.equal(e.kind, "rate_limit");
+    assert.equal(e.retryAfter, 30);
+    assert.equal(e.message, "操作过于频繁，请 30 秒后再试");
+    assert.equal(e.fieldErrors, undefined);
+  });
+
+  test("非 422 路径不变：开流前的 429 仍只认 header（body 里的 retry_after_s 是流式那条路）", async () => {
+    stubFetch(json(429, { error: { message: "上游限流", code: "rate_limited", retry_after_s: 30 } }));
+    const e = await captureError("/api/v1/personas", { method: "POST" });
+    assert.equal(e.kind, "rate_limit");
+    assert.equal(e.retryAfter, undefined, "本轮只修 422，不许顺手改非 422 的退避来源");
+    assert.equal(e.message, "操作过于频繁，请稍后再试");
+  });
+
+  test("非 422 路径不变：503 仍是服务繁忙文案", async () => {
+    stubFetch(json(503, { detail: "模型服务暂不可用", code: "service_unavailable" }));
+    const e = await captureError("/api/v1/personas");
+    assert.equal(e.kind, "service");
+    assert.equal(e.message, "服务繁忙，请稍后重试");
+    assert.equal(e.fieldErrors, undefined);
+  });
+});
+
 describe("SSE 解析：内容收集、宽松忽略、流内错误不静默", () => {
   const collect = async (resp) => {
     let text = "";

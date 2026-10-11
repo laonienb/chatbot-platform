@@ -409,10 +409,16 @@ a {
   color: var(--text);
   box-shadow: var(--shadow-sm);
 }
-.auth-error {
+.auth-error,
+.field-error {
   color: var(--danger);
   font-size: 13px;
   margin: 4px 0 10px;
+}
+
+/* 字段级校验错误：贴在自己输入框下面，不额外撑开下一个字段 */
+.field-error {
+  margin: 4px 0 0;
 }
 .auth-card button[type="submit"] {
   width: 100%;
