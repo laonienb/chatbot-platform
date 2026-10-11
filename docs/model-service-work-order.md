@@ -290,6 +290,7 @@ P2-1 / P2-2（协议已就绪，可并行）
 | v1.12 | 2026-10-11 | 架构师 A | **更正 §9 DW-2 / DW-6 状态列**（响应管家 G 的防重做单 `harness/proposals/G-dispatch-fix-dw2-dw6-status.md`，租约 `harness/bridge/leases/G/DW-status-fix.docs.json`）：两项**已交付**（`d969a1e`；看板 `2055e56`；README 自纠 `dcc8862`），而原状态列停留在 `8f32ce3` 之前的「待中继」⇒ **按 §9 表取活者会重做**，两侧已因此碰撞一次（六分钟互不可见）。改为「✅ 已交付 ｜⚠️ 未判闭合」并新增 **§9.1 回执**：docker 两条验收**未实跑**（本机复核 `docker: command not found`），补验需装了 docker 的机器，**判闭合归架构师 A**。归属：两侧共用同一 git 账号 ⇒ 提交身份不作凭据，只记「已交付」不判「谁写的」。DW-3/DW-4/DW-5 未开工不变 |
 | v1.13 | 2026-10-11 | 架构师 A | **新增 §9.2：真上游（xiaomimimo）实测 + DW-5 前置决策**（用户提供一次性调试凭证；**api_key 不入库/不入总线**）。只读 httpx 探针实测纠正了三处：<br>① **坑1 前提不成立**——无 `max_tokens` 时 `content` **非空**（非流式 50 字符 + reasoning 52 字符；流式亦然，`finish_reason=stop`）；真正的坑是**小 `max_tokens`（实测 8）被 reasoning 吃光 ⇒ content 空 + `finish_reason=length`**。故决策从「要不要透传 reasoning」收窄为「**给 reasoning 留足预算**」+「是否透传 `reasoning_content`」。<br>② **坑3 数值成立**——首 token **0.5 / 4.5 / 9.8s**（非流式 1.3–2.2s），默认 15s 仅 ~1.5× 余量 ⇒ 冒烟临时放大、别改默认值。<br>③ **坑2 静态证实**——`_check_compliance`（`main.py:139`）按 `model.split("/")[0]` 撞 `deny=openai,anthropic`，而 litellm 打 OpenAI 兼容端点需 `openai/` 前缀 ⇒ 会被自家红线5 403。<br>三项决策（provider 命名/deny、reasoning 对外语义、env 落位）**均标用户定**；DW-5 验收标准据此细化；冒烟**当前不可执行**（受决策①阻塞 + A 跨会话派发被 harness 拒），需用户直启轮或 G/用户转发 |
 | v1.14 | 2026-10-11 | 架构师 A | **新增 §9.3：甲/乙/丙按用户新规则分流 + A 立场**（立场与给 B 的问题同时写入协议 §26，本地 git 即广播）。并用 **litellm 直连探针**把服务级冒烟的可行性钉死：`custom_llm_provider="openai"` ＋ **无前缀 model** ＋ `api_base` **实测跑通**（`finish_reason=stop`、content 29 字符 ＋ reasoning 49 字符、首 token 0.86s）⇒ ① litellm **不需要** `openai/` 前缀；② 甲的"content 恒空"前提不成立（只有小 `max_tokens` 被 reasoning 吃光才空）；③ 丙的不碰红线接法 **A-1** 可行（请求 model 无前缀 ⇒ `_check_compliance` 不命中 deny）。乙**不需用户裁决**；丙的"放宽"降为最后一张牌 |
+| v1.15 | 2026-10-11 | 架构师 A | **B 会签通过（`0c294b9`）后把 §9.3 改写为「A-1 落点 5 项 + 冒烟规格」**（协议 §26.6 同步落盘）：A-1 落点由 2 项增为 **5 项**——加 B 的 2.2 🟡（`MS_CATALOG_MODELS` 含目标 model，否则无前缀 model 撞 `main.py:174-178` 目录校验 → **404**）、2.3 🔴（`_xms` 无前缀回落 `litellm_default_model` 前缀 ⇒ `provider=="deepseek"` **静默错账进 `usage_logs`**）、2.4（新增 **`MS_UPSTREAM_VENDOR`** ＋启动断言；**A 裁决同批做** —— A-1 未放宽条文但**让红线5 对真实出口失明**，可复现判据已写）。冒烟规格按 B 3.3 写死（测量项含**总时长**、各 ≥5 次、临时 env 带 `LITELLM_LOCAL_MODEL_COST_MAP=True`；工单记**后果链**"超时→入窗→10 分钟桶内回放 504"而非"1.5× 余量"）。甲-b 的 WARNING 落 §5 usage 段（建议条款，不阻塞）；甲-c 不预留字段位、将来做部署级 env |
 
 ---
 
@@ -326,7 +327,7 @@ P2-1 / P2-2（协议已就绪，可并行）
 
 ---
 
-## 9. 生产切换清单 ②–⑦ 工作项（v1.11 登记 / v1.12 状态列 / v1.13 真上游实测，部署侧）
+## 9. 生产切换清单 ②–⑦ 工作项（v1.11 登记 / v1.12 状态列 / v1.13–v1.15 真上游与 A-1，部署侧）
 
 > 依据：`DESIGN.md §10` 生产切换清单 ②–⑦（① 的**代码侧**已由 `c5ff7bb` 闭合，协议 §25.2）。**真源 = 本节**；
 > `AGENTS.md §一` 只镜像活队列。**责任人一律「后端 agent」**；其中 **DW-3 / DW-4 / DW-5 含用户决策项**，
@@ -375,13 +376,27 @@ P2-1 / P2-2（协议已就绪，可并行）
 
 **冒烟（待决策①后）**：需在**有网络**处跑一次真上游冒烟（**只用临时 env、不改默认配置**），把首 token 延迟与 content/reasoning 形态写进本单回执。**当前不可执行**：① 受决策①（合规 provider 命名）阻塞；② 架构师 A 的跨会话派发被 harness 拒（见 §9 派发段）⇒ 需在**用户直启**的轮里派，或由 G/用户发。若走 `custom_llm_provider` 代码路线，涉及路径 `model-service/msvc/provider.py`。
 
-### 9.3 甲/乙/丙 定案进程与 A 的立场（2026-10-11 · 协议 §26）
+### 9.3 A-1 实施落点（**B 已会签，5 项**）与冒烟规格（2026-10-11 · 协议 §26.6）
 
-> 按用户新规则（「遇事由两位架构师商量，只有重大或三轮不定才报用户」）重新分流。**立场与给 B 的问题已写入协议 §26**（本地 git 即广播），本节记实施项与分流。
+> 甲/乙/丙 已由架构师 B 会签通过、无分歧（`0c294b9`）；A 逐条采纳，裁决见协议 §26.6。**落点由 A 原写的 2 项增为 5 项**（B 补 3 项，缺任一项 A-1 会白跑或出错账）。
 
-- **甲（reasoning 是否透传）→ 两位架构师定**。A 立场：**不透传**，保持 `delta.content` 为唯一正文位；留可选开关。见 §26.2。**待 B 会签**。
-- **乙（临时冒烟）→ 两位架构师定，A 已把 litellm 层冒烟做完**（首 token 0.86s、`finish_reason=stop`、content 29 字符 + reasoning 49 字符）。**服务级冒烟**待 **A-1** 落地后用临时 env 跑；**不改默认值**。见 §26.4。
-- **丙（`deny` ∩ `openai/` 前缀）→ 合规放宽属重大，仍留用户**，但**先给不碰红线的接法**：**A-1（推荐）**＝`LiteLLMProvider` 加 `custom_llm_provider`（配置 `MS_LITELLM_PROVIDER`，默认 `openai`）+ **请求 model 名保持无前缀** ⇒ `_check_compliance` 不受影响、**红线未被放宽**（冲突是「协议名 vs 供应商名」的命名冲突）。备选 A-2（provider 归一化映射表，慎）/ A-3（不可行）。见 §26.3。
-- **④ 翻 `remote`（生产变更）/ ⑤ 改库迁移（不可逆）→ 仍留用户**，A+B 只出方案与风险：④＝取消 compose 注释 + 启动自检过，风险为生产链路切换、需可回滚，且**依赖 ③token 与 A-1**；⑤＝三阶段（加列/双写 → 切读 → 删列）可回滚，风险为改库不可逆、需备份与回滚脚本，**建议单独立项**。
+| # | 落点 | 来源 | 验收判据（可红可绿） |
+|---|---|---|---|
+| **A1-1** | `msvc/provider.py`：传 `custom_llm_provider`（取 `MS_LITELLM_PROVIDER`） | A | 服务级冒烟能跑通（无前缀 model） |
+| **A1-2** | `msvc/config.py`：新增 **`MS_LITELLM_PROVIDER`**（协议名，默认 `openai`） | A | 配置可注入、默认不变行为 |
+| **A1-3** | **`MS_CATALOG_MODELS` 含目标 model id**（配置，env 落 `deploy/.env`） | B 2.2 🟡 | 补服务侧用例「目录内的无前缀 model 不得 404」；env 改回默认 ⇒ **该用例红** |
+| **A1-4** | `msvc/config.py`：新增 **`MS_UPSTREAM_VENDOR`**（供应商名）＋ **启动期断言**（vendor ∈ deny → 拒启动；未声明 → WARNING） | B 2.4 | 用例：vendor∈deny 时 `create_app` 抛错；不实现则启动照常（红/绿） |
+| **A1-5** | `msvc/provider.py:_xms`：`provider` 归因改取 `MS_UPSTREAM_VENDOR` | B 2.3 🔴 | 用例断言无前缀 model 的 `x_model_service.provider == 声明的 vendor` 且 `!= "deepseek"`；不改 `_xms` ⇒ **红** |
 
-**A-1 实施的落点（待 B 会签后交后端）**：`model-service/msvc/provider.py`（传 `custom_llm_provider`）、`model-service/msvc/config.py`（新增 `MS_LITELLM_PROVIDER`）；若走配置路线，**不新增**其它路径。冒烟只用临时 env ⇒ **不落盘**。
+- **A1-4 的必要性（A 裁决同批做，不降级）**：A-1 之后红线5 的**两条判定臂对平台真实流量都不触发**（无前缀 model 恒不命中前缀臂；平台不发 `routing` ⇒ allow 臂是死的），而**真实出口由 env 决定、`_check_compliance` 从不检查** ⇒ A-1 **未放宽条文、但让红线5 对真实出口失明**。可复现判据：`MS_LITELLM_API_BASE=https://api.openai.com/v1` + 无前缀 model → 服务照常启动、合规放行。
+- **丙的「是否调整 `compliance_deny_providers`」仍留用户**，实施 5 项**不需要**它。
+
+**服务级冒烟（与 A-1 同批、归后端；只用临时 env、不改默认值、不落盘）**
+- **测量项写死**：首 token、**总时长**、content/reasoning 字符数、`finish_reason`、usage 是否含 `completion_tokens_details.reasoning_tokens`，**各 ≥5 次**。
+- 临时 env 带 **`LITELLM_LOCAL_MODEL_COST_MAP=True`**（模型服务侧 `LiteLLMProvider` 不读平台 env，否则 litellm 拉远端 cost map 的 3 次重试叠在预算上）。
+- **工单记「后果链」而非「1.5× 余量」**：首 token 超时 → `main.py:341-343` → `should_cache(504, retryable=False, reached_upstream=True)==True` → **入窗 600s** ⇒ 配合兼容面**10 分钟桶指纹键**，**一次首 token 超时会让同指纹重发在窗口内一律回放 504**（上游 1 秒后恢复也不恢复；与 §16.2 同型）。判据＝临时 `MS_UPSTREAM_FIRST_TOKEN_TIMEOUT=0.5` 起服务 → 首次 504 → 同 key 重发**仍 504**，调回 15s 也不恢复。
+- **运维预期（不是缺陷）**：`cost_per_token("mimo-v2.6-flash")` 价表查不到 ⇒ `cost_status="unknown"`、`cost_usd=None`（红线2 正确），平台回落价格表大概率也查不到 ⇒ `cost_source=none` + `needs_review=True`。
+
+**⚠️ 派发实现任务时必须带上**：`「delta.content 全程 null、正文在 delta.reasoning_content」已被 §26.1（`a3624fb`）实测否证并双侧口径作废——不设 `max_tokens` 时 `content` 有正文、与 `reasoning_content` 并存；真正的坑是 `max_tokens=8` 被推理预算吃光。**若照旧句实现「只取 `reasoning_content`」，会与甲项（只转 `content`）直接打脸。**
+
+**④ 翻 `remote`（生产变更）/ ⑤ 改库迁移（不可逆）→ 仍留用户**：④＝取消 compose 注释 + 启动自检过，风险为生产链路切换、需可回滚，且**依赖 ③token 与 A-1**；⑤＝三阶段（加列/双写 → 切读 → 删列）可回滚，风险为改库不可逆、需备份与回滚脚本，**建议单独立项**。

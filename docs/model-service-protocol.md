@@ -621,6 +621,7 @@ key 后**必须**通过 header 传给模型服务，保证「平台重试 ≠ �
 | v1.7-交叉复核 | 2026-10-10 | 架构师 B | **§24 复核架构师 A 的 §23**（审计留痕，**未改任何线协议条文**）：冻结快照独立实跑确认 R1（真实上游流式 → 裸 500）、R2/R3；**另发现 R4 🔴**——`_map_upstream_error` 只认 `FakeUpstream` 的 `_ScenarioError`、两个 handler 无 catch-all，真实上游异常逃逸 ⇒ ①响应违反 §7（裸 500 无 code）②**幂等在飞位永久泄漏**，同 key 后续请求恒 409（兼容面指纹键 ⇒ 同一条消息在重启前永久发不出）。对照组与快照内补丁双向验证：根因是「异常在 `_finish_window` 前逃出」，窗口逻辑本身正确；打补丁前后契约基线均 40 全绿 ⇒ 用例对该类缺陷双向皆盲。处置：工作单新增 **SW-4 🔴 / SW-5 🟢**、SW-1 验收扩至错误路径、`DESIGN.md §10 ①` 扩写；附**一条待 A 会签的 §8.2.1 澄清提案**（在飞位必须在任何退出路径释放） |
 | v1.7-澄清4 | 2026-10-11 | 架构师 A | **§25 会签 B 的 §24.3 提案 + SW-1…SW-5 终轮验收**（不改行为、不升线协议版本）：① **会签通过**，把「在飞位必须在**任何**退出路径释放（`try/finally` 或等价 catch-all，先释放后返回）」写入 **§8.2.1 正文**——它本是该节的隐含义务（在飞位语义=防并发，非永久拒绝），此前只是未写明；R4 的实现侧修复不需要它（§7/§8.2.1 已足以判缺陷），本条为**澄清**。② **`c5ff7bb`（SW-1…SW-5）验收通过**：服务侧 `64 passed`（独立实跑）；四处证伪各自只打红对应用例（SW-1 流式改回 NotImplementedError → 6 红全在 `test_real_upstream.py`、契约用例全绿；SW-4 映射改回裸抛 → 4 红；SW-5 TTL 关掉 → 1 红；SW-2 去 `retry_after_s` → 2 红）。③ **`0c5869e`（前端消费）验收通过**：`web` 30 用例；证伪三处（读 `retry_after_s` 置空 → 2 红；截断判定去掉 → 1 红；残留缓冲不补解析 → 1 红）。平台侧 `server` 全量 `180 passed` 无回归 |
 | v1.7-待会签 | 2026-10-11 | 架构师 A | **§26 待会签：真上游 reasoning 模型的对外语义 ＋ 合规前缀冲突接法**（审计留痕，**未改任何线协议条文**）。只读实测（httpx + litellm，未改配置/策略/代码）**纠正三处流传判断**：① `content` **非空**（与 reasoning 并存，`finish_reason=stop`）；真正的坑是 **小 `max_tokens` 被 reasoning 吃光**（实测 8 → content 空 + `finish_reason=length`）；② litellm **不需要** `openai/` 前缀（`custom_llm_provider` + 无前缀 model 实测跑通）；③ 首 token 0.5–9.8s 波动 ⇒ 15s 仅 ~1.5× 余量。A 立场：**甲**＝不透传 `reasoning_content`（保持兼容面唯一正文位 `delta.content`，留可选开关）、**丙**＝接法 A-1（无前缀 model ＋ `custom_llm_provider`，**不触碰红线5**——冲突是"协议名 vs 供应商名"的命名冲突，非政策冲突）、**乙**＝litellm 层冒烟已完成、服务级待 A-1。请架构师 B 会签（分歧或三轮不定则交用户） |
+| v1.7-会签 | 2026-10-11 | 架构师 A（回应 B 的 `0c294b9`） | **§26 已会签通过（甲/乙/丙 无分歧）**，A 逐条采纳并入 §26.6：① **甲**——不透传 reasoning；吸收 B 更硬的理由（`reasoning_content` 全仓零消费者 ＋ 计量计价已 reasoning-aware ⇒「不透传文本、一分钱不漏」）；WARNING **理由改计费正当性、位置落 §5 usage 段**（采纳为建议条款，不阻塞本轮）；**不预留字段位**，将来做**部署级 env** `MS_EXPOSE_REASONING`。② **丙**——A-1 落点由 2 项增为 **5 项**（加 `MS_CATALOG_MODELS` 含目标 model〔B 2.2 🟡：无前缀 model 撞目录 → 404〕＋ 新增 **`MS_UPSTREAM_VENDOR`**（供应商名）＋启动断言〔B 2.4：A-1 未放宽条文但让红线5 对**真实出口失明**，A 裁决**同批做、不降级**〕＋ `_xms` 归因改取 vendor〔B 2.3 🔴 静默错账 `provider=="deepseek"` 进 `usage_logs`〕）。「是否调整 `compliance_deny_providers`」仍留用户、**本轮不需要**。③ **乙**——归后端、与 A-1 同批；工单记**后果链**（首 token 超时 → 入窗 → 兼容面 10 分钟桶内回放 504，附可复跑判据），测量项含**总时长**、各 ≥5 次、临时 env 带 `LITELLM_LOCAL_MODEL_COST_MAP=True`。**分流：甲/乙 已定、丙不需放宽、④⑤ 仍留用户 ⇒ 不上报用户** |
 
 ---
 
@@ -1526,10 +1527,11 @@ R4 暴露出 §8.2.1 只写了在飞位的**获取**与**并发语义**，没写
 
 ---
 
-## 26. 待会签：真上游 reasoning 模型的对外语义 ＋ 合规前缀冲突接法（架构师 A · 2026-10-11）
+## 26. 真上游 reasoning 模型的对外语义 ＋ 合规前缀冲突接法（架构师 A 起草 · 架构师 B **会签通过** 2026-10-11）
 
 > 背景：用户 2026-10-11 提供一次性调试凭证（`base_url=https://api.xiaomimimo.com/v1`；**api_key 不入库、不入总线**）。
-> 架构师 A 只读实测（httpx 裸探针 ＋ litellm 探针；**未改配置/策略/代码**）。**性质：待架构师 B 会签/裁决**；本轮不改线协议条文；分歧或三轮不定 → 交用户。
+> 架构师 A 只读实测（httpx 裸探针 ＋ litellm 探针；**未改配置/策略/代码**）。
+> **性质：甲 / 乙 / 丙 三项已由架构师 B 会签通过、无分歧**（`0c294b9`，`harness/proposals/B-sign-protocol-26.md`），A 的裁决与采纳见 **§26.6**；本轮不改线协议条文。
 
 ### 26.1 实测事实（先纠正三处流传的判断）
 
@@ -1567,6 +1569,33 @@ litellm 层实测（`custom_llm_provider="openai"`、`model="mimo-v2.6-flash"`�
 
 ### 26.5 处置
 
-- 本条为**待会签**：请 B 就 **26.2（甲）** 与 **26.3（丙·A-1 是否等价于放宽）** 出具意见（可 `decision` 进总线）。
-- 未会签前：不改线协议条文；A-1 实施（`provider.py`/`config.py`）**待 B 意见**后交后端。
-- **分歧或三轮不定 → 交用户**（丙的"是否放宽"本就是用户的最后一张牌）。
+- 本章为 **A 起草的待会签文本**；会签结果与 A 的裁决见 §26.6。
+- 未会签前不改线协议条文；**现已会签通过** ⇒ A-1 可实施（落点见 §26.6-丙）。
+
+### 26.6 会签结论与 A 的裁决（架构师 B · `0c294b9`；A 裁决 2026-10-11）
+
+**B 结论：甲/乙/丙 三项均同意 A，无分歧 ⇒ 不上报用户**；但丙项的 A-1 有两个 A 未覆盖的落地漏洞，乙项规格需补。A 逐条采纳，裁决如下。
+
+**甲（reasoning 不透传）—— A 采纳，并吸收 B 的两处修正：**
+- B 补了一条比 A 更硬的理由：**`reasoning_content` 全仓零消费者**（`grep` 0 命中），且**计量/计价已 reasoning-aware**（`remote.py:267` → `ledger.py` `usage_logs.reasoning_tokens` → `rating.py:214-215` 按 reasoning 单价补差）⇒「不透传文本、一分钱不漏」。
+- **甲-b 的 WARNING**：**理由改用计费正当性**（小 `max_tokens` 被 reasoning 吃光时 `content=""` 而 `completion_tokens` 含 reasoning ⇒ **用户为空正文付推理钱**，账本里与正常请求同形、客诉无法定位）；**位置不放 §6.6**（那是收尾 chunk 形态条款），落 **§5 usage 段**；**内容不得含消息内容与业务身份**（红线1 精神）；判据＝fake 桩造 `content=""` + `finish_reason="length"` → 服务日志出现该 WARNING。**A 裁决：采纳为「建议条款」，随下次 §5 修订并入**（不阻塞本轮）。
+- **甲-c**：**不在 v1 预留字段位**（`msvc/guards.py` 入站守卫是黑名单式、未知字段放行 ⇒ 加开关是纯加法；预留反而造出"协议里有、实现里没有"的 §18.2-F1 同型温床）；将来若做，用**部署级 env**（如 `MS_EXPOSE_REASONING`，默认 false），**不做请求级**（请求级会让同一部署给出不同 chunk 形状、不可测）。
+
+**丙（A-1）—— A 采纳 B 的两条漏洞，裁决「补偿控制同批做」⇒ 落点由 2 项增为 5 项：**
+1. `provider.py`：传 `custom_llm_provider`（A-1 核心）；
+2. `config.py`：新增 **`MS_LITELLM_PROVIDER`**（**协议名**，默认 `openai`）；
+3. **`MS_CATALOG_MODELS` 必须含目标 model id**（B 2.2 🟡：`main.py:174-178` 对**无前缀** model 查目录 ⇒ 默认目录不含它 → **404 `model_not_found`**，冒烟直接失败且报错把人引向上游；判据＝补用例「目录内的无前缀 model 不得 404」，env 改回默认即变红）；
+4. `config.py`：新增 **`MS_UPSTREAM_VENDOR`**（**供应商名**，与协议名分开——正是 A 诊断的「协议名 vs 供应商名」显式建模）＋ **启动期断言**（`upstream=="litellm"` 且 `vendor ∈ compliance_deny_providers` → **拒绝启动**；vendor 未声明 → WARNING）；
+5. `provider.py:_xms`：`provider` 归因改取 `MS_UPSTREAM_VENDOR`（B 2.3 🔴：现 else 分支回落到 `litellm_default_model` 前缀 ⇒ 实测无前缀 model 得 **`provider=="deepseek"`**，且该字段经 `remote.py:456/668` → `ledger.py:142/190-191` **进 `usage_logs.provider` 与供应商统计** ＝ **静默错账**；判据＝断言无前缀 model 的 `provider` 等于声明的 vendor、`!= "deepseek"`，不改 `_xms` 即变红）。
+
+  **A 对 B 2.4 的裁决：同批做（不降级）**。理由：A-1 之后红线5 的**两条判定臂对平台真实流量都不再触发**（无前缀 model 恒不命中前缀臂；平台 `grep` 不发 `routing` ⇒ allow 臂是死的），而**真实出口由 env（`MS_LITELLM_API_BASE`）决定、`_check_compliance` 从不检查它** ⇒ **A-1 未放宽条文，但让红线5 对真实出口失明**。可复现判据：设 `MS_LITELLM_API_BASE=https://api.openai.com/v1` + 无前缀 model → 服务照常启动、合规放行。用第 4 项一个字段即解 2.3 与 2.4，且**请求级判定一字不改**（与 A 对 A-2 的"慎"不冲突）。
+- **丙的「是否调整 `compliance_deny_providers`」仍留用户**——B **没有**替用户打这张牌，A 也不打；实施 5 项**不需要**它。
+- **运维预期（写进工单，免得当缺陷查）**：`cost_per_token("mimo-v2.6-flash")` 在 litellm 价表查不到 ⇒ `cost_status="unknown"`、`cost_usd=None`（红线2 正确行为）；平台按 §5.1 回落价格表大概率也查不到 ⇒ `cost_source=none` + `needs_review=True`。**该模型毛利必然"未知/待复核"，不是 bug**。
+
+**乙（服务级冒烟）—— A 采纳 B 的规格：**
+- **归后端、与 A-1 同批同一实现方**（都要同一套临时 env + 同一次起服务；分开派会造成"两端各自设 env"的 §18.2-F1 型分歧）；
+- **工单记的是后果链，不是"1.5× 余量"**：B 实测 `should_cache(504, retryable=False, reached_upstream=True) == True`（对照 429 → False）⇒ 首 token 超时**入窗**（`main.py:341-343` → `idempotency.py:173`）⇒ 配合兼容面**10 分钟桶指纹键**，**一次首 token 超时会让同指纹重发在窗口内一律回放 504，即使上游 1 秒后已恢复**（与 §16.2 同型的"瞬时限速被放大成窗口级"）。判据＝临时 `MS_UPSTREAM_FIRST_TOKEN_TIMEOUT=0.5` 起服务 → 首次 504 → 同 key 重发**仍 504**（改回 15s 也不恢复，须等窗过期或重启）。
+- **测量项写死**：首 token、**总时长**、content/reasoning 字符数、`finish_reason`、usage 是否含 `completion_tokens_details.reasoning_tokens`，**各 ≥5 次**（B 附注：抬首 token 到 30s 后 `upstream_total_timeout=60s` 只剩 30s 给生成，reasoning 模型总时长很可能不够 → 必须同时量总时长）。
+- 临时 env 须带 **`LITELLM_LOCAL_MODEL_COST_MAP=True`**：模型服务侧 `LiteLLMProvider` **不读平台 env**，否则 litellm 拉远端 cost map 的 3 次重试会叠在预算上（B 两轮对照已验）。
+
+**分流结论（用户新规则）**：甲/乙 **两位架构师已定、无分歧**；丙的"放宽"仍留用户但**不需要**；④⑤ 仍留用户（A+B 已给方案与风险）。⇒ **本轮不上报用户。**
