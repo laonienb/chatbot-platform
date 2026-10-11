@@ -291,6 +291,7 @@ P2-1 / P2-2（协议已就绪，可并行）
 | v1.13 | 2026-10-11 | 架构师 A | **新增 §9.2：真上游（xiaomimimo）实测 + DW-5 前置决策**（用户提供一次性调试凭证；**api_key 不入库/不入总线**）。只读 httpx 探针实测纠正了三处：<br>① **坑1 前提不成立**——无 `max_tokens` 时 `content` **非空**（非流式 50 字符 + reasoning 52 字符；流式亦然，`finish_reason=stop`）；真正的坑是**小 `max_tokens`（实测 8）被 reasoning 吃光 ⇒ content 空 + `finish_reason=length`**。故决策从「要不要透传 reasoning」收窄为「**给 reasoning 留足预算**」+「是否透传 `reasoning_content`」。<br>② **坑3 数值成立**——首 token **0.5 / 4.5 / 9.8s**（非流式 1.3–2.2s），默认 15s 仅 ~1.5× 余量 ⇒ 冒烟临时放大、别改默认值。<br>③ **坑2 静态证实**——`_check_compliance`（`main.py:139`）按 `model.split("/")[0]` 撞 `deny=openai,anthropic`，而 litellm 打 OpenAI 兼容端点需 `openai/` 前缀 ⇒ 会被自家红线5 403。<br>三项决策（provider 命名/deny、reasoning 对外语义、env 落位）**均标用户定**；DW-5 验收标准据此细化；冒烟**当前不可执行**（受决策①阻塞 + A 跨会话派发被 harness 拒），需用户直启轮或 G/用户转发 |
 | v1.14 | 2026-10-11 | 架构师 A | **新增 §9.3：甲/乙/丙按用户新规则分流 + A 立场**（立场与给 B 的问题同时写入协议 §26，本地 git 即广播）。并用 **litellm 直连探针**把服务级冒烟的可行性钉死：`custom_llm_provider="openai"` ＋ **无前缀 model** ＋ `api_base` **实测跑通**（`finish_reason=stop`、content 29 字符 ＋ reasoning 49 字符、首 token 0.86s）⇒ ① litellm **不需要** `openai/` 前缀；② 甲的"content 恒空"前提不成立（只有小 `max_tokens` 被 reasoning 吃光才空）；③ 丙的不碰红线接法 **A-1** 可行（请求 model 无前缀 ⇒ `_check_compliance` 不命中 deny）。乙**不需用户裁决**；丙的"放宽"降为最后一张牌 |
 | v1.15 | 2026-10-11 | 架构师 A | **B 会签通过（`0c294b9`）后把 §9.3 改写为「A-1 落点 5 项 + 冒烟规格」**（协议 §26.6 同步落盘）：A-1 落点由 2 项增为 **5 项**——加 B 的 2.2 🟡（`MS_CATALOG_MODELS` 含目标 model，否则无前缀 model 撞 `main.py:174-178` 目录校验 → **404**）、2.3 🔴（`_xms` 无前缀回落 `litellm_default_model` 前缀 ⇒ `provider=="deepseek"` **静默错账进 `usage_logs`**）、2.4（新增 **`MS_UPSTREAM_VENDOR`** ＋启动断言；**A 裁决同批做** —— A-1 未放宽条文但**让红线5 对真实出口失明**，可复现判据已写）。冒烟规格按 B 3.3 写死（测量项含**总时长**、各 ≥5 次、临时 env 带 `LITELLM_LOCAL_MODEL_COST_MAP=True`；工单记**后果链**"超时→入窗→10 分钟桶内回放 504"而非"1.5× 余量"）。甲-b 的 WARNING 落 §5 usage 段（建议条款，不阻塞）；甲-c 不预留字段位、将来做部署级 env |
+| v1.16 | 2026-10-12 | 架构师 A | **A-1 实施验收通过 ＋ R2 入库默认裁定**（应管家 G 派单 `harness/proposals/G-dispatch-A-a1-acceptance-and-catalog-ruling.md`，commit `91c3bc8`；租约 `leases/G/A-a1-acceptance.docs.json`；**A 不碰 `deploy/*`**）。① **R1**：`cdda16a` **通过**——五项落点逐条对号（`provider.py:202-203`／`config.py:29`／`config.py:42`+README／`config.py:34,79-108`／`provider.py:218-220`）；A 在**仓库外冻结快照**实跑服务侧 **84 passed**，六条 mutation（M1→3／M1b→1／M2→1／M3→1／M4→2／M5→3）**各自复现自报计数**、红点全落在 A-1 文件内；平台侧 180 **不在 delta 内**（`cdda16a` 只动 `model-service/`）。② **R2 裁定**（新增 **§9.4**，判定原文见协议 **§27.4**）：`MS_CATALOG_MODELS` 三处不一致 ⇒ **`.env.example` 与 compose 兜底都对齐代码默认为 `deepseek-chat,qwen-plus`**（目录是并集白名单，单值会让"配了反而更窄"）；「目标 model」**唯一启用位＝服务侧 `MS_CATALOG_MODELS`**（管理端 enable 管的是平台选谁，不改服务侧 404 闸门），两侧须**成对**；**404/403 分辨写进 README 排障、不进自检**（发哪个 model 是运行时决定）；**冒烟 model `mimo-v2.6-flash` 不进模板主值**（绑一次性凭证）。③ **甲项不进 `AGENTS.md`「三」**（对外流式形状无字段增减）。④ **R3 不重复裁**（C 已点亮 B；A 预置本侧立场于协议 §27.6，跨侧成文仍归 A）。⑤ DW-2/DW-6 **维持「已交付、未判闭合」**（docker 仍不可得、两验**未实跑**，2026-10-12 A 复核）|
 
 ---
 
@@ -327,7 +328,7 @@ P2-1 / P2-2（协议已就绪，可并行）
 
 ---
 
-## 9. 生产切换清单 ②–⑦ 工作项（v1.11 登记 / v1.12 状态列 / v1.13–v1.15 真上游与 A-1，部署侧）
+## 9. 生产切换清单 ②–⑦ 工作项（v1.11 登记 / v1.12 状态列 / v1.13–v1.15 真上游与 A-1 / v1.16 A-1 验收与 R2 裁定，部署侧）
 
 > 依据：`DESIGN.md §10` 生产切换清单 ②–⑦（① 的**代码侧**已由 `c5ff7bb` 闭合，协议 §25.2）。**真源 = 本节**；
 > `AGENTS.md §一` 只镜像活队列。**责任人一律「后端 agent」**；其中 **DW-3 / DW-4 / DW-5 含用户决策项**，
@@ -338,8 +339,8 @@ P2-1 / P2-2（协议已就绪，可并行）
 
 | # | 对应 §10 | 项 | 责任人 | 具体动作 | 验收标准 | 阻塞了什么 | 状态 |
 |---|---|---|---|---|---|---|---|
-| **DW-2** | ② | compose 增补 `model-service` + 内网隔离 | 后端 | `deploy/docker-compose.yml` 增 `model-service` 服务（`build: ../model-service`、**不映射宿主端口**、仅挂内部网络）；`server` 经 `MODEL_SERVICE_BASE_URL=http://model-service:8000` 访问；env 用 `${VAR:-默认}` 形态**保持现状（仍 mock，不翻转）** | `docker compose config` 通过；`up` 后 server 能解析 `model-service` 且该服务**不暴露宿主端口**；提交后 `git status` 干净 | DW-4 的切换依赖它 | ✅ **已交付** `d969a1e`（+`dcc8862`）｜⚠️ **未判闭合**：docker 两条验收**未实跑**（本机无 docker），见 §9.1 |
-| **DW-6** | ⑥ | 幂等窗容量按 H3 定值 | 后端 | 按 `max_entries ≥ 峰值RPS × MS_IDEMPOTENCY_WINDOW_SECONDS` 给 `MS_IDEMPOTENCY_CACHE_MAX_ENTRIES`/`MAX_CHARS` 定值，写进 compose（并 `deploy/.env.example`）；把**峰值 RPS 假设 + 算例**补进 `model-service/README.md` | compose 中该 env 可见且值有据；README 有公式与按假设 RPS 的算例；运维信号「淘汰 WARNING 正常为零」在 README 明示 | 无（与 DW-2 同批） | ✅ **已交付** `d969a1e`（compose 注入基线档 6000 条/9e6 字符；`dcc8862` 修正假设口径）｜⚠️ **未判闭合**（同 DW-2） |
+| **DW-2** | ② | compose 增补 `model-service` + 内网隔离 | 后端 | `deploy/docker-compose.yml` 增 `model-service` 服务（`build: ../model-service`、**不映射宿主端口**、仅挂内部网络）；`server` 经 `MODEL_SERVICE_BASE_URL=http://model-service:8000` 访问；env 用 `${VAR:-默认}` 形态**保持现状（仍 mock，不翻转）** | `docker compose config` 通过；`up` 后 server 能解析 `model-service` 且该服务**不暴露宿主端口**；提交后 `git status` 干净 | DW-4 的切换依赖它 | ✅ **已交付** `d969a1e`（+`dcc8862`）｜⚠️ **未判闭合**：docker 两条验收**未实跑**（本机无 docker），见 §9.1。**2026-10-12 架构师 A 复核：维持此口径**——A-1（`cdda16a`）落码**不改变** DW-2 的验收面（docker 仍不可得），仍「已交付、未判闭合」 |
+| **DW-6** | ⑥ | 幂等窗容量按 H3 定值 | 后端 | 按 `max_entries ≥ 峰值RPS × MS_IDEMPOTENCY_WINDOW_SECONDS` 给 `MS_IDEMPOTENCY_CACHE_MAX_ENTRIES`/`MAX_CHARS` 定值，写进 compose（并 `deploy/.env.example`）；把**峰值 RPS 假设 + 算例**补进 `model-service/README.md` | compose 中该 env 可见且值有据；README 有公式与按假设 RPS 的算例；运维信号「淘汰 WARNING 正常为零」在 README 明示 | 无（与 DW-2 同批） | ✅ **已交付** `d969a1e`（compose 注入基线档 6000 条/9e6 字符；`dcc8862` 修正假设口径）｜⚠️ **未判闭合**（同 DW-2：docker 不可得，**未实跑**，2026-10-12 A 复核维持） |
 | **DW-3** | ③ | `MODEL_SERVICE_TOKEN` 生成并注入双方 | 后端（+**用户定落点**） | 生成 ≥32 字节随机 token；写入**不入库**的 `deploy/.env`（`.gitignore` 已排除 `.env`/`.env.*`）；提交 `deploy/.env.example` 模板（占位符）；两处注入：model-service `MS_SERVICE_TOKENS`、server `MODEL_SERVICE_TOKEN`（§3 静态 Bearer） | `git check-ignore deploy/.env` 命中；`git grep <token>` 无命中；双方启动自检通过 | 任何 `remote` 联通 | ⏸ **未派**（待用户定 token 落点） |
 | **DW-4** | ④ | 翻到 `remote`（**生产变更**） | 后端（+**用户定**） | `LLM_BACKEND=remote` + `MODEL_SERVICE_MODE=native` + `APP_ENV=prod`；确认启动自检（协议版本 / 内层<外层超时 / 目录同步）通过 | prod 下 `mock` 被拒启动守卫生效；端到端一次真上游流式成功 | 生产可用 | ⏸ **未派**（待用户定是否切/用何凭证） |
 | **DW-5** | ⑤ | 凭证迁入 + 两列废弃迁移（S6） | 后端（+**用户定**） | provider 凭证迁入模型服务 env（`MS_LITELLM_API_BASE`/`_API_KEY`/`_DEFAULT_MODEL`，**值不入库**）；`llm_models.api_key`/`api_base` 废弃迁移 | ①凭证落位（§9.2-决策③）；②**provider 命名与合规 deny 相容**（§9.2-决策①，未定则不可达）；③「流式逐块转发」= 转发 `delta.content`，`reasoning_content` 透传与否见决策②；④给 reasoning 模型**留足推理预算**（实测小 `max_tokens` 被 reasoning 吃光 ⇒ content 空）；⑤迁移**有备份/回滚方案**；两列不再被读 | 生产凭证不再散落平台库 | ⏸ **前置决策未定**（provider 命名/deny、reasoning 语义；见 §9.2）；凭证已由用户提供（值不入库） |
@@ -391,6 +392,8 @@ P2-1 / P2-2（协议已就绪，可并行）
 - **A1-4 的必要性（A 裁决同批做，不降级）**：A-1 之后红线5 的**两条判定臂对平台真实流量都不触发**（无前缀 model 恒不命中前缀臂；平台不发 `routing` ⇒ allow 臂是死的），而**真实出口由 env 决定、`_check_compliance` 从不检查** ⇒ A-1 **未放宽条文、但让红线5 对真实出口失明**。可复现判据：`MS_LITELLM_API_BASE=https://api.openai.com/v1` + 无前缀 model → 服务照常启动、合规放行。
 - **丙的「是否调整 `compliance_deny_providers`」仍留用户**，实施 5 项**不需要**它。
 
+**验收（2026-10-12 · 架构师 A，协议 §27.1–§27.3）**：`cdda16a` **通过**。五项**逐条对号**（`provider.py:202-203`／`config.py:29`／`config.py:42`+README／`config.py:34,79-108`／`provider.py:218-220`，见 §27.2）；本机**仓库外冻结快照**实跑服务侧 **84 passed**，六条 mutation（M1/M1b/M2/M3/M4/M5）各自复现自报计数、红点全落在 A-1 文件内（§27.3）。**A1-3 的「入库默认值」另有裁定 ⇒ §9.4。**（冒烟为实现方自报，A 未复跑，理由见 §27.3 末。）
+
 **服务级冒烟（与 A-1 同批、归后端；只用临时 env、不改默认值、不落盘）**
 - **测量项写死**：首 token、**总时长**、content/reasoning 字符数、`finish_reason`、usage 是否含 `completion_tokens_details.reasoning_tokens`，**各 ≥5 次**。
 - 临时 env 带 **`LITELLM_LOCAL_MODEL_COST_MAP=True`**（模型服务侧 `LiteLLMProvider` 不读平台 env，否则 litellm 拉远端 cost map 的 3 次重试叠在预算上）。
@@ -400,3 +403,19 @@ P2-1 / P2-2（协议已就绪，可并行）
 **⚠️ 派发实现任务时必须带上**：`「delta.content 全程 null、正文在 delta.reasoning_content」已被 §26.1（`a3624fb`）实测否证并双侧口径作废——不设 `max_tokens` 时 `content` 有正文、与 `reasoning_content` 并存；真正的坑是 `max_tokens=8` 被推理预算吃光。**若照旧句实现「只取 `reasoning_content`」，会与甲项（只转 `content`）直接打脸。**
 
 **④ 翻 `remote`（生产变更）/ ⑤ 改库迁移（不可逆）→ 仍留用户**：④＝取消 compose 注释 + 启动自检过，风险为生产链路切换、需可回滚，且**依赖 ③token 与 A-1**；⑤＝三阶段（加列/双写 → 切读 → 删列）可回滚，风险为改库不可逆、需备份与回滚脚本，**建议单独立项**。
+
+### 9.4 `MS_CATALOG_MODELS` 入库默认裁定（2026-10-12 · 架构师 A · R2，协议 §27.4）
+
+> **本节的判定原文在协议 §27.4**（同一裁定、单一真源）；此处只登记**执行面**——改哪些文件的哪些行、谁在哪一步启用、排障口径。**`deploy/*` A 不碰**（此刻在 `flash-后端-G` 名下，`leases/G/A1-3.deploy-env-template.json` 至 01:12:39）⇒ 由管家转派或开发按本成文执行。
+
+**三处不一致（本机现取）**：`msvc/config.py:42` 代码默认 `deepseek-chat,qwen-plus`（两值）／`deploy/docker-compose.yml:71` 兜底 `${MS_CATALOG_MODELS:-deepseek-chat}`（单值）／`deploy/.env.example:44` `MS_CATALOG_MODELS=deepseek-chat`（单值，**会**被注入）。
+
+**执行（一句话）**：把 `deploy/.env.example` 的 `MS_CATALOG_MODELS` 与 `deploy/docker-compose.yml:71` 的 `${MS_CATALOG_MODELS:-…}` **兜底都改成 `deepseek-chat,qwen-plus`**（与 `config.py:42` **同值**），并在该行正上方加注释：`# 切 MS_UPSTREAM=litellm 真上游时，把目标 model id 追加进来（无前缀 model 走目录校验，漏了在到达上游前就 404 model_not_found，报错像上游故障）。`
+
+**为什么对齐代码默认（两值）而非单值**：① 目录是**白名单/并集语义**（多列无害、少列必 404）；② `.env.example` 的**单值**会在装 compose 时被注入 ⇒ 部署目录**比不注入 env 裸跑还窄**（反直觉缺陷）；③ 三处同值 ⇒ 改一处即改全部，消漂移源。**不把 `gpt-4o-mini` 列进目录**（那是平台侧回落默认，且属 deny 供应商命名域；正确修法在平台侧把 `llm_default_model` 指向目录内 id —— 不属本次）。
+
+**谁在哪一步启用「目标 model」**：**唯一正确位 ＝ 该部署的 `MS_CATALOG_MODELS`（服务侧 env）**；管理端 enable 决定的是"平台选哪个模型"，**不改变**服务侧目录校验（404 在服务侧入站关口 `main.py:174-178`，管理端点不动它）。⇒ **两侧必须成对**：`MS_CATALOG_MODELS` 含该 id **且** 管理端把对应行 enable（或平台 `llm_default_model` 指向目录内 id）。DW-4 ② 实测的 `enabled=0 ⇒ 平台回落 gpt-4o-mini ⇒ 开流 404` 正是这个错位。
+
+**404 / 403 分辨：写进 README 排障一节（一句话），不进启动自检**（自检只对账启动期已知量；"发哪个 model"是运行时决定，服务侧启动时无从自检）：**`404 model_not_found` ＝ 服务侧目录缺口，不是上游；`403` 只会来自合规 deny（显式发 `openai/…` 前缀时；A-1 后无前缀 model 不命中）；到达上游之后的失败才带 §7 上游 `code`。**
+
+**冒烟 model（`mimo-v2.6-flash`，vendor `xiaomimimo`）：不进 `.env.example` 主值，只作注释示例**（它绑一次性调试凭证、不入库；README 的冒烟 bash 块已给完整示例）。安全提示：若目标供应商名**恰好命中** `MS_COMPLIANCE_DENY_PROVIDERS`（默认 `openai,anthropic`）⇒ 服务**拒绝启动**（A1-4，**期望行为**）；**别为让它起来去删 deny**（运营决策、留用户，§26.6）。

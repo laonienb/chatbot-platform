@@ -622,6 +622,7 @@ key 后**必须**通过 header 传给模型服务，保证「平台重试 ≠ �
 | v1.7-澄清4 | 2026-10-11 | 架构师 A | **§25 会签 B 的 §24.3 提案 + SW-1…SW-5 终轮验收**（不改行为、不升线协议版本）：① **会签通过**，把「在飞位必须在**任何**退出路径释放（`try/finally` 或等价 catch-all，先释放后返回）」写入 **§8.2.1 正文**——它本是该节的隐含义务（在飞位语义=防并发，非永久拒绝），此前只是未写明；R4 的实现侧修复不需要它（§7/§8.2.1 已足以判缺陷），本条为**澄清**。② **`c5ff7bb`（SW-1…SW-5）验收通过**：服务侧 `64 passed`（独立实跑）；四处证伪各自只打红对应用例（SW-1 流式改回 NotImplementedError → 6 红全在 `test_real_upstream.py`、契约用例全绿；SW-4 映射改回裸抛 → 4 红；SW-5 TTL 关掉 → 1 红；SW-2 去 `retry_after_s` → 2 红）。③ **`0c5869e`（前端消费）验收通过**：`web` 30 用例；证伪三处（读 `retry_after_s` 置空 → 2 红；截断判定去掉 → 1 红；残留缓冲不补解析 → 1 红）。平台侧 `server` 全量 `180 passed` 无回归 |
 | v1.7-待会签 | 2026-10-11 | 架构师 A | **§26 待会签：真上游 reasoning 模型的对外语义 ＋ 合规前缀冲突接法**（审计留痕，**未改任何线协议条文**）。只读实测（httpx + litellm，未改配置/策略/代码）**纠正三处流传判断**：① `content` **非空**（与 reasoning 并存，`finish_reason=stop`）；真正的坑是 **小 `max_tokens` 被 reasoning 吃光**（实测 8 → content 空 + `finish_reason=length`）；② litellm **不需要** `openai/` 前缀（`custom_llm_provider` + 无前缀 model 实测跑通）；③ 首 token 0.5–9.8s 波动 ⇒ 15s 仅 ~1.5× 余量。A 立场：**甲**＝不透传 `reasoning_content`（保持兼容面唯一正文位 `delta.content`，留可选开关）、**丙**＝接法 A-1（无前缀 model ＋ `custom_llm_provider`，**不触碰红线5**——冲突是"协议名 vs 供应商名"的命名冲突，非政策冲突）、**乙**＝litellm 层冒烟已完成、服务级待 A-1。请架构师 B 会签（分歧或三轮不定则交用户） |
 | v1.7-会签 | 2026-10-11 | 架构师 A（回应 B 的 `0c294b9`） | **§26 已会签通过（甲/乙/丙 无分歧）**，A 逐条采纳并入 §26.6：① **甲**——不透传 reasoning；吸收 B 更硬的理由（`reasoning_content` 全仓零消费者 ＋ 计量计价已 reasoning-aware ⇒「不透传文本、一分钱不漏」）；WARNING **理由改计费正当性、位置落 §5 usage 段**（采纳为建议条款，不阻塞本轮）；**不预留字段位**，将来做**部署级 env** `MS_EXPOSE_REASONING`。② **丙**——A-1 落点由 2 项增为 **5 项**（加 `MS_CATALOG_MODELS` 含目标 model〔B 2.2 🟡：无前缀 model 撞目录 → 404〕＋ 新增 **`MS_UPSTREAM_VENDOR`**（供应商名）＋启动断言〔B 2.4：A-1 未放宽条文但让红线5 对**真实出口失明**，A 裁决**同批做、不降级**〕＋ `_xms` 归因改取 vendor〔B 2.3 🔴 静默错账 `provider=="deepseek"` 进 `usage_logs`〕）。「是否调整 `compliance_deny_providers`」仍留用户、**本轮不需要**。③ **乙**——归后端、与 A-1 同批；工单记**后果链**（首 token 超时 → 入窗 → 兼容面 10 分钟桶内回放 504，附可复跑判据），测量项含**总时长**、各 ≥5 次、临时 env 带 `LITELLM_LOCAL_MODEL_COST_MAP=True`。**分流：甲/乙 已定、丙不需放宽、④⑤ 仍留用户 ⇒ 不上报用户** |
+| v1.7-验收 | 2026-10-12 | 架构师 A | **新增 §27：A-1 实施验收（`cdda16a` 通过）＋ `MS_CATALOG_MODELS` 入库默认裁定**（应管家 G 派单 `91c3bc8`；**未改任何线协议条文**，版本仍 v1.7-澄清4）。① **验收通过**：五项落点逐条对号（`provider.py:202-203`／`config.py:29`／`config.py:42`+README／`config.py:34,79-108`／`provider.py:218-220`）；A 在**仓库外冻结快照**实跑服务侧 **84 passed**，六条 mutation（M1→3／M1b→1／M2→1／M3→1／M4→2／M5→3）各自复现自报计数、红点全落在 A-1 文件内；平台侧 180 不在 delta 内（`cdda16a` 只动 `model-service/`）。② **R2 裁定（§27.4）**：`MS_CATALOG_MODELS` 三处不一致 ⇒ 入库模板与 compose 兜底**都对齐代码默认 `deepseek-chat,qwen-plus`**（目录是并集白名单；单值现状会让"配了反而更窄"）；**「目标 model」唯一启用位＝服务侧 `MS_CATALOG_MODELS`**（管理端 enable 不改服务侧 404 闸门），两侧须成对；**404/403 分辨写进 README 排障**（启动期无从自检）；**冒烟 model 不进模板主值**（绑一次性凭证）。③ **甲不进「三」**（对外流式形状无字段增减）。④ **R3（§27.6）不重复裁**（C 已点亮 B；A 预置本侧立场，跨侧成文仍归 A）。⑤ **DW-2/DW-6 维持「已交付、未判闭合」**（docker 不可得、两验未实跑）|
 
 ---
 
@@ -1599,3 +1600,82 @@ litellm 层实测（`custom_llm_provider="openai"`、`model="mimo-v2.6-flash"`�
 - 临时 env 须带 **`LITELLM_LOCAL_MODEL_COST_MAP=True`**：模型服务侧 `LiteLLMProvider` **不读平台 env**，否则 litellm 拉远端 cost map 的 3 次重试会叠在预算上（B 两轮对照已验）。
 
 **分流结论（用户新规则）**：甲/乙 **两位架构师已定、无分歧**；丙的"放宽"仍留用户但**不需要**；④⑤ 仍留用户（A+B 已给方案与风险）。⇒ **本轮不上报用户。**
+
+---
+
+## 27. A-1 实施验收 ＋ `MS_CATALOG_MODELS` 入库默认裁定（架构师 A · 2026-10-12）
+
+> 派单：管家 G（`harness/proposals/G-dispatch-A-a1-acceptance-and-catalog-ruling.md`，commit `91c3bc8`；
+> 租约 `harness/bridge/leases/G/A-a1-acceptance.docs.json`，paths ＝ 本文件 ＋ `docs/model-service-work-order.md`）。
+> 本条只写 docs；**`deploy/*` 此刻在 `flash-后端-G` 名下**（`leases/G/A1-3.deploy-env-template.json`，至 01:12:39），
+> A **不碰**，裁定交管家转派或由开发按成文执行。**未改任何线协议条文**；版本仍 **v1.7-澄清4 / §26 会签后**。
+
+### 27.1 验收结论：**通过**（交付 `cdda16a`，2026-10-12 00:03:53）
+
+`feat(model-service): A-1 五项落点（协议名与供应商名分开）＋ 服务级真上游冒烟已跑`。
+实现与 §26.6-丙「落点 5 项」一致，线协议条文与 `compliance_deny_providers` **一字未改**（丙的"是否放宽"仍留用户，实施 5 项不需要它）。**判定：成立。**
+
+### 27.2 五项落点逐条对号（A 读码核实，非引回执）
+
+| # | 规格（§26.6-丙 / §9.3） | 实现位置（本机现取 `HEAD`） | 对号 |
+|---|---|---|---|
+| **A1-1** | `provider.py` 传 `custom_llm_provider`（**仅无前缀**时） | `msvc/provider.py:202-203`：`if "/" not in model: kw["custom_llm_provider"] = s.litellm_provider`；有前缀**不传**（litellm 会再拼一层 ⇒ `openai/deepseek/deepseek-chat`） | ✅ |
+| **A1-2** | `config.py` 新增 `MS_LITELLM_PROVIDER`（协议名，默认 `openai`） | `msvc/config.py:29`：`litellm_provider: str = "openai"` | ✅ |
+| **A1-3** | `MS_CATALOG_MODELS` 必须含目标 model id | `msvc/config.py:42`（默认 `deepseek-chat,qwen-plus`）＋ `README.md` 落点 3 ＋ 用例 `test_a1_3_*` 三条（正／反／带前缀免检） | ✅ 代码；**入库默认值另有裁定 ⇒ §27.4** |
+| **A1-4** | `config.py` 新增 `MS_UPSTREAM_VENDOR` ＋ 启动期对账 | `msvc/config.py:34`（默认空）＋ `config.py:79-108` `_reconcile_upstream_vendor_with_compliance`：`upstream=="litellm"` 且 vendor ∈ deny ⇒ `raise ValueError`（拒启动）；未声明 ⇒ WARNING；非 litellm ⇒ 跳过 | ✅ |
+| **A1-5** | `provider.py:_xms` 的 `provider` 归因取 vendor | `msvc/provider.py:218-220`：`inferred = …`；`"provider": (s.upstream_vendor.strip() or inferred)`（未声明才回落，升级期不炸旧部署） | ✅ |
+
+### 27.3 独立复核证据（架构师 A 本机，仓库外冻结快照）
+
+- **快照**：`git archive HEAD model-service` 解到仓库外临时目录，用 `server/.venv/Scripts/python.exe` 跑（**不在共享工作树、不碰 `server/dev.db`**）。
+- **计数**：服务侧 **84 passed**（与自报一致；＝ 基线 64 ＋ 新增 `tests/test_a1_upstream_identity.py` 20 条）。
+  取证坑：`model-service/pytest.ini` 有 `addopts = -q`，A 再传 `-q` 会变 `-qq` **吞掉汇总行** ⇒ 用 `-o addopts=""`。
+- **平台侧 180 不在本次 delta 内**：`cdda16a` 只动 `model-service/`（4 文件），`server/` 未触碰 ⇒ 本轮未重跑（§25.2 已独立跑过一次 180）。
+- **证伪（A 自跑，改坏后按用例对号）**：M1 去 `custom_llm_provider` → **3 红**；M1b 无条件传 → **1 红**；M2 协议名硬编码 `"openai"` → **1 红**；M3 目录闸门关掉 → **1 红**；M4（只摘 deny 的 `raise`）→ **2 红**；M5 归因回退 `inferred` → **3 红**。
+  六条**全部复现自报计数**，红点**全落在 A-1 文件内**、其余三套契约用例零红（防线互相独立）。附注：M4 若连 WARNING 一起摘（A 另跑过）为 3 红，自报的 2 红对应「只摘 deny 臂」，与其用例数自洽；M4b（对 fake 上游也判定 → 1 红）A 本轮未复跑，不影响结论。
+- **冒烟（实现方自报，A 未复跑——需真凭证与真网络，凭证按用户要求只当一次性、不入库）**：流式 5/5；`x_model_service.provider=xiaomimimo`、`model_used=mimo-v2.6-flash`（项 5 在真上游成立）；`cost_status=unknown`/`cost_usd=null` 属红线2 正确行为。A 采信为**未见反证**，不作为本次判定的独立证据；判定依据是代码与可离线复现的 84 用例 ＋ 6 条证伪。
+
+### 27.4 裁定：`MS_CATALOG_MODELS` 入库默认（R2）——**可执行一句话**
+
+**现状三处不一致**（本机现取）：`msvc/config.py:42` 代码默认 `deepseek-chat,qwen-plus`（两值）；`deploy/docker-compose.yml:71` 兜底 `${MS_CATALOG_MODELS:-deepseek-chat}`（单值）；`deploy/.env.example:44` `MS_CATALOG_MODELS=deepseek-chat`（单值，**会**被注入）。README 落点 3 要求「必须含目标 model id，漏配 ⇒ 到达上游前 404 `model_not_found`」。
+
+> **执行（改哪个文件哪一行、填什么值、为什么）**：把 `deploy/.env.example` 的 `MS_CATALOG_MODELS` 与 `deploy/docker-compose.yml:71` 的 `${MS_CATALOG_MODELS:-…}` **兜底都改成 `deepseek-chat,qwen-plus`**（与 `msvc/config.py:42` 代码默认**同值**），并在该行正上方加一行注释：
+> `# 切 MS_UPSTREAM=litellm 真上游时，把目标 model id 追加进来（无前缀 model 走目录校验，漏了在到达上游前就 404 model_not_found，报错像上游故障）。`
+
+**为什么是对齐代码默认、而不是列单值**：
+1. **目录是白名单（并集语义）**：多列一个无害、少列一个必 404 ⇒ 取并集不取交集。
+2. **单值现状是一条反直觉缺陷**：`.env.example` 的**单值**会在装 compose 时被注入，使部署的目录**比不注入 env 直接跑还窄**（裸跑用代码默认两值、compose 只给一值）——「配了反而更少」。
+3. **对齐代码默认 = 对齐「不注入时的行为」**，三处同值后改一处即改全部，消除漂移源（三处三个值本身就是缺陷源）。
+
+**不把 `gpt-4o-mini` 列进目录**：它是**平台侧**回落默认（`llm_default_model`，DW-4 ② 实测），服务侧不该为一个平台内部默认值放宽自己的对外模型集，且它属 deny 供应商 `openai` 的命名域、出现在境内服务目录里语义也不对。正确修法是**平台侧**把 `llm_default_model` 指向目录内某个 id（或把同步插入的行 enable 起来）——不属本次入库默认。
+
+**② 谁在哪一步启用「目标 model」**：
+> **「目标 model」只有一个正确启用位 ＝ 该部署的 `MS_CATALOG_MODELS`（服务侧 env）；管理端 enable 管的是"平台选哪个模型"，不改变服务侧目录校验。**
+
+理由：404 发生在**服务侧入站关口**（`main.py:174-178`），管理端点不动它。DW-4 ② 实测的正是这个错位（目录同步插入的行 `enabled=0` ⇒ 平台回落 `gpt-4o-mini` ⇒ 服务侧目录无它 ⇒ 开流即 404）。⇒ **两侧必须成对**：`MS_CATALOG_MODELS` 含该 id **且** 管理端把对应行 enable（或平台 `llm_default_model` 指向目录内 id）。README 应补一句这条成对要求。
+
+**404 / 403 分辨：写进 README 排障一节（一句话），不进启动自检。** 理由：自检只能对账**启动期已知量**（vendor ∈ deny、超时分层），而"平台会发哪个 model"由**运行时**决定（平台可发目录内任意一个），服务侧启动时无从自检；但它是**最高频的运维误判**（404 看着像上游故障）。一句话口诀：
+
+> **`404 model_not_found` ＝ 服务侧目录缺口（无前缀 model 不在 `MS_CATALOG_MODELS` 里），不是上游；`403` 只会来自合规 deny（显式发 `openai/…` 等前缀时；A-1 之后无前缀 model 不会命中）；到达上游之后的失败才带 §7 的上游 `code`。**
+
+**③ 冒烟用的真上游 model（`mimo-v2.6-flash`）是否进模板：不进 `.env.example` 主值，只作注释示例。** 理由：它绑的是**一次性调试凭证**（用户明示只当一次性、建议验后轮换），把它写成默认目录等于暗示「生产就用它」，而凭证不入库 ⇒ 照抄的人没有 key、目录里却有它，更迷惑。README 的冒烟 bash 块已给完整示例（`MS_CATALOG_MODELS="deepseek-chat,qwen-plus,<目标model>"`），足够。补一条**安全提示**：若目标供应商名**恰好命中** `MS_COMPLIANCE_DENY_PROVIDERS`（默认 `openai,anthropic`）⇒ 服务**拒绝启动**（A1-4，**期望行为**）；冒烟/示例里的 `xiaomimimo` 不命中，可直接用。**别为了让它起来去删 deny 里的项**——那是运营决策、留用户（§26.6）。
+
+### 27.5 甲项（服务不透传 `reasoning_content`）是否进 `AGENTS.md`「三」：**不进**
+
+结论：**不进**（`AGENTS.md` 此刻两侧后端并列在写，A 也不去动它）。理由：甲只改**模型服务→平台**一段的实现语义，对外（平台→客户端）流式形状**无任何字段增减**——`choices[].delta.content` 仍是唯一正文位，`reasoning_content` 全仓零消费者（§26.6-甲）。前端可见的变化只有"真上游流式从不通变通、且只出 content"，属**功能可用性**而非**契约变更**。真正需要通告前端的**小 `max_tokens` ⇒ 空正文**（甲-b）属**平台 `max_tokens` 策略**（平台默认 `max_tokens=None`，正常路径不受影响）；若平台将来加下限保护，再走「三」。⇒ 本轮**无 §三 条目**；A 可写，但当前没有要写的东西。
+
+### 27.6 R3（首 token 预算 / vendor 对账）处置：**不重复裁，等 B；A 预置本侧立场**
+
+`cdda16a` 上报的两条，**C 侧已点亮架构师 B**（存证 `harness/proposals/C-ask-arch-B-reasoning-budget-and-vendor-arm.md`、总线 `1791734876792-C` 第 3 点）⇒ A **不再各写一份**（避免两位架构师各写一份再互相会签白绕一轮）。B 结论经 C 转来后，**跨侧成文（新 § 或线协议条文）仍归 A**。
+
+**A 预置本侧立场（供 B 参考，不另立条文）**——两条都**不是缺陷**，是**默认值／声明粒度**问题：
+
+1. **首 token 预算**：15s 是**默认值**不是**契约值**；契约只规定红线8「内层 < 外层 90s」。⇒ A 不建议动线协议，处置是**部署侧按模型族放大** `MS_UPSTREAM_FIRST_TOKEN_TIMEOUT`（reasoning 模型建议 ≥30s，仍守 <90s）。「reasoning 是否算首 token」**不改名义**（改了"首 token 预算"名不副实）；若嫌推理期静默，可选**加法**——推理期间发 SSE 注释行 `: keepalive`（不改 chunk 形状、不需前端改），但那是**另一条**需单独裁的加法。**注意后果链是既定的**：首 token 超时按 §8.2.1 属「上游结果不明」⇒ **入窗是对的**（可能已计费）；"窗口内回放 504"是 §8.2.1 × 兼容面 10 分钟桶指纹键的**设计叠加**，不是新缺陷，杠杆在**别撞超时**。
+2. **vendor 对账**：A1-4 把「真实出口是谁」变成**显式声明 ＋ 启动对账 ＋ 日志 WARNING**，这是 A 在 §26.6 已写明的取舍（**声明非验证**）。要封死"声明 ≠ 实际"需按 `MS_LITELLM_API_BASE` **主机名**判定——那是**协议决策**（改变"合规判定读什么"），A 同意与 B 一并裁，不单方面落条文。
+
+### 27.7 状态处置（本题只判到这一步）
+
+- **`cdda16a`（A-1 五项 ＋ 服务级冒烟）：验收通过**（§27.1–§27.3）。
+- **DW-2 / DW-6 状态列：维持「已交付、未判闭合」**——A-1 落码**不改变**其验收面，docker 仍不可得（本机复核 `docker: command not found`）⇒ 两条验收**未实跑**，按 §9.1 口径写、**不得写成实跑**。
+- **R2 裁定**：§27.4 三问已定，交管家转派/开发按成文执行（`deploy/*` A 不碰）。
+- **R3**：§27.6，不重复裁、等 B。
