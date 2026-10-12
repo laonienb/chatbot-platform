@@ -77,8 +77,15 @@ class IdempotencyWindow:
         max_entries: int = 256,
         max_chars: int = 1_000_000,
         inflight_ttl_seconds: float = 60.0,
+        error_ttl_seconds: float = 60.0,
     ):
         self.window_seconds = window_seconds
+        # RB-5（协议 §8.2.1 TTL 表／§28.3）：**入窗分两类时长**——
+        # 成功响应用长窗（回放正确答案），「结果不明」类（首 token 超时、首个正文 token 超时、
+        # 总超时、已发起调用后的 5xx）用短窗：入窗只为**防双烧**，不是为了回放答案。
+        # 600s 的错误窗会把一次慢推理放大成同一条消息的**窗口级锁死**（兼容面指纹键 ⇒
+        # 上游 1 秒后恢复也照样回放 504）。大小关系由 `Settings` 启动期断言保证。
+        self.error_ttl_seconds = error_ttl_seconds
         # §8.2.2-3：缓存必须有**条数/体积上限**（本节两个上限）。
         self.max_entries = max_entries
         self.max_chars = max_chars

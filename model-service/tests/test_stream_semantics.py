@@ -102,7 +102,15 @@ async def test_p1_10_same_key_concurrent_second_rejected_409(live_server, app):
     早已跑完、在飞位已释放，本用例会退化成"先跑完再重发"从而假绿。
     """
     app.state.upstream.reset()
-    app.state.scenario.chunk_delay = 0.2  # 续住第一条流，使第二条在它仍于在飞态时到达
+    # 用**显式沉默**续住第一条流：首个内容 chunk 发出后进入 30s 沉默 ⇒ 在飞位在整个断言期间
+    # 稳定持有，"并发"这件事不再依赖时间差运气。（`silence_*` 字段此前是声明但零使用的死字段，
+    # RB-2③ 才接上。）旧写法 `chunk_delay=0.2` 让整条约 0.6s，共享机上跑全量会被调度挤掉：
+    # 2026-10-12 在 HEAD(79cdace) 基线上复现过「全量 1 failed / 单文件 12 passed」，
+    # 症状正是第二条拿到 200（第一条已跑完、在飞位已释放）——是时间预算太窄，不是用例逻辑错。
+    sc = app.state.scenario
+    sc.chunk_delay = 0.05
+    sc.silence_after_chunks = 1
+    sc.silence_seconds = 30.0
     url = f"{live_server}/v1/chat/completions"
     key = "idem-stream-race"
 
@@ -114,8 +122,7 @@ async def test_p1_10_same_key_concurrent_second_rejected_409(live_server, app):
             async with httpx.AsyncClient(timeout=10, headers=auth_headers()) as c2:
                 r2 = await c2.post(url, json=_body(stream=True), headers={"Idempotency-Key": key})
             assert r2.status_code == 409, "同 key 并发第二条必须被在飞位拒（409）"
-            async for _ in it:  # 收完第一条
-                pass
+            # 不 drain 第一条：它此刻正处在 30s 沉默里，退出上下文即取消（取消传播另有 T6 用例）
 
     assert app.state.upstream.started == 1, "并发第二条不得各自真实调用上游"
 

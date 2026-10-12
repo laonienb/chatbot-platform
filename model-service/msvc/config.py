@@ -43,6 +43,12 @@ class Settings(BaseSettings):
 
     # 超时（§8.1，模型服务侧自持，红线8：内层 < 平台流式空闲上限 90s）。
     upstream_first_token_timeout: float = 15.0
+    # RB-1（协议 §28.1／§8.1 表新增行）：**首个正文 token** 预算——从请求开始到首个非空
+    # `delta.content` 的预算，**含全部推理时长**。首 token 行修正后（reasoning chunk 会复位
+    # 它，§28.1）不再覆盖"只推理不出正文"这一场景，外层由本项承担；超 ⇒ 504
+    # `upstream_reasoning_timeout`（§7 表，与 `upstream_timeout` **区分归因**）。
+    # ⚠️ 60s 是**默认值、不是契约值**（部署侧可按模型族放大，须守红线8）。
+    upstream_first_content_timeout: float = 60.0
     # 首字节**之后**的 chunk 间隔预算（O1，v1.7）：中途停顿超此值 → 流内错误帧
     # `upstream_chunk_timeout`（与首 token 超时的 `upstream_timeout` 区分归因）。
     # 旧实现硬编码 1.0s，会把真实上游（LiteLLMProvider）的正常停顿误杀。
@@ -58,6 +64,12 @@ class Settings(BaseSettings):
     # SW-5：在飞位 TTL 兜底。默认对齐上游总超时（60s）——超过它还在"飞"，说明那次调用
     # 已经丢了（异常漏放 finally），此时必须放行，否则同 key 永久 409。
     idempotency_inflight_ttl_seconds: float = 60.0
+    # RB-5（协议 §8.2.1 TTL 表／§28.3）：**入窗分类不只分类"入不入"，还要分"入多久"**。
+    # 成功回放的窗口需要长（默认 600s）；「结果不明」类（首 token 超时、首个正文 token 超时、
+    # 总超时、已发起调用后的 5xx）入窗只为**防双烧**、不是回放答案 ⇒ 用独立短 TTL。
+    # 客户端抖动重发集中在**秒级**，600s 会把一次慢推理变成同一条消息的窗口级锁死。
+    # ⚠️ 60s 是默认值、非契约值；且必须 **< `MS_IDEMPOTENCY_WINDOW_SECONDS`**（否则"分类"无意义）。
+    idempotency_error_ttl_seconds: float = 60.0
 
     protocol_version: int = 1
     implementation_name: str = "model-service"
@@ -104,6 +116,33 @@ class Settings(BaseSettings):
                 f"MS_COMPLIANCE_DENY_PROVIDERS={sorted(self.deny_providers)}（红线5）。"
                 f"拒绝启动——请把供应商名改为真实值，或改 MS_LITELLM_API_BASE 换出口；"
                 f"放宽 deny 列表是运营决策，不在本服务配置里静默做。"
+            )
+        return self
+
+
+    @model_validator(mode="after")
+    def _check_budget_layering(self) -> "Settings":
+        """预算/窗口的**内部先后关系**必须在启动期就成立（协议 §28.1-2、§28.3-1）。
+
+        - `upstream_first_content_timeout ≥ upstream_first_token_timeout`：首个正文 token 是
+          **外层**（含全部推理时长），若它比首 token 还小，第二项预算永不可达 ⇒ 分类无意义，
+          且"上游正在推理"会被误归因成"上游没连上"。
+        - `idempotency_error_ttl_seconds < idempotency_window_seconds`：错误类入窗只为防双烧，
+          窗口不比成功短就不是"分类"而是"同一个数写两遍"（§8.2.1 TTL 表）。
+        """
+        if self.upstream_first_content_timeout < self.upstream_first_token_timeout:
+            raise ValueError(
+                f"预算层级违反协议 §28.1：MS_UPSTREAM_FIRST_CONTENT_TIMEOUT="
+                f"{self.upstream_first_content_timeout} < MS_UPSTREAM_FIRST_TOKEN_TIMEOUT="
+                f"{self.upstream_first_token_timeout}。首个正文 token 是含推理时长的外层预算，"
+                f"必须 ≥ 首 token 预算，否则它永不可达、错误归因（只推理不出正文会被报成上游没连上）。"
+            )
+        if self.idempotency_error_ttl_seconds >= self.idempotency_window_seconds:
+            raise ValueError(
+                f"入窗 TTL 分类违反协议 §8.2.1/§28.3：MS_IDEMPOTENCY_ERROR_TTL_SECONDS="
+                f"{self.idempotency_error_ttl_seconds} ≥ MS_IDEMPOTENCY_WINDOW_SECONDS="
+                f"{self.idempotency_window_seconds}。错误类窗口必须比成功窗口短，"
+                f"否则一次首 token 超时会把同一条消息锁死整个幂等窗。"
             )
         return self
 

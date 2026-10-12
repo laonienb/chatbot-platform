@@ -44,7 +44,22 @@ _CODE_TO_PLATFORM: dict[str, tuple[int, bool, bool]] = {
     # O1（v1.7）：首字节**之后**的 chunk 间隔预算耗尽（中途停顿）——与首 token 超时
     # （upstream_timeout）区分归因；同属 5xx/超时类 ⇒ 计入熔断（§11）。
     "upstream_chunk_timeout": (504, False, True),
+    # RB-1（协议 §7 表 v1.7-澄清5 新增行）：到达**首个正文 token** 前超预算（含全部推理时长）。
+    # §7 给的运维语义＝「不重试；计入熔断；可选降级」⇒ 第三位 True。缺这一条时它落进
+    # "未知码"分支被翻成 502 且口径不明（对外状态与 §7 不符）。
+    "upstream_reasoning_timeout": (504, False, True),
 }
+
+
+def _is_replayed(headers) -> bool:
+    """RB-5④（协议 §8.2.1 连带项）：这次响应是**幂等窗回放**，不是新一次上游调用。
+
+    回放对平台原本不可识别 ⇒ 每次回放 504 都让熔断再计一次（`cb_threshold=5`）⇒
+    **同一条消息重发 5 次即打开熔断、全站降级**。短 TTL 把放大窗口从 600s 压到 60s
+    但没有消除它，故服务侧在响应头标 `Idempotency-Replayed: true`，平台读到即**不计数**：
+    回放是同一次失败的副本，不是新的上游故障证据。计数规则本身（按 code 决定）不变。
+    """
+    return str(headers.get("idempotency-replayed") or "").strip().lower() == "true"
 
 
 def _classify_error_code(code: str, *, raw_status: int | None = None) -> tuple[int, bool, bool]:
@@ -93,20 +108,25 @@ class ModelServiceError(Exception):
         self.retryable = retryable
 
 
-def _error_from_frame(err: dict) -> ModelServiceError:
+def _error_from_frame(err: dict, *, replayed: bool = False) -> ModelServiceError:
     """§6.7 流内错误帧 → ModelServiceError，并按 §11 **按码**决定是否计熔断。
 
     审计 §18.2-F2 的根因是平台把该帧整条丢弃：内容空、无 code、`record_success()`、
     熔断不计数、退避时长丢失。此处把它当作与 HTTP 错误响应**同等**的失败处理，
     只是状态码已随 200 发出、无法再改（故走 `StreamDone` 归因而非 raise）。
+
+    `replayed`（RB-5④）：本条流是幂等窗**回放**出来的副本 ⇒ 不计数（计数规则本身不变，
+    只是"这不是新的一次上游失败"）。
     """
     code = str(err.get("code") or "upstream_error")
     message = str(err.get("message") or f"模型服务流内错误 {code}")
     status, alert, counts = _classify_error_code(code)
     raw_ra = err.get("retry_after_s")
     retry_after = raw_ra if isinstance(raw_ra, int) and not isinstance(raw_ra, bool) else None
-    if counts:
+    if counts and not replayed:
         breaker.record_failure()
+    elif counts and replayed:
+        logger.info("幂等窗回放的错误帧（code=%s）不计入熔断（§8.2.1 连带项／RB-5④）", code)
     if alert:
         logger.error("模型服务流内错误帧告警 code=%s: %s", code, message)
     return ModelServiceError(
@@ -391,8 +411,12 @@ class RemoteBackend:
                     retry_after = int(ra)
                 except ValueError:
                     retry_after = None
-        if counts:
+        if counts and not _is_replayed(resp.headers):
             breaker.record_failure()
+        elif counts:
+            # RB-5④：回放副本不计熔断（§8.2.1 连带项）——否则同一条消息重发 cb_threshold
+            # 次就打开全站降级，而实际发生过的上游故障只有一次。
+            logger.info("幂等窗回放（Idempotency-Replayed）不计入熔断：code=%s", code)
         if alert:
             logger.error("模型服务鉴权/内部告警 code=%s status=%s: %s", code, status, message)
         return ModelServiceError(
@@ -488,7 +512,11 @@ class RemoteBackend:
 
         if resp.status_code != 200:
             raise self._error_from_response(resp)
-        breaker.record_success()
+        # RB-5④：回放的成功响应**既不计数也不复位**熔断——它不带关于上游健康的新信息，
+        # 拿副本去 `record_success()` 会让半开态的探测被一次回放"成功"关掉（§11 半开只放 1 次
+        # 真实探测的语义被绕过）。判据＝服务侧的 `Idempotency-Replayed` 响应头。
+        if not _is_replayed(resp.headers):
+            breaker.record_success()
         return self._result_from(resp.json(), model, messages)
 
     async def chat_stream(
@@ -524,6 +552,7 @@ class RemoteBackend:
         finish_reason: str | None = None
         current_event: str | None = None
         stream_error: ModelServiceError | None = None  # §6.7 首字节后的流内错误帧
+        replayed = False  # RB-5④：本条流是否为幂等窗回放出来的副本（进流后由响应头确定）
         client = httpx.AsyncClient(timeout=timeout, trust_env=False)
         # §8.1 缺口 K：httpx 的 total 超时**对流式不适用**，必须显式做空闲计时。
         # 语义是"沉默时长"而非"总时长"：只有**协议活动**（注释行/事件行/data 行）重置，
@@ -539,6 +568,9 @@ class RemoteBackend:
                 if resp.status_code != 200:
                     await resp.aread()
                     raise self._error_from_response(resp)
+                # RB-5④：整条流若来自幂等窗回放，则它不携带上游健康信息 ⇒ 收尾时既不计失败
+                # 也不计成功（见 chat() 里同一条注释）。头在开流前已发出，故这里能读到。
+                replayed = _is_replayed(resp.headers)
                 line_iter = resp.aiter_lines().__aiter__()
                 while True:
                     # §8.1 两层独立计时：
@@ -594,7 +626,8 @@ class RemoteBackend:
                         # 收尾。此前平台整条丢弃该帧 → 内容空、无 code、下面记 record_success()，
                         # 于是流式（主路径）下上游限流/超时对平台不可见、熔断不计数、账本按成功结算。
                         # 是否计熔断由 `_error_from_frame` 按 code 经 §11 决定，不在此另立口径。
-                        stream_error = _error_from_frame(obj["error"])
+                        # RB-5④：`replayed=True` 时不计数——这条帧是幂等窗回放的副本。
+                        stream_error = _error_from_frame(obj["error"], replayed=replayed)
                         if isinstance(obj.get("usage"), dict):
                             # §6.7 G3-2：错误帧可携带**实测部分 usage**（加法字段），优先采信，
                             # 不让账本无谓降档到 tiktoken/estimated。
@@ -642,6 +675,10 @@ class RemoteBackend:
         elif terminate_reason == "stream_max_duration":
             # §8.1.1-4：绝对上限属连接类失败，计入熔断；但不 raise，落到下面按已收 token 结算。
             breaker.record_failure()
+        elif replayed:
+            # RB-5④：回放的**成功**流同样不动熔断——副本不携带上游健康信息，用它复位熔断
+            # 会让半开态的一次真实探测被回放顶掉（§11）。归因保持"正常收尾"。
+            pass
         else:
             breaker.record_success()
         prompt, completion, cache_read, reasoning = _usage_from(usage)

@@ -49,6 +49,13 @@ class Scenario:
     silence_after_chunks: int | None = None  # 发满 N 块后沉默
     keepalive_during_silence: bool = False
     silence_seconds: float = 5.0
+    # RB-2③（协议 §28.2）：沉默期间每隔多久发一行心跳（`keepalive_during_silence` 打开时生效）。
+    keepalive_interval_seconds: float = 1.0
+    # RB-1/RB-2：模拟 reasoning 型上游——先只"推理"（产 N 个不产出正文的上游 chunk），
+    # 之后才出正文。fake 与 `LiteLLMProvider` 在此**同形**：都发 `{"kind":"keepalive"}` 事件，
+    # 这样服务侧用例不必依赖真 litellm 也能锁住对外字节流形态（真实 provider 另有对拍用例）。
+    reasoning_only_chunks: int = 0
+    reasoning_chunk_interval: float = 0.05
     cost_mode: str = "exact"  # exact | unknown | absent
     provider: str = "deepseek"
     model_used: str = "deepseek/deepseek-chat"
@@ -132,6 +139,12 @@ class FakeUpstream:
                 raise _scenario_error(scenario.error)
             if scenario.first_token_seconds:
                 await asyncio.sleep(scenario.first_token_seconds)
+            # RB-1/RB-2：reasoning 阶段——上游只吐**不产出正文**的 chunk。fake 与真实
+            # `LiteLLMProvider` 在此同形（都发 `{"kind":"keepalive"}` 事件），故服务侧用例
+            # 不依赖网络也能锁住"推理期有注释行、正文前不 504"这条防线。
+            for _ in range(scenario.reasoning_only_chunks):
+                await asyncio.sleep(scenario.reasoning_chunk_interval)
+                yield {"kind": "keepalive"}
             sent = 0
             for piece in ("这是", " 模型服务的", "流式回复。"):
                 yield {"kind": "chunk", "content": piece}
@@ -145,6 +158,20 @@ class FakeUpstream:
                     raise _scenario_error(
                         scenario.error or {"code": "internal_error", "retryable": False}
                     )
+                # RB-2③：把此前"声明但零使用"的死字段接上。`silence_after_chunks` 单独就表示
+                # "发满 N 块后进入沉默"（字段本意），`keepalive_during_silence` 决定这段沉默里
+                # 要不要按 keepalive_interval_seconds 心跳——真实服务里心跳由 reasoning chunk
+                # 触发，这里模拟"上游还活着但不出字"的另一种静默形态（也是幂等窗在飞位用例的
+                # 确定性抓手：不再靠 0.6s 的时间差去赌并发）。
+                if scenario.silence_after_chunks is not None and sent >= scenario.silence_after_chunks:
+                    waited = 0.0
+                    while waited < scenario.silence_seconds:
+                        step = min(scenario.keepalive_interval_seconds, scenario.silence_seconds - waited)
+                        await asyncio.sleep(step)
+                        waited += step
+                        if scenario.keepalive_during_silence:
+                            yield {"kind": "keepalive"}
+                    break
             yield {"kind": "finish", "finish_reason": scenario.finish_reason}
             yield {"kind": "usage", "usage": self._usage()}
             if scenario.cost_mode != "absent":
@@ -293,10 +320,20 @@ class LiteLLMProvider:
                     delta = choice.get("delta") if isinstance(choice, dict) else _obj(choice, "delta")
                     delta = delta if isinstance(delta, dict) else _as_dict(delta)
                     text = delta.get("content")
+                    fin = choice.get("finish_reason")
+                    if fin:
+                        finish_reason = fin
                     if text:
                         yield {"kind": "chunk", "content": text}
-                    if choice.get("finish_reason") or _obj(choice, "finish_reason"):
-                        finish_reason = choice.get("finish_reason") or _obj(choice, "finish_reason")
+                    elif not fin:
+                        # RB-1／RB-2（协议 §28.1／§6-4「推理期间必须发」）：**不产出正文**的上游
+                        # chunk（reasoning-only 最常见，也含 role-only／空 delta）必须产出一个事件，
+                        # 否则服务侧整个推理期对外静默 ⇒ §8.1 的"上游首 token"被实现成"首个对外
+                        # 事件"，推理超过预算就误报 504（这正是 B 裁的"定义没错、实现错了"）。
+                        # 该事件同时兼作首 token 计时的复位信号与对外的 `: keepalive` 注释行。
+                        # 收尾 chunk（带 finish_reason）**不**算心跳——它自己会变成 finish 事件，
+                        # 给它再发一条会让 §6.6 的事件顺序出现多余行、也和平台已有用例的形状不符。
+                        yield {"kind": "keepalive"}
                 raw_usage = _get(chunk, "usage")
                 if raw_usage:
                     usage = _norm_usage(raw_usage) or usage

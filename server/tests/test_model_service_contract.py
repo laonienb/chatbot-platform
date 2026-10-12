@@ -1531,3 +1531,255 @@ async def _compat_key(client, auth_headers) -> str:
     assert resp.status_code == 201, resp.text
     return resp.json()["key"]
 
+
+# ==================================================================================
+# RB 批① 跨侧对拍 —— 起**真模型服务**（`model-service` 的真 app + 真 uvicorn 子进程）
+#
+# 为什么这一段非要起真服务：协议 §28.2 里 A 对 F2+F3 的裁定指出，平台旧三条心跳用例
+# （def 842／1130／1458）跑的是**平台自家桩**，只证明"平台能吞注释行"，**不证明"真实服务
+# 会发"** ——§18.2-F1「两端各跑自家桩」的第三次。这里的两端都是真的：服务侧用 `msvc.main.create_app()`
+# 起的真 app（场景经 `tests/serve_scenario.py` 注入），平台侧用真 `RemoteBackend` 走真 TCP。
+# 时序类断言（心跳是否在正文之前到达）也只有真连接能测：`httpx.ASGITransport` 会攒完整个响应体。
+# ==================================================================================
+import json as _json  # noqa: E402  (本节局部导入，避免动文件头的既有 import 顺序)
+import os as _os
+import socket as _socket
+import subprocess as _subprocess
+import time as _time
+import urllib.request as _urllib  # noqa: E402
+from pathlib import Path as _Path  # noqa: E402
+
+_MS_DIR = _Path(__file__).resolve().parents[2] / "model-service"
+_SERVE = _MS_DIR / "tests" / "serve_scenario.py"
+SERVICE_TOKEN = "rb-real-service-token"
+
+
+def _free_port() -> int:
+    with contextlib.closing(_socket.socket()) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+@contextlib.contextmanager
+def real_model_service(*, scenario=None, env=None):
+    """起真 model-service（真 app + 真 uvicorn 子进程），返回 base_url。"""
+    port = _free_port()
+    child = dict(_os.environ)
+    child.update({
+        "MS_SERVICE_TOKENS": SERVICE_TOKEN,
+        "MS_UPSTREAM": "fake",
+        "MS_SERVE_PORT": str(port),
+        "PYTHONPATH": str(_MS_DIR),
+        "PYTHONIOENCODING": "utf-8",
+    })
+    if scenario:
+        child["MS_SCENARIO_JSON"] = _json.dumps(scenario)
+    child.update(env or {})
+    proc = _subprocess.Popen([_sys_executable(), str(_SERVE)], env=child,
+                             stdout=_subprocess.PIPE, stderr=_subprocess.STDOUT,
+                             text=True, errors="replace")  # 控制台默认 GBK，服务日志里的中文会炸解码
+    base = f"http://127.0.0.1:{port}"
+    deadline = _time.monotonic() + 30
+    try:
+        while _time.monotonic() < deadline:
+            if proc.poll() is not None:
+                out = proc.stdout.read() if proc.stdout else ""
+                raise AssertionError(f"真模型服务进程提前退出：{out[-900:]}")
+            try:
+                with _urllib.urlopen(f"{base}/health/liveness", timeout=1):  # noqa: S310
+                    break
+            except OSError:
+                _time.sleep(0.1)
+        else:
+            raise AssertionError("真模型服务 30s 内没起来")
+        yield base
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=6)
+        except _subprocess.TimeoutExpired:  # pragma: no cover
+            proc.kill()
+
+
+def _sys_executable() -> str:
+    import sys
+
+    return sys.executable
+
+
+@pytest.fixture
+def real_service_mode(monkeypatch):
+    """把平台切到 remote/native，token 与真服务一致；不动 base_url（由用例指向真服务）。"""
+    from app.config import get_settings
+    from app.llm.remote import breaker
+
+    s = get_settings()
+    monkeypatch.setattr(s, "llm_backend", "remote")
+    monkeypatch.setattr(s, "model_service_token", SERVICE_TOKEN)
+    monkeypatch.setattr(s, "model_service_version", 1)
+    monkeypatch.setattr(s, "model_service_mode", "native")
+    monkeypatch.setattr(s, "model_service_fallback_direct", "")
+    breaker.reset()
+    yield s
+    breaker.reset()
+
+
+async def test_rb2_real_service_emits_keepalive_before_content_and_platform_swallows_it(
+    real_service_mode,
+):
+    """RB-2④（§28.2 判据／"真实服务也发"的正向补位）：
+
+    ① 直读 SSE：上游只推理的那段时间里，客户端必须先看到 ≥1 行 `:` 注释行，**那时还没有正文**；
+    ② 平台 `RemoteBackend` 对着同一个真服务跑流式：注释行被吞、正文收全、无错误归因。
+
+    mutation＝删掉服务侧 `event_gen` 里心跳那条 yield ⇒ **本用例红**；而平台旧三条（跑自家桩的）
+    **仍在桩上全绿**——那正是 A 说的"只被自家桩看守"。
+    """
+    with real_model_service(
+        scenario={"reasoning_only_chunks": 10, "reasoning_chunk_interval": 0.2}
+    ) as base:
+        # ① 真字节流：注释行必须在正文之前
+        comments_before_content = 0
+        content_seen = False
+        async with httpx.AsyncClient(timeout=30, trust_env=False, headers={
+            "Authorization": f"Bearer {SERVICE_TOKEN}"
+        }) as c:
+            async with c.stream(
+                "POST", f"{base}/v1/chat/completions",
+                json={"model": "deepseek-chat", "messages": [{"role": "user", "content": "hi"}],
+                      "stream": True},
+            ) as r:
+                assert r.status_code == 200, await r.aread()
+                async for line in r.aiter_lines():
+                    if line.startswith(":"):
+                        if not content_seen:
+                            comments_before_content += 1
+                    elif _data_line_has_content(line):
+                        content_seen = True
+        assert comments_before_content >= 1, (
+            "真实服务在推理期一条注释行都没发 ⇒ §6-4『推理期间必须发』只在桩里有、服务里没有"
+        )
+        assert content_seen, "正文最终必须到达"
+
+        # ② 平台吞注释行并拿到完整正文（真服务、真 TCP，不是自家桩）
+        real_service_mode.model_service_base_url = base
+        parts, done = await _drain_done(
+            RemoteBackend().chat_stream([{"role": "user", "content": "hi"}], "deepseek-chat")
+        )
+        assert "".join(parts) == "这是 模型服务的流式回复。", parts
+        assert done is not None and done.terminate_reason is None, done
+
+
+def _data_line_has_content(line: str) -> bool:
+    if not line.startswith("data: "):
+        return False
+    try:
+        obj = _json.loads(line[6:])
+    except Exception:
+        return False
+    for ch in obj.get("choices") or []:
+        if (ch.get("delta") or {}).get("content"):
+            return True
+    return False
+
+
+async def test_rb1_platform_sees_reasoning_timeout_as_distinct_code_and_counts_once(real_service_mode):
+    """RB-1 跨侧：服务侧因"只推理不出正文"发流内错误帧 ⇒ 平台按 §7 把它当成**独立 code**
+    处理（504、计入熔断一次、内容按已收结算不 raise）。
+
+    这一条同时防两件事：① 服务把归因写错（写回 `upstream_timeout` 就红）；
+    ② 平台把未知 code 落进"未知码"分支翻成 502（§7 表要求 504）。
+    """
+    from app.llm.remote import _classify_error_code
+
+    assert _classify_error_code("upstream_reasoning_timeout") == (504, False, True), (
+        "§7 表新行未在平台映射表落地"
+    )
+    with real_model_service(
+        scenario={"reasoning_only_chunks": 400, "reasoning_chunk_interval": 0.02},
+        # 内容预算必须 ≥ 首 token 预算（§28.1-2，启动期断言会拒），否则服务根本起不来。
+        env={"MS_UPSTREAM_FIRST_TOKEN_TIMEOUT": "0.3",
+             "MS_UPSTREAM_FIRST_CONTENT_TIMEOUT": "0.6",
+             "MS_UPSTREAM_CHUNK_IDLE_TIMEOUT": "30"},
+    ) as base:
+        real_service_mode.model_service_base_url = base
+        parts, done = await _drain_done(
+            RemoteBackend().chat_stream([{"role": "user", "content": "hi"}], "deepseek-chat")
+        )
+        assert done is not None
+        assert done.terminate_reason == "upstream_reasoning_timeout", done
+        assert done.error_retryable is False
+        assert not parts, f"推理期不该有正文：{parts}"
+        assert breaker._consecutive_failures == 1, (
+            "§7 表：reasoning 超时计入熔断，且只计一次"
+        )
+
+
+async def test_rb5_replayed_failure_is_not_counted_again_by_platform(real_service_mode):
+    """RB-5④（§8.2.1 连带项）：同一条消息重发命中幂等窗 ⇒ 服务标 `Idempotency-Replayed: true`
+    ⇒ 平台**不重复计熔断**。不带标记时照旧计数（两条方向都要，防一刀切屏蔽计数）。
+
+    真实场景：`cb_threshold=5`，一次上游故障后客户端抖动重发 5 次就会把整站打进降级——
+    而实际发生过的上游故障只有一次。
+    """
+    from app.llm.remote import breaker
+
+    with real_model_service(
+        scenario={"error": {"code": "upstream_error", "retryable": False}},
+        env={"MS_IDEMPOTENCY_ERROR_TTL_SECONDS": "300", "MS_IDEMPOTENCY_WINDOW_SECONDS": "600"},
+    ) as base:
+        real_service_mode.model_service_base_url = base
+        be = RemoteBackend()
+        key = "rb5-same-key"
+
+        # ① 第一次：真实调上游并失败 ⇒ 计一次
+        with pytest.raises(ModelServiceError):
+            await be.chat([{"role": "user", "content": "hi"}], "deepseek-chat", idempotency_key=key)
+        assert breaker._consecutive_failures == 1
+
+        # ② 同 key 重发（在 error TTL 内）⇒ 服务回放、平台不计数
+        with pytest.raises(ModelServiceError):
+            await be.chat([{"role": "user", "content": "hi"}], "deepseek-chat", idempotency_key=key)
+        assert breaker._consecutive_failures == 1, (
+            "回放被再计一次熔断 = §8.2.1 连带项未解：同一条消息重发 cb_threshold 次即全站降级"
+        )
+
+        # ③ 换 key（真实新调用）⇒ 必须照常计数，证明 ② 不是"把计数整体关掉"
+        with pytest.raises(ModelServiceError):
+            await be.chat([{"role": "user", "content": "hi"}], "deepseek-chat",
+                          idempotency_key="rb5-other-key")
+        assert breaker._consecutive_failures == 2
+
+
+async def test_rb5_service_marks_replay_header_on_http_error(real_service_mode):
+    """回放标记的**服务端**证据：同一 Idempotency-Key 第二次拿到的响应带
+    `Idempotency-Replayed: true`，第一次没有（RB-5③ 的最小加法）。"""
+    with real_model_service(
+        scenario={"error": {"code": "upstream_error", "retryable": False}},
+        env={"MS_IDEMPOTENCY_ERROR_TTL_SECONDS": "300"},
+    ) as base:
+        h = {"Authorization": f"Bearer {SERVICE_TOKEN}", "Idempotency-Key": "rb5-header-check"}
+        body = {"model": "deepseek-chat", "messages": [{"role": "user", "content": "hi"}]}
+        async with httpx.AsyncClient(timeout=20, trust_env=False) as c:
+            r1 = await c.post(f"{base}/v1/chat/completions", json=body, headers=h)
+            r2 = await c.post(f"{base}/v1/chat/completions", json=body, headers=h)
+        assert r1.status_code == r2.status_code == 502, (r1.status_code, r2.status_code)
+        assert "idempotency-replayed" not in {k.lower() for k in r1.headers}, r1.headers
+        assert r2.headers.get("idempotency-replayed") == "true", r2.headers
+
+
+async def test_rb5_frame_replay_flag_is_unit_lock(real_service_mode):
+    """单元层再锁一次流内帧那条支路（§6.7 的帧与 HTTP 错误同等处理，但回放副本不计数）。"""
+    from app.llm.remote import _error_from_frame, breaker
+
+    breaker.reset()
+    _error_from_frame({"code": "upstream_timeout", "message": "x", "retryable": False},
+                      replayed=False)
+    assert breaker._consecutive_failures == 1
+    _error_from_frame({"code": "upstream_timeout", "message": "x", "retryable": False},
+                      replayed=True)
+    assert breaker._consecutive_failures == 1, "replayed=True 仍计数 ⇒ RB-5④ 没落地"
+    _error_from_frame({"code": "rate_limited", "message": "x", "retryable": True}, replayed=False)
+    assert breaker._consecutive_failures == 1, "§11：429 类不计数，加了 replayed 也不该变"
+
+

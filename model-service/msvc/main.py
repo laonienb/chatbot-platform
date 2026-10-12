@@ -211,11 +211,22 @@ async def chat_completions(request: Request) -> Response:
 
 
 def _replay_cached(cached: CachedResponse, model: str) -> Response:
-    """命中幂等窗：流式 → **终态重放**（§8.2.2-3）；非流式/首字节前错误 → 回放原 JSON。"""
+    """命中幂等窗：流式 → **终态重放**（§8.2.2-3）；非流式/首字节前错误 → 回放原 JSON。
+
+    RB-5④（§8.2.1 连带项）：回放在平台侧原本**不可识别** ⇒ 每次回放 504 都让平台再计一次
+    熔断（`cb_threshold=5` ⇒ 同一条消息重发 5 次就打开熔断、全站降级）。故回放响应一律带
+    `Idempotency-Replayed: true`（**流式与非流式都在响应头**——流式的头在开流前就已发出，
+    这是唯一能标记"这条流是副本"的位置）。不加 body 字段、不改 chunk 形状、不升线协议版本。
+    """
+    replayed = {"Idempotency-Replayed": "true"}
     if cached.stream is None:
-        return JSONResponse(cached.body, status_code=cached.status, headers=cached.headers)
+        return JSONResponse(
+            cached.body, status_code=cached.status, headers={**cached.headers, **replayed}
+        )
     return StreamingResponse(
-        _replay_stream(cached.stream, model), media_type="text/event-stream", headers=SSE_HEADERS
+        _replay_stream(cached.stream, model),
+        media_type="text/event-stream",
+        headers={**SSE_HEADERS, **replayed},
     )
 
 
@@ -250,7 +261,16 @@ def _cache_stream_terminal(window: IdempotencyWindow, idem: str, terminal: Strea
     """
     window.finish(
         idem,
-        CachedResponse(200, {}, {}, time.monotonic() + window.window_seconds, stream=terminal),
+        CachedResponse(
+            200,
+            {},
+            {},
+            time.monotonic()
+            # RB-5（§8.2.1 TTL 表）：错误帧终止的流属「结果不明／已发起调用后的失败」⇒ 短窗；
+            # 成功终止才用长窗回放答案。
+            + (window.error_ttl_seconds if terminal.error is not None else window.window_seconds),
+            stream=terminal,
+        ),
     )
 
 
@@ -294,9 +314,14 @@ def _finish_window(window, idem, status, retryable, reached_upstream, response, 
         if should:
             body = response_body(response)
             headers = _response_headers(response)
+            # RB-5（§8.2.1 TTL 表／§28.3）：**入窗时长分类**。类目"结果不明"= 超时类与
+            # 已发起调用后的 5xx，一律用短 TTL；4xx 永久性拒绝（413／上游 404）同输入必同
+            # 拒绝，是"稳定答案"，留长窗。判据只用 status 的这一段——**入不入窗**仍由
+            # `should_cache` 的两个布尔决定（§8.2.1 禁止用状态码白名单判入窗，这里没有判入窗）。
+            ttl = window.window_seconds if status < 500 else window.error_ttl_seconds
             window.finish(
                 idem,
-                CachedResponse(status, body, headers, time.monotonic() + window.window_seconds),
+                CachedResponse(status, body, headers, time.monotonic() + ttl),
             )
             return
     except Exception:  # 记账失败不能连带泄漏在飞位
@@ -329,10 +354,22 @@ async def _handle_stream(request, body, model, scenario, idem) -> Response:
     # 任何事件）必须返回 **HTTP 错误状态**（同 §7 表），不得用「200 + 流内错误帧」代替
     # —— 否则平台的限流退避、`Retry-After` 透传、熔断计数全部失效，且入窗分类也会失真
     # （瞬时拒绝本该不入窗）。故先向上游取**第一个事件**，成功后才构造 StreamingResponse。
+    #
+    # RB-1（协议 §28.1）两条预算在此分工：
+    #  · **首 token**：上游**任何** chunk 都复位它（provider 把 reasoning-only chunk 转成
+    #    `keepalive` 事件，§28.1 明确"定义不改、改实现"）⇒ 它测的是"上游到底有没有在吐字"；
+    #  · **首个正文 token**：从请求开始的**绝对**截止（含全部推理时长）⇒ 它测的是
+    #    "一直推理、始终不出正文"。
+    # 首字节之前没有任何事件 ⇒ 归因只能是 `upstream_timeout`（我们**不知道**它在推理）；
+    # `upstream_reasoning_timeout` 在"有事件（含心跳）但无正文"时触发，那时首字节已过，
+    # 按 §6.7 只能以流内错误帧收尾（见 `event_gen`）。
+    content_deadline = time.monotonic() + settings.upstream_first_content_timeout
     agen = upstream.stream(body, scenario).__aiter__()
     try:
         first_ev = await asyncio.wait_for(
-            agen.__anext__(), timeout=settings.upstream_first_token_timeout
+            agen.__anext__(),
+            timeout=min(settings.upstream_first_token_timeout,
+                        max(content_deadline - time.monotonic(), 0.001)),
         )
     except StopAsyncIteration:
         first_ev = None
@@ -356,12 +393,20 @@ async def _handle_stream(request, body, model, scenario, idem) -> Response:
         # 错误帧），**不是**事件序列 —— 后者会随生成长度无界增长。
         terminal = StreamTerminal()
         reached_terminal = False
+        # RB-2（§6-4「推理期间必须发」／§8.2.2-3）：心跳是**过程字节**，不是终态的一部分
+        # ⇒ 绝不写进 `terminal`（否则被终态重放缓存收下并重放，还会污染
+        # `MS_IDEMPOTENCY_CACHE_MAX_CHARS` 的体积核算）。
+        content_seen = bool(first_ev and first_ev.get("kind") == "chunk" and first_ev.get("content"))
         try:
             ev = first_ev
             while ev is not None:
                 kind = ev.get("kind")
-                if kind == "chunk":
+                if kind == "keepalive":
+                    # `_sse()` 只会产 `event:`/`data:` 两种行，注释行必须**绕开**它直接写。
+                    yield ": keepalive\n\n"
+                elif kind == "chunk":
                     terminal.content += ev["content"]
+                    content_seen = True
                     yield _sse(_chunk(ev["content"], model_used))
                 elif kind == "finish":
                     # §6.6（工作单 P1-8）：收尾 chunk 必须携带**非 null** finish_reason，且位于
@@ -381,19 +426,67 @@ async def _handle_stream(request, body, model, scenario, idem) -> Response:
                 # O1（v1.7）：中途停顿用**独立可配**预算 `upstream_chunk_idle_timeout`
                 # （默认 30s），**不与首 token 超时共用硬编码值**——旧实现硬编码 1.0s，
                 # 真实上游中途正常停顿 >1s 即被误杀，且归因文案错写成"首 token 超时"。
+                # RB-1：正文尚未出现时，还要同时盯着「首个正文 token」的**绝对**截止。
+                # ⚠️ 归因**不能**在超时之后再读一次时钟来判断"哪个预算到了"：asyncio.wait_for
+                # 用的是事件循环每轮**缓存**的时钟，可能比 time.monotonic() 早触发几毫秒，于是
+                # 内容预算明明先到却被判成 upstream_timeout（本机实测：26 条心跳、最大间隔 32ms、
+                # 全程没有 0.3s 沉默，却误报首 token 超时）。正确做法：等待**之前**就记下这次由
+                # 哪个预算封顶——remote.py 的 P1-6 归因用的也是同一招（别二次读时钟）。
+                wait_for_budget = (
+                    # 正文出现前：**上游任何 chunk（含 reasoning-only → keepalive 事件）都复位**
+                    # 首 token 预算（§28.1「定义不改、改实现」），所以这里的"沉默多久算失败"
+                    # 用的是 first_token 而非 chunk_idle。
+                    settings.upstream_first_token_timeout
+                    if not content_seen
+                    # 正文之后：中途停顿预算 O1（默认 30s，独立可配）。
+                    else settings.upstream_chunk_idle_timeout
+                )
+                bound_by_content = False
+                if not content_seen:
+                    remaining_content = content_deadline - time.monotonic()
+                    if remaining_content <= 0:
+                        terminal.error = _error_payload(
+                            "upstream_reasoning_timeout",
+                            f"上游在 {settings.upstream_first_content_timeout}s 内只推理未产出正文"
+                            "（§8.1 首个正文 token 预算，含全部推理时长；与首 token 超时区分归因）",
+                            retryable=False,
+                        )
+                        await _aclose(agen)  # 红线6
+                        break
+                    bound_by_content = remaining_content <= wait_for_budget
+                    wait_for_budget = min(wait_for_budget, remaining_content)
                 try:
-                    ev = await asyncio.wait_for(
-                        agen.__anext__(), timeout=settings.upstream_chunk_idle_timeout
-                    )
+                    ev = await asyncio.wait_for(agen.__anext__(), timeout=wait_for_budget)
                 except StopAsyncIteration:
                     ev = None
                 except asyncio.TimeoutError:
-                    terminal.error = _error_payload(
-                        "upstream_chunk_timeout",
-                        f"上游中途停顿超过 {settings.upstream_chunk_idle_timeout}s 未产出下一个事件"
-                        "（§8.1 中途空闲预算，与首 token 超时区分归因）",
-                        retryable=False,
-                    )
+                    # RB-1 归因（§28.1／§7 表）：三种沉默是三件不同的事，压成一条就白分了——
+                    #  · 正文始终没出现**且**外层内容预算到了 ⇒ `upstream_reasoning_timeout`
+                    #    （上游在推理、预算不够 ⇒ 处置是放大 first_content）；
+                    #  · 正文没出现、内容预算也还没到，只是上游连着 >first_token 没吐 chunk
+                    #    ⇒ 仍是首 token 超时 `upstream_timeout`（上游连不上/不吐字，该早失败）；
+                    #  · 正文已出现后的停顿 ⇒ `upstream_chunk_timeout`（O1）。
+                    if bound_by_content:
+                        terminal.error = _error_payload(
+                            "upstream_reasoning_timeout",
+                            f"上游在 {settings.upstream_first_content_timeout}s 内只推理未产出正文"
+                            "（§8.1 首个正文 token 预算，含全部推理时长；与首 token 超时区分归因）",
+                            retryable=False,
+                        )
+                    elif not content_seen:
+                        terminal.error = _error_payload(
+                            "upstream_timeout",
+                            f"上游首 token 超时（自持，§8.1；预算 {settings.upstream_first_token_timeout}s），"
+                            "正文出现前上游连一个 chunk 都没吐",
+                            retryable=False,
+                        )
+                    else:
+                        terminal.error = _error_payload(
+                            "upstream_chunk_timeout",
+                            f"上游中途停顿超过 {settings.upstream_chunk_idle_timeout}s 未产出下一个事件"
+                            "（§8.1 中途空闲预算，与首 token 超时区分归因）",
+                            retryable=False,
+                        )
                     await _aclose(agen)  # 红线6：别让上游生成器悬空
                     break
                 except Exception as exc:
@@ -491,6 +584,7 @@ def create_app() -> Starlette:
         max_entries=settings.idempotency_cache_max_entries,
         max_chars=settings.idempotency_cache_max_chars,
         inflight_ttl_seconds=settings.idempotency_inflight_ttl_seconds,
+        error_ttl_seconds=settings.idempotency_error_ttl_seconds,
     )
     app.state.scenario = Scenario()
     return app

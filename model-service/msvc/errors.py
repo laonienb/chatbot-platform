@@ -23,6 +23,9 @@ CODE_HTTP: dict[str, int] = {
     "upstream_error": 502,
     "service_unavailable": 503,
     "upstream_timeout": 504,
+    # RB-1（协议 §7 表 v1.7-澄清5 新增行）：到达**首个正文 token** 前超预算（含推理时长）。
+    # 与 `upstream_timeout`（上游一个 chunk 都没吐）**区分归因**；两者同属 504。
+    "upstream_reasoning_timeout": 504,
 }
 
 
