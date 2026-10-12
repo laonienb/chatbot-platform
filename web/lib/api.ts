@@ -57,6 +57,15 @@ export class ApiError extends Error {
    * 表单据此把错误落到具体输入框，而不是只甩一句「请求失败 (422)」。
    */
   fieldErrors?: Record<string, string>;
+  /**
+   * 被「面向用户文案」替换掉的后端原文，**只为排障留存，绝不可渲染**。
+   *
+   * 5xx 类错误的后端原文是写给运维的（含 `§8.4`／`缺口 K`／`token` 这类协议术语，
+   * 见 `server/app/llm/remote.py` 的 `ModelServiceError` 构造点）。它不能让终端用户看到，
+   * 但直接丢掉又会让线上问题无从查起 —— 故原文退到这处，`message` 只放人话。
+   * 只有发生替换时才有值；未替换时 `message` 本身就是原文。
+   */
+  serverMessage?: string;
   constructor(
     status: number,
     message: string,
@@ -65,6 +74,7 @@ export class ApiError extends Error {
       retryAfter?: number;
       code?: string;
       fieldErrors?: Record<string, string>;
+      serverMessage?: string;
     }
   ) {
     super(message);
@@ -73,6 +83,7 @@ export class ApiError extends Error {
     this.retryAfter = opts?.retryAfter;
     this.code = opts?.code;
     this.fieldErrors = opts?.fieldErrors;
+    this.serverMessage = opts?.serverMessage;
   }
 }
 
@@ -224,6 +235,32 @@ function readErrorBody(
  * 会被误判成限流并自动退避重试。协议 §7 明确「旧约定保留一个版本周期后废弃」，
  * 故此处主动切换到 code 优先，同时保留启发式以免后端未发 code 时行为倒退。
  */
+/**
+ * 平台/模型服务会发出的 **5xx 及内部类** `code` → 面向用户的人话。
+ *
+ * 为什么必须逐个列出：这些码的后端原文是**运维语**（实测会带 `§8.4`、`缺口 K`、
+ * `协议 §8.1`、`token` 等术语，见 `server/app/llm/remote.py` 的构造点），
+ * 直接端给用户既看不懂、又等于对外泄露内部协议编号。
+ *
+ * 分档依据是「用户能做什么」，不是「后端怎么归类」。这批码对用户的可操作性相同
+ * （都不该盲目重发，等一会儿再试或报障），故统一归 `service`；**归因不丢**——
+ * 精确原因保留在 `code` 与 `serverMessage` 里，供排障与将来的差异化 UI 使用。
+ */
+const SERVER_SIDE_TEXT: Record<string, { kind: ApiErrorKind; text: string }> = {
+  // 504：超时三兄弟。用户侧行为一致（稍后重试），排障靠 code 区分。
+  upstream_timeout: { kind: "service", text: "模型响应超时，请稍后重试" },
+  upstream_chunk_timeout: { kind: "service", text: "模型响应超时，请稍后重试" },
+  upstream_reasoning_timeout: { kind: "service", text: "模型思考时间过长，请稍后重试" },
+  // 502/503：链路或服务本身不可用
+  service_unavailable: { kind: "service", text: "服务繁忙，请稍后重试" },
+  upstream_error: { kind: "service", text: "服务繁忙，请稍后重试" },
+  internal_error: { kind: "service", text: "服务暂时异常，请稍后重试" },
+  service_auth_failed: { kind: "service", text: "服务配置异常，请联系管理员" },
+  upstream_auth_failed: { kind: "service", text: "模型服务凭证异常，请联系管理员" },
+  // 400：平台/模型服务拒绝了这次请求（红线 1 禁字段、契约不符）。用户改不了，需报障。
+  invalid_request: { kind: "service", text: "请求被拒绝，请刷新页面后重试；若持续出现请联系管理员" },
+};
+
 function classify(
   status: number,
   code: string | undefined,
@@ -234,6 +271,10 @@ function classify(
   const withKind = (kind: ApiErrorKind, text: string, extra?: { retryAfter?: number }) =>
     new ApiError(status, text, { kind, code, fieldErrors, ...extra });
 
+  /** 把后端原文换成面向用户的文案，原文退到 serverMessage 供排障。 */
+  const replaced = (kind: ApiErrorKind, text: string, extra?: { retryAfter?: number }) =>
+    new ApiError(status, text, { kind, code, fieldErrors, serverMessage: message, ...extra });
+
   switch (code) {
     case "rate_limited":
       return withKind(
@@ -243,9 +284,6 @@ function classify(
       );
     case "budget_exhausted":
       return withKind("quota", "本月额度已用尽，请充值或联系管理员（重试无效）");
-    case "service_unavailable":
-    case "upstream_error":
-      return withKind("service", "服务繁忙，请稍后重试");
     case "context_length_exceeded":
       return withKind("context", "对话上下文过长，请精简后重试（或开新会话）");
     case "compliance_denied":
@@ -253,6 +291,10 @@ function classify(
     case "model_not_found":
       return withKind("model_missing", "模型不存在或已下线，请刷新模型列表");
   }
+
+  // ---- 5xx/内部类码：人话替换（逐个列出，缺一个就会漏出运维原文）----
+  const known = code ? SERVER_SIDE_TEXT[code] : undefined;
+  if (known) return replaced(known.kind, known.text);
 
   // ---- code 缺失或未知：回退到状态码启发式（保持既有行为）----
   if (status === 402) return withKind("balance", `${message}，请充值或联系管理员`);
@@ -265,6 +307,11 @@ function classify(
   if (status === 413) return withKind("context", "对话上下文过长，请精简后重试（或开新会话）");
   if (status === 403) return withKind("forbidden", "该模型当前不可用，请更换模型");
   if (status === 404) return withKind("model_missing", "模型不存在或已下线，请刷新模型列表");
+  // 502/504 此前**没有任何分支**：504 + 未知 code 会静默把后端运维原文端给用户
+  // （实测 `upstream_timeout` 走的就是这条路）。补上保守回退，人话优先。
+  if (status === 502 || status === 504) {
+    return replaced("service", "服务繁忙，请稍后重试");
+  }
   return new ApiError(status, message, { code, fieldErrors });
 }
 

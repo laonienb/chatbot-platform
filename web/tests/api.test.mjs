@@ -148,8 +148,10 @@ describe("错误判读：code 优先，缺失才回退状态码 + Retry-After", 
     stubFetch(new Response("<html>502</html>", { status: 502 }));
     const e = await captureError("/api/v1/x");
     assert.equal(e.status, 502);
-    assert.equal(e.message, "请求失败 (502)");
-    assert.equal(e.kind, undefined);
+    // 502 属服务侧故障：给用户人话，原始兜底文案退到 serverMessage 供排障
+    assert.equal(e.message, "服务繁忙，请稍后重试");
+    assert.equal(e.serverMessage, "请求失败 (502)");
+    assert.equal(e.kind, "service");
   });
 
   test("401 先用 refresh token 换新 token 重试一次", async () => {
@@ -172,6 +174,109 @@ describe("错误判读：code 优先，缺失才回退状态码 + Retry-After", 
     assert.equal(store.has("cp_access_token"), false);
     assert.equal(globalThis.window.location.href, "/login");
     assert.equal(calls.length, 2);
+  });
+});
+
+/**
+ * 5xx/内部类码：后端原文是写给运维的。本组用例锁死"不得端给用户"。
+ */
+describe("5xx/内部类码：运维原文不得端给用户（本会话实测缺陷）", () => {
+  /**
+   * 载荷逐字取自 `server/app/llm/remote.py` 里 `ModelServiceError` 的真实构造点，
+   * 不是编造的。修复前实测：这些 code 在 classify 里**一个 case 都没有**，
+   * 504/502 也没有状态码回退分支，于是后端运维原文被原样渲染到界面，
+   * 含 `§8.4`／`缺口 K`／`协议 §8.1` 等内部协议编号。
+   */
+  const OPS_JARGON = ["§", "降级", "缺口", "协议", "token", "红线"];
+  const leaky = (text) => OPS_JARGON.filter((j) => text.includes(j));
+
+  const CASES = [
+    {
+      code: "upstream_timeout",
+      status: 504,
+      ops: "模型服务流式空闲超过 90s（无任何字节），已断开并按 §8.4 降级（协议 §8.1 缺口 K）",
+      want: "模型响应超时，请稍后重试",
+    },
+    {
+      code: "upstream_chunk_timeout",
+      status: 504,
+      ops: "模型服务流式空闲超过 90s（无任何字节），已断开并按 §8.4 降级（协议 §8.1 缺口 K）",
+      want: "模型响应超时，请稍后重试",
+    },
+    {
+      code: "upstream_reasoning_timeout",
+      status: 504,
+      ops: "模型服务在首个正文 token 前超过 60s（推理期无正文），已断开",
+      want: "模型思考时间过长，请稍后重试",
+    },
+    { code: "internal_error", status: 502, ops: "模型服务返回 502", want: "服务暂时异常，请稍后重试" },
+    {
+      code: "service_auth_failed",
+      status: 502,
+      ops: "模型服务鉴权失败（service_auth_failed）",
+      want: "服务配置异常，请联系管理员",
+    },
+    {
+      code: "upstream_auth_failed",
+      status: 502,
+      ops: "上游供应商鉴权失败",
+      want: "模型服务凭证异常，请联系管理员",
+    },
+    {
+      code: "invalid_request",
+      status: 400,
+      ops: "不得把 persona:<slug> 下移给模型服务（红线1：人格是平台业务语义）",
+      want: "请求被拒绝，请刷新页面后重试；若持续出现请联系管理员",
+    },
+  ];
+
+  for (const c of CASES) {
+    test(`★ ${c.code}：文案是人话，且原文只退到 serverMessage（不渲染）`, async () => {
+      stubFetch(json(c.status, { detail: c.ops, code: c.code }));
+      const e = await captureError("/api/v1/conversations/1/messages");
+      assert.equal(e.message, c.want, "应替换为面向用户的文案");
+      assert.equal(e.serverMessage, c.ops, "后端原文必须保留供排障");
+      assert.equal(e.code, c.code, "归因不丢：code 原样保留");
+      assert.equal(e.kind, "service");
+      assert.deepEqual(leaky(e.message), [], "面向用户的文案里不得出现协议术语");
+    });
+  }
+
+  test("★ 同样的码走流内错误帧，替换同样生效（HTTP 已是 200，只能靠 code 判）", async () => {
+    const ops = "模型服务流式空闲超过 90s（无任何字节），已断开并按 §8.4 降级（协议 §8.1 缺口 K）";
+    const frame = `data: ${JSON.stringify({ error: { message: ops, type: "api_error", code: "upstream_timeout" } })}\n\n`;
+    const resp = new Response(
+      new ReadableStream({
+        start(c2) {
+          c2.enqueue(new TextEncoder().encode(frame));
+          c2.close();
+        },
+      }),
+      { status: 200, headers: { "content-type": "text/event-stream" } }
+    );
+    const e = await streamSSE(resp, { onDelta: () => {} }).then(
+      () => null,
+      (x) => x
+    );
+    assert.equal(e.message, "模型响应超时，请稍后重试");
+    assert.equal(e.serverMessage, ops);
+    assert.deepEqual(leaky(e.message), []);
+  });
+
+  test("★ 未知 5xx 码 + 504：也要兜住，不能漏出后端原文", async () => {
+    // 未来新增的码没登记时，504/502 的保守回退必须接住它
+    stubFetch(json(504, { detail: "某个将来才有的运维文案 §9.9", code: "brand_new_code" }));
+    const e = await captureError("/api/v1/x");
+    assert.equal(e.kind, "service");
+    assert.equal(e.message, "服务繁忙，请稍后重试");
+    assert.deepEqual(leaky(e.message), []);
+  });
+
+  test("★ 非 5xx 的未知码仍保留后端原文（不误伤既有行为）", async () => {
+    stubFetch(json(418, { detail: "我是茶壶", code: "teapot" }));
+    const e = await captureError("/api/v1/x");
+    assert.equal(e.message, "我是茶壶");
+    assert.equal(e.serverMessage, undefined, "未替换时不该有多余字段");
   });
 });
 
