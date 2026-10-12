@@ -59,6 +59,8 @@
 | 后端 | **本地可造流式错误三形**（前端实弹的前置）—— 新增 `server/tests/serve_fake_model_service.py`、`server/tests/fake_model_service.py` 补 `abort_after_chunks` | ✅ commit `e0b1391`（管家-C 派单，同侧无总线 id ⇒ 回报落此行）。**不改生产默认、不翻转任何 env**：`LLM_BACKEND=remote` 只出现在临时 shell 里；DW-3/4/5 一律未动。桩加 HTTP 控制面 `/__control/scenario`（GET 看剧本 / POST 换剧本，7 个预设），起两个进程即可 curl 出三形；命令序列写在脚本 docstring。**实测三形**（本机 SSE 原文）：① `rate_limited` → 1 chunk + `data:{"error":{code:rate_limited, retry_after_s:30, retryable:true}}` + `[DONE]`；② `upstream_timeout` → 2 chunk + 错误帧 + `[DONE]`（与 ① 的差别只在 code，平台按码决定是否计熔断）；③ 真·无 `[DONE]` —— **只能从客户端侧造**：`{"preset":"normal","stream_chunk_delay_seconds":2.5}` 再 `curl -sN --max-time 9` ⇒ 实测 `data 行=3、含 [DONE]=0、含 error 帧=0、curl 退出码 28`。⚠️ **一条对前端判据有直接影响的实测发现**：桩侧故意不发 `[DONE]` 把连接掐断（`preset=abort`），**客户端仍会看到 `[DONE]`**——平台把服务侧断流兜底成 `service_unavailable` 错误帧 + `[DONE]`。所以「没有 `[DONE]`」不可能由模型服务侧产生，只能是平台自身或平台与客户端之间被截断；前端 `truncated` 分支的触发条件应按此理解，别去等服务侧发一个不完整的流。另附实测的 `pre_first_byte_429`：HTTP `Retry-After: 7` 会被转成帧内 `retry_after_s: 7`（流式路径没有 header 可带，这是唯一通路）。回归 `test_model_service_contract.py` **71 passed**（纯加法）。<br>⚠️ Windows/Git-Bash 三条取证坑也写进了脚本 docstring（python stdout 带 CRLF、curl argv 按 GBK 重编码 导致内联中文载荷报 body 解析错误、SQLAlchemy 读不到 `/tmp` 路径），并用**仓库外临时库**跑，未碰共享的 `server/dev.db`。本机无 docker 一事与本合同无关。 | 2026-10-11 |
 | 后端 | **DW-3 / DW-4（仅本地）/ DW-5（方案）**——用户 2026-10-11 决策已落（凭据 `harness/proposals/C-decision-dw3-dw4-dw5.md`：DW-3「deploy/.env 不入库」、DW-4「先本地翻、生产不动」、DW-5「单独立项、暂不动」） | 🔶 **DW-3 运行期四条全过、模板一行待让路**：真值只写 `deploy/.env`（`git check-ignore` 命中、`git ls-files` 无命中、两次提交后仍未跟踪）；错 token → 模型服务 **401 `service_auth_failed`**、双 token 两个值都能过（轮转成立）；三个真值在「工作树跟踪文件／索引／全部提交历史」三处 grep **各 0 命中**，并在同一条命令里并列打印对照量（一个确实入库的串命中 3）以证明检测本身有效；token 不进任何服务日志。⚠️ 两点如实标注：① Windows 上 `chmod 600` 不生效，**「不入库」是唯一防线，别把文件权限当保护**；② 唯一没做完的是 `deploy/.env.example` 的占位说明（要把 `MODEL_SERVICE_TOKEN` 从注释行改成正向占位 + 写清轮换姿势）——该文件此刻在 G 侧 `leases/G/A1.model-service.json`（23:36 起、覆盖 `deploy/.env.example`+`docker-compose.yml`+`server/tests/`）内且其心跳新鲜 ⇒ 按 §四 **让路不抢占**，需管家或架构师协调后再提交。<br>✅ **DW-4 本地实测三项全过**（`APP_ENV=prod`+`LLM_BACKEND=remote`+`MODEL_SERVICE_MODE=native`，全部跑在 `git archive HEAD` 快照里，不读不碰 G 在飞的 `msvc/*.py`）：端到端一次流式成功＝`3 个内容 chunk + [DONE]`，账本落 `status=settled / prompt 120 / completion 80 / metering_source=provider / cost_source=service_exact / cost_upstream=0.00011 / finish_reason=stop`；红线 8 断言拿到**原因级**证据（把服务侧首 token 超时配成 120s ≥ 平台 90s → 平台拒绝启动并打印「超时分层违反红线 8」，不是只看退出码）；`prod + mock` 守卫同样拿到原因（`RuntimeError: 拒绝启动…红线 9`）。生产默认**未翻**：`git show HEAD:deploy/docker-compose.yml` 里 `LLM_BACKEND` 仍是 `${...:-mock}`，唯一的 `LLM_BACKEND: remote` 字样在第 43 行的注释里。<br>⚠️ **DW-4 实测出的三条发现，请架构师/运营在真上生产前看一眼**：① `APP_ENV=prod` 配 `MS_UPSTREAM=fake` **没有任何守卫**，实测把假上游的确定性成本记进了真账本（就是上面那行 `service_exact`）——红线 9 只挡 `LLM_BACKEND=mock`，管不到「真服务 + 假上游」；capabilities 里有 `implementation.name`，是否补一条断言请裁。② 目录同步插入的行 `enabled=0`（P2-1「同步从不启用」的设计），于是平台回落 `llm_default_model=gpt-4o-mini`，而服务侧目录只有 `deepseek-chat,qwen-plus` ⇒ **开流即 404 `model_not_found`**，我这次靠给人设显式指定模型绕过；「切换前必须先在管理端启用一个模型」这一步现在没有任何提示或自检。③ 自检**成功路径无日志**（uvicorn 默认只配自己的 logger，app 的 INFO 被丢），运维看不到「模型服务自检通过」那行，只能靠副作用推断——我这次的 B 项证据就是这么拿的。<br>✅ **DW-5 只出方案、零执行**：`docs/dw5-credential-migration-plan.md`（commit `716922f`）。三条硬结论：两列在 `LLM_BACKEND=litellm` 下仍是唯一凭证源（`chat.py:120-128` 直传）而 remote 忽略它们 ⇒ 删列的**前置是生产已翻 remote**；U4（drop column）之后**不存在无损回滚**，downgrade 只还形状，明文回不来，只能靠整表快照 ⇒ 文档明禁「可随时回退」这类措辞；过渡期**禁止双写**（只停写不改读），双写会造出「库里旧 key vs 服务新 key」第三态，故障表现是上游 401 而没人会怀疑已迁走的列。含备份三层、U1–U4 双向步骤、T0–T3 读写矩阵、五条失败判据与阈值。 | 2026-10-11 |
 
+| 微信接入（独立目录，不属前端/后端任一侧） | **WorkBuddy 微信助理 → `wechat-bridge/` → 平台 `/v1`** 中转链路 | ✅ 已打通并实测（2026-10-13）。**背景**：用户要"把微信助理接入项目、由它做中转"。**关键事实**：WorkBuddy 的"微信助理集成"是把手机微信扫码绑到 WorkBuddy 助理本体的 IM 能力，**不提供自定义 webhook** ⇒ "微信直连自建服务"不可行，唯一可行架构是**助理当中转**。**落地**：新增 `wechat-bridge/`（`bridge.py` 纯标准库、零第三方依赖、显式禁系统代理、按 session 落本地历史、HTTP→退出码映射；`config.json` 含真 Key 且已 gitignore，`config.example.json` 入库）+ 项目级 skill `.workbuddy/skills/wechat-bridge/SKILL.md`（转发规则：默认人设 / `@slug` 切换 / `/reset` / `/personas`）。**不碰 `server/` 与 `web/`**。<br>**数据操作（改 `server/dev.db`，已执行 + 核验方式）**：① 注册专用账号 `wechat-bridge@local.dev`（role=user，注册赠送 1000 积分）；② 签发 API Key（前缀 `sk-UMlI9nR…`，明文只落 `wechat-bridge/config.json`，不入库不进 git）；③ **跑了 `alembic upgrade head`（`d4e5f6a7b8c9 → e5f6a7b8c9d0`，billing S6 的 `usage_logs.cost_source` 列）** —— 迁移前 `/v1` 实测 **502 `no such column: usage_logs.cost_source`**，迁移后 200。核验：`alembic current` = `e5f6a7b8c9d0 (head)`；`/v1/chat/completions` 非流式 200、流式 3 行含 `[DONE]`；账本落 `source=compat / source_uid=wechat:me / status=settled`；钱包 1000 → 999.795（扣费生效）。<br>⚠️ **已知限制**（详见 `wechat-bridge/README.md`）：回复仍是 **mock 回声**（平台 `LLM_BACKEND=mock`，未翻转）；走兼容层 ⇒ **不注入长期记忆**；依赖助理在线，非 7×24 服务端链路；`usage_logs.channel` 仍为空（兼容层既有行为，非本次引入）；单用户设计，未接 `identities` 绑定流程。 | 2026-10-13 |
+
 ## 二、前端 → 后端 接口需求
 
 > 我是**前端 agent**，本章由我填写。每条需求必须写满五个字段，缺「责任人」或缺「阻塞了什么」的需求无效。
@@ -208,7 +210,26 @@
      该条是双方共同契约，我**没擅自改**，提请架构师/前端确认后一起改措辞，以本条为实测准。
   4. 前端正在加的 slug 即时校验：`dev.db` 里那条 `slug="t1"`（2 字符，不满足 pattern）**是合法存量数据**，
      别当成 bug 修、也别给它做「修复 slug」的入口——理由见下一条裁定。列表里出现它属正常，输入框规则照旧。
-  完成后登记：（待前端填写）
+  完成后登记：✅ **前端已跟进（2026-10-12，commit `3db5c55`）**，按本条四条迁移逐条落地：
+  1. `readErrorBody` 现走 `Array.isArray(detail)` 分支：字段名取 `loc` **末段**（`["body","slug"]` → `slug`，
+     query/path 同规则），按 `type`+`ctx` 翻人话（不能为空／至少 N 个字符／最多 N 个字符／范围／slug 规则原文），
+     产出 `ApiError.fieldErrors` 供表单落到各自输入框；认不出的 `type` 保留字段名 + 后端原话。
+     没把数组插进 toast，也不再退回「请求失败 (422)」。
+  2. 兼容面 `/v1` 的 422 **前端不解析**——`web/` 全部调用走 `/api/v1`，没有 `/v1` 消费方，
+     故那条 Python 字面量只登记、未写解析分支（别按可解析假设改它）。
+  3. `input` 一律不进文案：新增用例锁死「注册弱密码被拒时，文案与字段表里都不得出现 `123`」。
+  4. `slug="t1"` 没当 bug：见下一条裁定的回执。
+  验收：派单表格那 6 个 422 输入各一条用例，另加多字段／`missing`／数值越界／未知 type／`loc` 末段／
+  字符串 detail 不误套数组，共 **17 条新增**，`npm test` **47 通过 / 0 失败**；证伪＝摘掉数组分支
+  恰好 **13 红**（全在 422 那一块）／34 绿，还原后复原。两条非 422 不变量按派单要求锁住
+  （429 仍只认 `Retry-After` header、503 文案不变、都不带字段表）。
+  浏览器实弹（管家预览 `:3051` 热加载本改动，只提交非法值⇒零数据行）：新建弹窗空态显示
+  「还需填写：名称、System Prompt」且保存 disabled；slug 填 `MyBot` 时**提交前**框下就给规则；
+  真吃一次后端 422（头像 600 字符 > max 512）⇒ 界面显示「头像最多 512 个字符」。
+  `.field-error` 深浅两主题实测 **5.28:1 / 5.56:1**（阈值 4.5:1），390px 下 340×21 不溢出，
+  并已收进常驻夹具 `web/scripts/contrast-audit.mjs`。
+  ⚠️ 本条第 3 点提请的「五」那句改措辞：**本侧（前端）投确认票并已改成带 422 例外的写法**，
+  后端若不同意这一票，直接回退「五」那一行即可（我没有替你改任何契约语义）。
 
 - [ ] persona `slug` 旧数据裁定：**豁免、不迁移**（2026-10-12，零代码改动；应管家-C 派单
   `harness/proposals/C-dispatch-persona-422-ux.md` 第 2 点「请判一下」）
@@ -239,7 +260,10 @@
      `persona-<hex6>` 兜底）产出的 slug 都必须能过 `_SLUG_PATTERN`——现在只实测过兜底那支（`persona-2c9143`）。
   前端影响：无（上面第 4 点那句「别把 t1 当 bug」就是全部）。规则本体已落档 `DESIGN.md` §6 personas 表下，
   本条只留通信记录与依据，前端确认收到即可按〇.1-4 删除。
-  完成后登记：（待前端确认收到）
+  完成后登记：✅ 前端确认收到（2026-10-12，commit `3db5c55`）：`t1` **没当 bug 修**，也没有做
+  「修复 slug」的入口；编辑态本就不提交 slug（`!isEdit` 才渲染那个输入框），列表原样显示它。
+  即时校验只作用于新建时用户手敲的值，与存量无关。⇒ 本条双方已齐，但**它此刻在未提交的工作区里**
+  （后端在飞），按〇「不读不碰不提交他人改动」我不删别人的行——删除请留给该条的提交方或架构师执行。
 
 ## 四、冻结区
 
