@@ -317,6 +317,69 @@ async def test_t9_capabilities_version_and_timeouts(client):
     assert to["upstream_total_s"] < 90 and to["upstream_first_token_s"] <= to["upstream_total_s"]
 
 
+# ------------------------------------------------- RB-3 capabilities 声明位（§8.1-2／§28.2）
+async def test_rb3_capabilities_expose_first_content_budget(client):
+    """RB-3-1（A1）：`features.timeouts` 必须含 `upstream_first_content_s`，且**值 == 实际配置**。
+
+    平台启动断言据它对标红线 8（§8.1 硬约束 2，v1.7-澄清5 把它列进"缺键即失败"清单）。
+    断言"存在"不够——把值写死成别的数（例如复制 first_token 的 15）平台就对标错了对象，
+    故这里跟 `get_settings()` 的实际配置逐值比对。
+    """
+    from msvc.config import get_settings
+
+    s = get_settings()
+    to = (await client.get("/v1/capabilities")).json()["features"]["timeouts"]
+    assert "upstream_first_content_s" in to, "首个正文 token 预算未暴露 ⇒ 平台缺键即失败（拒启动）"
+    assert to["upstream_first_content_s"] == s.upstream_first_content_timeout
+    # 与兄弟键同处、且四项齐全（平台侧按四项做"缺键即失败"）
+    assert set(to) >= {
+        "upstream_first_token_s",
+        "upstream_first_content_s",
+        "upstream_chunk_idle_s",
+        "upstream_total_s",
+    }
+
+
+async def test_rb3_stream_keepalive_false_for_fake_upstream(client):
+    """RB-3-2（A2 方向一）：`MS_UPSTREAM=fake` ⇒ **声明不发心跳**（`false`）。
+
+    §28.2 的 A 裁定：平台据本键决定流式内层预算对标 90s（空闲上限）还是 180s（绝对上限）。
+    出厂默认部署就是假上游（`deploy/docker-compose.yml` 的 `${MS_UPSTREAM:-fake}`），而假上游
+    只在 Scenario 显式打开心跳开关时才发 `: keepalive`、生产建 app 用的是默认 `Scenario()`
+    ⇒ 一行心跳都没有。**此时若声明 `true`，平台会按 180s 对标而真实保护只有 90s**
+    （虚假的安全感，比不做这个功能更坏）。
+    """
+    from msvc.config import get_settings
+
+    assert get_settings().upstream == "fake", "本用例的前提是进程跑在假上游上"
+    feats = (await client.get("/v1/capabilities")).json()["features"]
+    assert "stream_keepalive" in feats, "声明位缺失 ⇒ 平台无法判定，缺键即失败（拒启动）"
+    assert feats["stream_keepalive"] is False, (
+        "假上游默认一行心跳都不发，声明 true 就是假声明（平台按 180s 对标、真实只有 90s）"
+    )
+
+
+async def test_rb3_stream_keepalive_true_for_litellm_upstream(client, monkeypatch):
+    """RB-3-2（A2 方向二）：`MS_UPSTREAM=litellm` ⇒ 声明**会发心跳**（`true`）。
+
+    与上一条**方向相反**，缺一即漏一类错误：只有上面那条，实现就能写死 `false` 而全绿——
+    那样真实 litellm 部署会被平台按保守侧 90s 对标，一个合规的 120s 内层预算被误判违规、
+    平台启动被拒（协议 §8.1 硬约束 2 说的正是这种误判）。
+
+    推导依据（不是拍脑袋）：`LiteLLMProvider.stream` 对**任何**不产出正文、也不带
+    `finish_reason` 的上游 chunk（reasoning-only 最常见）产出 `keepalive` 事件，
+    `_handle_stream` 再渲染成 `: keepalive` 注释行。该实现本身由
+    `test_real_upstream.py::test_rb3_litellm_provider_emits_keepalive_for_reasoning_chunk` 看守。
+    """
+    from msvc.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "upstream", "litellm")
+    feats = (await client.get("/v1/capabilities")).json()["features"]
+    assert feats["stream_keepalive"] is True, (
+        "真实上游会发推理期心跳，声明 false 会让平台按 90s 保守对标、误拦合法的 120s 内层预算"
+    )
+
+
 # ---------------------------------------------------------------- T10 目录同步
 async def test_t10_models_catalog(client):
     d = (await client.get("/v1/models")).json()

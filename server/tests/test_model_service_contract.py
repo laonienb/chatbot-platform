@@ -344,11 +344,27 @@ async def test_t9_native_version_mismatch_refuses_startup(remote_mode):
 
 
 async def test_t9_native_version_match_passes(remote_mode):
-    """T9b：版本一致 → 自检通过（且确实调了 /v1/capabilities）。"""
+    """T9b：版本一致 → 自检通过（且确实调了 /v1/capabilities）。
+
+    RB-3 起 capabilities 的**超时四项 + `stream_keepalive` 缺一即失败**，故本用例必须给
+    全（此前只给 `features.cost_attribution` 也能过 —— 那正是"缺键即跳过"放行的空转）。
+    """
     from app.llm.model_service_ops import startup_self_check
 
     control, _ = remote_mode
-    control.capabilities = {"protocol_version": 1, "features": {"cost_attribution": True}}
+    control.capabilities = {
+        "protocol_version": 1,
+        "features": {
+            "cost_attribution": True,
+            "stream_keepalive": False,
+            "timeouts": {
+                "upstream_first_token_s": 15,
+                "upstream_first_content_s": 60,
+                "upstream_chunk_idle_s": 30,
+                "upstream_total_s": 60,
+            },
+        },
+    }
     await startup_self_check()  # 不抛即通过
 
 
@@ -1006,9 +1022,16 @@ async def test_p2_2_capabilities_timeout_layering_violation_refuses_startup(
     monkeypatch.setattr(get_settings(), "model_service_stream_idle_timeout", 60.0)
     control.capabilities = {
         "protocol_version": 1,
-        "features": {},
+        # RB-3：声明位与四个超时键都必须在场（缺一即失败），故此处逐个给全；
+        # 本用例仍保留**顶层** `timeouts` 形状（兼容读那条臂的既有覆盖）。
+        "features": {"stream_keepalive": False},
         # 内层 120s ≥ 外层 60s → 违反红线 8
-        "timeouts": {"upstream_first_token_s": 15, "upstream_total_s": 120},
+        "timeouts": {
+            "upstream_first_token_s": 15,
+            "upstream_first_content_s": 30,
+            "upstream_chunk_idle_s": 30,
+            "upstream_total_s": 120,
+        },
     }
     with pytest.raises(ProtocolVersionError) as ei:
         await startup_self_check()
@@ -1024,8 +1047,14 @@ async def test_p2_2_capabilities_timeout_layering_ok(remote_mode, monkeypatch):
     monkeypatch.setattr(get_settings(), "model_service_stream_idle_timeout", 90.0)
     control.capabilities = {
         "protocol_version": 1,
-        "features": {},
-        "timeouts": {"upstream_first_token_s": 15, "upstream_total_s": 60},
+        # RB-3：`stream_keepalive=False` ⇒ 保守侧，内层须 < 空闲上限 90s。
+        "features": {"stream_keepalive": False},
+        "timeouts": {
+            "upstream_first_token_s": 15,
+            "upstream_first_content_s": 60,
+            "upstream_chunk_idle_s": 30,
+            "upstream_total_s": 60,
+        },
     }
     await startup_self_check()  # 不抛即通过
 
@@ -1343,11 +1372,15 @@ async def test_h2_chunk_idle_budget_violation_refuses_startup(remote_mode, monke
     control.capabilities = {
         "protocol_version": 1,
         "features": {
+            # 显式 `False` ⇒ 保守侧，外层 = 空闲上限 60s（外层是 180s 时 120 < 180 会合法通过，
+            # 本用例要验的正是"不发心跳的服务把中途空闲配到 120 必须被拦"）。
+            "stream_keepalive": False,
             "timeouts": {
                 "upstream_first_token_s": 15,
+                "upstream_first_content_s": 30,
                 "upstream_total_s": 50,
                 "upstream_chunk_idle_s": 120,  # ≥ 外层 60 → 违反
-            }
+            },
         },
     }
     with pytest.raises(ProtocolVersionError) as ei:
@@ -1370,10 +1403,21 @@ async def test_p2_2_timeouts_read_from_real_service_nesting(remote_mode, monkeyp
     monkeypatch.setattr(get_settings(), "model_service_stream_idle_timeout", 60.0)
     control.capabilities = {
         "protocol_version": 1,
-        "features": {"timeouts": {"upstream_total_s": 120}},
+        # RB-3：声明位与四项给全，**违规仍然只挂在嵌套这一侧** —— 若谁把读法改回只读顶层
+        # 就会当"没有该字段"，而"缺键即失败"此时也不会救它（顶层读到的是空 dict）。
+        "features": {
+            "stream_keepalive": False,
+            "timeouts": {
+                "upstream_first_token_s": 15,
+                "upstream_first_content_s": 30,
+                "upstream_chunk_idle_s": 30,
+                "upstream_total_s": 120,  # ≥ 外层 60 → 违反
+            },
+        },
     }
-    with pytest.raises(ProtocolVersionError):
+    with pytest.raises(ProtocolVersionError) as ei:
         await startup_self_check()
+    assert "上游总超时" in str(ei.value), "必须是分层违规，不是缺键报错"
 
 
 async def test_p2_2_default_stub_capabilities_pass(remote_mode, monkeypatch):
@@ -1388,6 +1432,208 @@ async def test_p2_2_default_stub_capabilities_pass(remote_mode, monkeypatch):
     assert "timeouts" not in control.capabilities, "桩必须与真实服务同形（timeouts 在 features 内）"
     monkeypatch.setattr(get_settings(), "model_service_stream_idle_timeout", 90.0)
     await startup_self_check()  # 不抛即通过
+
+
+# ============================================ RB-3／RB-4 capabilities 声明位与对标对象
+#
+# 判据映射（工作单 W-1 §3）：
+#   A3 → test_rb3_missing_*_refuses_startup（两条：循环路径 / 声明位路径）
+#   B1 → test_rb4_keepalive_true_*（会发心跳 ⇒ 对标 180s）
+#   B2 → test_rb4_keepalive_false_*（不发心跳 ⇒ 保守侧 90s）
+#
+# B1 与 B2 是**方向相反的一对**，缺一即漏一类错误：只有 B1 会写出"一律 180s"（漏掉不发
+# 心跳的服务，真外层只有 90s 却被放行）；只有 B2 等于维持现状（"一律 90s"）。
+# ⚠️ B2 单独**不能**证明新逻辑存在——它在改动前的旧代码下也是红的（120 ≥ 90）；
+# 只有 B1 在旧代码下必红、在新代码下必绿，两条一起才锁得住"按 keepalive 分档"。
+
+# 一份**完全合法**的 capabilities 底座：其余键全对，只让被测的那一项不同。
+# A3 的用例必须建立在它之上 —— 若给一个整体崩溃的 payload（例如协议版本错），
+# 失败会发生在版本检查上，"缺键即失败"与"缺键跳过"**都**会红 ⇒ 用例无牙齿。
+def _valid_caps(**overrides) -> dict:
+    features = {
+        "cost_attribution": True,
+        "stream_keepalive": False,
+        "timeouts": {
+            "upstream_first_token_s": 15,
+            "upstream_first_content_s": 60,
+            "upstream_chunk_idle_s": 30,
+            "upstream_total_s": 60,
+        },
+    }
+    for key in ("stream_keepalive",):
+        if key in overrides:
+            features[key] = overrides.pop(key)
+    if "timeouts" in overrides:
+        features["timeouts"] = overrides.pop("timeouts")
+    elif "drop_timeout_key" in overrides:
+        del features["timeouts"][overrides.pop("drop_timeout_key")]
+    caps = {"protocol_version": 1, "features": features}
+    caps.update(overrides)
+    return caps
+
+
+@pytest.mark.parametrize(
+    "dropped",
+    ["upstream_first_content_s", "upstream_first_token_s", "upstream_chunk_idle_s", "upstream_total_s"],
+)
+async def test_rb3_missing_timeout_key_refuses_startup(remote_mode, monkeypatch, dropped):
+    """A3①（§8.1 硬约束 2，v1.7-澄清5）：caps 缺**任一**超时键 ⇒ **拒绝启动**，报错点名该键。
+
+    这一条正对 P2-2 的旧病：旧写法是 `if inner is None: continue`，注释给的理由是
+    "Proxy 过渡期无 capabilities 契约（§8.3）"——**那个理由是假的**（proxy 在本函数开头
+    已 return，根本走不到循环）。它保护的不是 proxy，只是把 native 路径的缺键静默吞掉：
+    整个 `timeouts` 缺失时每个键都是 `None`、全部 `continue` ⇒ 断言一条都不执行、**零日志
+    零警告**。这就是"名义闭合、实则空转"的真相。
+
+    mutation（本用例的牙齿）：把"缺键即失败"改回"缺键跳过"（`continue`）⇒ 必须红。
+    ⚠️ 断言**缺的键名出现在报错里**（不能只断言 "红线 8"，太弱、无法定位到是哪一项）。
+    """
+    from app.config import get_settings
+    from app.llm.model_service_ops import ProtocolVersionError, startup_self_check
+
+    control, _ = remote_mode
+    monkeypatch.setattr(get_settings(), "model_service_stream_idle_timeout", 90.0)
+    monkeypatch.setattr(get_settings(), "model_service_stream_max_duration", 180.0)
+    control.capabilities = _valid_caps(drop_timeout_key=dropped)
+
+    with pytest.raises(ProtocolVersionError) as ei:
+        await startup_self_check()
+    msg = str(ei.value)
+    assert dropped in msg, f"报错必须点名缺的是哪个键，实际：{msg}"
+    assert "缺" in msg, f"必须是缺键类报错（不是分层违规）：{msg}"
+
+
+async def test_rb3_missing_stream_keepalive_refuses_startup(remote_mode, monkeypatch):
+    """A3②（§28.2）：caps 缺 `features.stream_keepalive` ⇒ **拒绝启动**，报错点名该键。
+
+    与上一条**分属两条判定路径**（超时四项走循环、声明位走独立检查），必须各有一条用例，
+    否则其中一条分支无人看守。声明位缺失时**不**静默回落保守侧：保守侧只适用于"显式声明
+    了 false"，缺失是服务没履约（协议 §8.1 硬约束 2 把它列进"缺键即失败"清单）。
+    """
+    from app.config import get_settings
+    from app.llm.model_service_ops import ProtocolVersionError, startup_self_check
+
+    control, _ = remote_mode
+    monkeypatch.setattr(get_settings(), "model_service_stream_idle_timeout", 90.0)
+    monkeypatch.setattr(get_settings(), "model_service_stream_max_duration", 180.0)
+    caps = _valid_caps()
+    del caps["features"]["stream_keepalive"]
+    control.capabilities = caps
+
+    with pytest.raises(ProtocolVersionError) as ei:
+        await startup_self_check()
+    assert "stream_keepalive" in str(ei.value), (
+        f"报错必须点名 stream_keepalive：{ei.value}"
+    )
+
+
+async def test_rb4_keepalive_true_benchmarks_absolute_cap(remote_mode, monkeypatch):
+    """B1（§8.1 硬约束 2 的 A 裁定）：`stream_keepalive=true` + 内层 120s ⇒ **断言通过**。
+
+    服务会发 `: keepalive` ⇒ 平台「流式空闲上限 90s」**永不触发**（心跳持续复位它），
+    真正的外层边界是**绝对上限 180s** ⇒ 一个合规的 120s 内层预算必须被放行。
+    旧代码拿它跟 90s 比 ⇒ 120 ≥ 90 ⇒ 误判违规、**平台拒绝启动**（协议 §8.1 原文点名的
+    两种误判之一）。
+
+    mutation（本用例的牙齿）：把对标值写死成 90s（即忽略 keepalive 分档）⇒ 必须红。
+    """
+    from app.config import get_settings
+    from app.llm.model_service_ops import startup_self_check
+
+    control, _ = remote_mode
+    monkeypatch.setattr(get_settings(), "model_service_stream_idle_timeout", 90.0)
+    monkeypatch.setattr(get_settings(), "model_service_stream_max_duration", 180.0)
+    control.capabilities = _valid_caps(
+        stream_keepalive=True,
+        timeouts={
+            "upstream_first_token_s": 15,
+            "upstream_first_content_s": 120,  # 合法：< 180s 绝对上限
+            "upstream_chunk_idle_s": 120,
+            "upstream_total_s": 60,
+        },
+    )
+    await startup_self_check()  # 不抛即通过
+
+    # 边界：仍然必须**严格小于**绝对上限（180s 是硬天花板，不是"≤"）
+    control.capabilities = _valid_caps(
+        stream_keepalive=True,
+        timeouts={
+            "upstream_first_token_s": 15,
+            "upstream_first_content_s": 120,
+            "upstream_chunk_idle_s": 180,  # == 绝对上限 ⇒ 违反
+            "upstream_total_s": 60,
+        },
+    )
+    with pytest.raises(Exception) as ei:
+        await startup_self_check()
+    assert "绝对上限" in str(ei.value), (
+        f"心跳服务的违规文案必须指向**绝对上限**（实际参与判定的那个）：{ei.value}"
+    )
+
+
+async def test_rb4_keepalive_false_benchmarks_idle_cap(remote_mode, monkeypatch):
+    """B2（§8.1 硬约束 2 的保守侧）：`stream_keepalive=false` + 内层 120s ⇒ **断言失败**。
+
+    服务**不发**心跳 ⇒ 空闲上限 90s 是真外层 ⇒ 120s 的内层预算必须先被拦下，否则平台会在
+    90s 处断开、把一个本该由服务侧归因（`upstream_chunk_timeout`）的故障抢走
+    （钱花了、回包丢了、归因没了）。
+
+    mutation（本用例的牙齿）：去掉保守回退（一律对标 180s）⇒ 必须红。
+    ⚠️ 与 B1 配对才有意义：本用例在旧代码（一律 90s）下**也是红的**，它单独不能证明
+    新逻辑存在。
+    """
+    from app.config import get_settings
+    from app.llm.model_service_ops import ProtocolVersionError, startup_self_check
+
+    control, _ = remote_mode
+    monkeypatch.setattr(get_settings(), "model_service_stream_idle_timeout", 90.0)
+    monkeypatch.setattr(get_settings(), "model_service_stream_max_duration", 180.0)
+    control.capabilities = _valid_caps(
+        stream_keepalive=False,
+        timeouts={
+            "upstream_first_token_s": 15,
+            "upstream_first_content_s": 120,  # < 180s 但 ≥ 90s ⇒ 保守侧下违规
+            "upstream_chunk_idle_s": 30,
+            "upstream_total_s": 60,
+        },
+    )
+    with pytest.raises(ProtocolVersionError) as ei:
+        await startup_self_check()
+    msg = str(ei.value)
+    # 文案必须**参数化**：指向实际选中的外层（空闲上限）与实际的配置名，
+    # 而不是硬写"90s"（keepalive=true 时那条报错会指向一个没参与判定的配置）。
+    assert "空闲上限" in msg, f"保守侧必须给出「空闲上限」这个原因：{msg}"
+    assert "MODEL_SERVICE_STREAM_IDLE_TIMEOUT" in msg, f"必须指出该调哪个配置：{msg}"
+    assert "stream_keepalive=False" in msg, f"必须说明判定依据是声明位：{msg}"
+
+
+async def test_rb4_keepalive_true_still_bounds_nonstream_total(remote_mode, monkeypatch):
+    """`upstream_total_s` **不随** keepalive 放宽（工作单 W-1 架构师裁定 §五）。
+
+    协议 §8.1 表：该预算**仅约束非流式**，按平台读超时口径对标。若把它并进那条按
+    keepalive 分档的循环，`keepalive=true` 时它会被放行到 180s —— 即**一条非流式预算
+    被放过了头**（这正是"把它从循环里摘出来"的理由）。本用例锁住"摘出来"这个结构。
+    """
+    from app.config import get_settings
+    from app.llm.model_service_ops import ProtocolVersionError, startup_self_check
+
+    control, _ = remote_mode
+    monkeypatch.setattr(get_settings(), "model_service_stream_idle_timeout", 90.0)
+    monkeypatch.setattr(get_settings(), "model_service_stream_max_duration", 180.0)
+    control.capabilities = _valid_caps(
+        stream_keepalive=True,  # 流式侧可放宽到 180s
+        timeouts={
+            "upstream_first_token_s": 15,
+            "upstream_first_content_s": 120,
+            "upstream_chunk_idle_s": 120,
+            "upstream_total_s": 120,  # 非流式侧仍须 < 90s ⇒ 违规
+        },
+    )
+    with pytest.raises(ProtocolVersionError) as ei:
+        await startup_self_check()
+    assert "上游总超时" in str(ei.value), (
+        f"非流式总超时必须仍按空闲上限 90s 对标、不得随 keepalive 放宽：{ei.value}"
+    )
 
 
 # ==================================================== P1-9 对外那一半：平台自己的 SSE 错误帧

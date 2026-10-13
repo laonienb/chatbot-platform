@@ -86,11 +86,19 @@ class Control:
                 # ⚠️ 与**真实服务同形**：`msvc/main.py` 把 timeouts 放在 `features` 里。
                 # 桩若放在顶层，平台侧测试就会对着一个真实服务永远给不出的形状断言
                 # （红线 8 的启动断言正是这样在生产里静默失效的，见 model_service_ops）。
+                #
+                # RB-3：四项**缺一不可**（平台侧"缺键即失败"，v1.7-澄清5）。值取
+                # `msvc/config.py` 的代码默认（15/60/30/60），与真实服务逐项同值。
                 "timeouts": {
                     "upstream_first_token_s": 15,
+                    "upstream_first_content_s": 60,
                     "upstream_chunk_idle_s": 30,
                     "upstream_total_s": 60,
                 },
+                # RB-3（协议 §28.2）：与真实服务同形——`MS_UPSTREAM=fake` 的实现**不发**心跳
+                # （`msvc/main.py:capabilities` 按 `upstream == "litellm"` 推导），故这里也是
+                # False。桩若写 True，平台侧测试就会在"对标 180s"的分支上空转。
+                "stream_keepalive": False,
             },
             "implementation": {"name": "fake-model-service", "version": "0.1.0"},
         }

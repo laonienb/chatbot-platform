@@ -116,25 +116,104 @@ async def startup_self_check() -> None:
     # ⇒ 对真实服务永远读不到，再叠上"字段缺失即跳过"，红线 8 断言在生产里**静默不执行**
     # （P2-2 名义闭合、实则从未触发，与 P1-8 是同一类"两端各跑自家桩"的盲区）。
     # 层级应由架构师在条文里钉死；实现先做兼容读，见工作单 P1-9 回执。
-    timeouts = caps.get("timeouts") or (caps.get("features") or {}).get("timeouts") or {}
+    features = caps.get("features") or {}
+    timeouts = caps.get("timeouts") or features.get("timeouts") or {}
+
+    # ── RB-3：**缺键即失败**（协议 §8.1 硬约束 2，v1.7-澄清5 增补）────────────────────
+    # 此前这里写的是 `if inner is None: continue`，注释给的理由是"Proxy 过渡期无
+    # capabilities 契约（§8.3）"—— **那个理由是假的**：proxy 模式在本函数开头
+    # （`mode == "proxy"` 那一支）**已经 return**，根本走不到这个循环。它保护的不是 proxy，
+    # 只是把 native 路径的缺键**静默吞掉**：整个 `timeouts` 缺失时每个键都是 `None`、
+    # 全部 `continue`，于是断言一条都不执行、**零日志零警告**。这正是 P2-2「名义闭合、
+    # 实则空转」的真相。role 卡 §3.4 明令禁止用注释缩小契约范围，故连带删掉假理由。
+    required_keys = (
+        "upstream_first_token_s",
+        "upstream_first_content_s",
+        "upstream_chunk_idle_s",
+        "upstream_total_s",
+    )
+    missing = [k for k in required_keys if timeouts.get(k) is None]
+    if missing:
+        raise ProtocolVersionError(
+            f"capabilities 缺少超时声明键 {missing}（§8.1 硬约束 2，v1.7-澄清5：缺键即失败）。"
+            f"规范位置 = features.timeouts（当前读到的 timeouts = {timeouts!r}）。"
+            f"模型服务实现应暴露 {list(required_keys)} 四项实际值；"
+            f"平台**不会**「字段缺失即跳过」——那正是红线 8 断言在生产里从未执行的原因。"
+        )
+
+    # ── RB-4：内层预算的**对标对象**取决于服务是否真会发心跳（协议 §8.1 硬约束 2，
+    # v1.7-澄清5 的 A 裁定）────────────────────────────────────────────────────────
+    # 服务会发 `: keepalive` ⇒ 平台「流式空闲上限 90s」**永不触发**（心跳持续复位它），
+    # 真正的外层边界是「绝对上限 180s」；不发 ⇒ 仍是空闲上限。对标错了就是两种误判：
+    # ① 会发心跳的服务把内层设成 120s（合法，<180s）被拦下；② 断言放行但流被 180s 砍断、
+    # 归因成"上游超时"。
+    #
+    # 声明位**缺失即失败**（RB-3-3 的"缺键即失败"清单含本键）：此处**不**回落保守侧——
+    # 保守侧只用于"显式声明了 false"，见下条. 两种情况都是**拒启动**（fail-closed），
+    # 但缺失必须点名报错，否则运维只会看到一个语焉不详的分层违规。
+    if "stream_keepalive" not in features:
+        raise ProtocolVersionError(
+            "capabilities 缺少声明键 features.stream_keepalive（§28.2）。平台据它决定流式"
+            "内层预算对标「空闲上限 90s」还是「绝对上限 180s」；缺失无法判断，拒绝启动。"
+            "模型服务应在 capabilities 的 features 里声明本服务是否会在推理静默期发 "
+            "`: keepalive`（值必须与真实行为一致，写死 true 会造出虚假的安全感）。"
+        )
+    keepalive = features.get("stream_keepalive") is True
+
     outer_idle = float(s.model_service_stream_idle_timeout)
+    outer_abs = float(s.model_service_stream_max_duration)
+    if keepalive:
+        # 心跳会不断复位空闲计时 ⇒ 真外层是绝对上限。
+        outer, outer_label, outer_cfg = (
+            outer_abs,
+            "平台流式绝对上限",
+            "MODEL_SERVICE_STREAM_MAX_DURATION",
+        )
+    else:
+        # 不发心跳（显式 false）⇒ **保守侧**：空闲上限是真外层。
+        outer, outer_label, outer_cfg = (
+            outer_idle,
+            "平台流式空闲上限",
+            "MODEL_SERVICE_STREAM_IDLE_TIMEOUT",
+        )
+
+    # 流式三项按上面选出的外层对标。文案**参数化**（工作单 B2 要求"按保守侧给出原因"）：
+    # 硬写"90s"会让 keepalive=true 时的报错指向一个根本没参与判定的配置。
     for key, label in (
-        ("upstream_total_s", "上游总超时"),
         ("upstream_first_token_s", "首 token 超时"),
-        # H2 / O1：中途空闲预算同样必须 < 平台空闲上限，否则平台先断开、
+        ("upstream_first_content_s", "首个正文 token 超时"),
+        # H2 / O1：中途空闲预算同样必须 < 外层，否则平台先断开、
         # 服务侧的 `upstream_chunk_timeout` 归因永远看不到。
         ("upstream_chunk_idle_s", "中途空闲预算"),
     ):
-        inner = timeouts.get(key)
-        if inner is None:
-            continue  # Proxy 过渡期无 capabilities 契约 → 跳过（§8.3）
-        if float(inner) >= outer_idle:
+        inner = float(timeouts[key])
+        if inner >= outer:
             raise ProtocolVersionError(
-                f"超时分层违反红线 8：模型服务{label} {inner}s ≥ 平台流式空闲上限 "
-                f"{outer_idle}s。内层必须严格小于外层，否则平台会先断开（钱花了、回包丢了）。"
-                f"请调小模型服务该项超时或调大 MODEL_SERVICE_STREAM_IDLE_TIMEOUT。"
+                f"超时分层违反红线 8：模型服务{label} {inner}s ≥ {outer_label} "
+                f"{outer}s（判定依据：capabilities features.stream_keepalive={keepalive}）。"
+                f"内层必须严格小于外层，否则平台会先断开（钱花了、回包丢了）。"
+                f"请调小模型服务该项超时或调大 {outer_cfg}。"
             )
-    logger.info("模型服务自检通过：native 模式，协议版本 %s", pv)
+
+    # `upstream_total_s` **仅约束非流式**（协议 §8.1 表），按平台读超时口径对标，**不**随
+    # `stream_keepalive` 放宽：把它并进上面的循环会让 keepalive=true 时一条非流式预算
+    # 被对标到 180s，即"放过了头"（工作单 W-1 架构师裁定 §五）。对标基准的修订另立单。
+    total = float(timeouts["upstream_total_s"])
+    if total >= outer_idle:
+        raise ProtocolVersionError(
+            f"超时分层违反红线 8：模型服务上游总超时 {total}s ≥ 平台流式空闲上限 "
+            f"{outer_idle}s。（本项仅约束非流式调用，故对标基准固定为空闲上限、不随 "
+            f"features.stream_keepalive 放宽。）请调小模型服务该项超时或调大 "
+            f"MODEL_SERVICE_STREAM_IDLE_TIMEOUT。"
+        )
+    logger.info(
+        "模型服务自检通过：native 模式，协议版本 %s，流式内层预算对标 %s %ss"
+        "（stream_keepalive=%s）",
+        pv,
+        outer_label,
+        outer,
+        keepalive,
+    )
 
 
 async def sync_catalog(db: AsyncSession) -> dict:

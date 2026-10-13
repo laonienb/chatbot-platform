@@ -134,6 +134,41 @@ async def test_sw1_provider_no_cost_never_zero(monkeypatch):
     assert xms["cost_usd"] != 0 and xms["cost_usd"] != "0"
 
 
+async def test_rb3_litellm_provider_emits_keepalive_for_reasoning_chunk(monkeypatch):
+    """RB-3-2 的**推导依据**：真实 provider 对 reasoning-only chunk 真的产 `keepalive` 事件。
+
+    这是 `capabilities.features.stream_keepalive = (upstream == "litellm")` 那条推导的地基：
+    若 `LiteLLMProvider.stream` 哪天不再为"无正文、无 finish_reason"的 chunk 产出事件，
+    声明位就会变成**假声明**（平台按 180s 对标、真实一行心跳都没有）——而契约用例
+    （`test_contract.py::test_rb3_stream_keepalive_true_for_litellm_upstream`）只看声明、
+    看不到这里，故本用例必须单独存在。
+
+    只推理的那一段：`delta` 里既没有 `content`、也没有 `finish_reason`（真实 reasoning 模型
+    的常见形态，如 `delta.reasoning_content`）⇒ 必须产 `keepalive`；
+    而**带** `finish_reason` 的收尾 chunk **不**产心跳（§6.6 事件顺序不能被它插行）。
+    """
+    _install_fake_litellm(monkeypatch, chunks=[
+        # ① 纯推理：无 content、无 finish_reason ⇒ 心跳
+        {"model": "deepseek/deepseek-chat",
+         "choices": [{"index": 0, "delta": {"reasoning_content": "想一想"}, "finish_reason": None}]},
+        # ② role-only / 空 delta ⇒ 同样是"不产出正文"，也须心跳
+        {"model": "deepseek/deepseek-chat",
+         "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]},
+        # ③ 正文
+        {"model": "deepseek/deepseek-chat",
+         "choices": [{"index": 0, "delta": {"content": "你好"}, "finish_reason": None}]},
+        # ④ 收尾：带 finish_reason ⇒ **不得**再产心跳
+        {"model": "deepseek/deepseek-chat",
+         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+    ])
+    events = await _collect(LiteLLMProvider().stream(_body(), Scenario()))
+    kinds = [e["kind"] for e in events]
+    assert kinds == ["keepalive", "keepalive", "chunk", "finish", "terminate", "done"], (
+        f"推理期心跳与收尾事件顺序不对：{kinds}。"
+        f"①②必须各产一条心跳（stream_keepalive=true 的推导依据），④不得产心跳"
+    )
+
+
 async def test_sw1_provider_complete_maps_real_error_not_bare(monkeypatch):
     """非流式：真实 litellm 异常必须带 §7 code（此前裸抛 → 500 无 code）。"""
     _install_fake_litellm(monkeypatch, raise_at_call=_AuthErr())

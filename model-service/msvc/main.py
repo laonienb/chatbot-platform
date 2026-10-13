@@ -524,6 +524,26 @@ async def _handle_stream(request, body, model, scenario, idem) -> Response:
 
 
 async def capabilities(request: Request) -> Response:
+    """§8.1-2 / §28.2：向平台自述**实际**超时值与「是否真会发心跳」。
+
+    `stream_keepalive` 是**推导值、不是写死的常量**（RB-3，工作单 W-1 架构师裁定）：
+    平台据它决定流式内层预算对标 90s（空闲上限）还是 180s（绝对上限），
+    写死 `true` 就是一份**假声明** ⇒ 平台按 180s 对标、真实保护只有 90s，
+    比不做这个功能更坏（虚假的安全感）。故本键必须与"本进程是否真会发心跳"一致：
+
+    - `MS_UPSTREAM=litellm` ⇒ **会发**。`LiteLLMProvider.stream` 对**任何**不产出正文、
+      也不带 `finish_reason` 的上游 chunk（reasoning-only 最常见）产出 `keepalive` 事件，
+      `_handle_stream` 再渲染成 `: keepalive` 注释行（§28.1／§28.2）；
+    - `MS_UPSTREAM=fake` ⇒ **不发**。假上游只在 `Scenario` 显式打开
+      `reasoning_only_chunks` / `keepalive_during_silence` 时产心跳，而生产建 app 用的是
+      默认 `Scenario()`（`create_app`）⇒ 一行心跳都没有。**出厂默认部署就是 fake**
+      （`deploy/docker-compose.yml` 的 `${MS_UPSTREAM:-fake}`、`deploy/.env.example`）,
+      所以键的默认值是 `false`。
+
+    该推导的**另一半防线**在用例里：`tests/test_contract.py` 锁"声明位 == 实际 provider"，
+    `tests/test_real_upstream.py` 锁"litellm provider 对 reasoning-only chunk 真的产心跳"
+    ——两条合起来才排除"声明说有、实现没有"。
+    """
     s = get_settings()
     return JSONResponse(
         {
@@ -534,9 +554,13 @@ async def capabilities(request: Request) -> Response:
                 "routing_hints": True,
                 "compliance_policies": ["cn_only_providers"],
                 "idempotency_window_seconds": s.idempotency_window_seconds,
-                # §8.1-2：暴露实际超时值供平台启动断言「内层 < 外层」
+                # §28.2：声明"推理静默期会发 `: keepalive`"（推导值，见 docstring）。
+                "stream_keepalive": s.upstream == "litellm",
+                # §8.1-2：暴露实际超时值供平台启动断言「内层 < 外层」。
+                # 四项缺一不可：平台侧**缺键即失败**（v1.7-澄清5），不再"缺失即跳过"。
                 "timeouts": {
                     "upstream_first_token_s": s.upstream_first_token_timeout,
+                    "upstream_first_content_s": s.upstream_first_content_timeout,
                     "upstream_chunk_idle_s": s.upstream_chunk_idle_timeout,
                     "upstream_total_s": s.upstream_total_timeout,
                 },
