@@ -1,6 +1,17 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  type AutoAdvanceRule,
+  type AutoAdvanceState,
+  loadRound,
+  loadState,
+  mergeDueMessage,
+  persistState,
+  pickDueRules,
+  sanitizeRules,
+  saveRound,
+} from "@/lib/autoAdvance";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { createPortal } from "react-dom";
@@ -91,6 +102,85 @@ export default function ChatPage() {
   const pacedTextRef = useRef("");
   /** 当前这条临时气泡的 id：收尾对齐时要确认它还在末尾（切会话后不能乱接）。 */
   const streamBubbleIdRef = useRef<string | null>(null);
+
+  // ---- 自动推进（auto-advance）----
+  // 规则存 localStorage（按会话隔离），轮次计数也存 localStorage。
+  // autoStateRef 是唯一真源：闭包里读它，避免 setState 时序问题。
+  const autoStateRef = useRef<AutoAdvanceState>({ rules: [], enabled: false });
+  const [autoRules, setAutoRules] = useState<AutoAdvanceRule[]>([]);
+  const [autoEnabled, setAutoEnabled] = useState(false);
+  const [autoRound, setAutoRound] = useState(0);
+  const [autoPanelOpen, setAutoPanelOpen] = useState(false);
+  /** 正在等待自动推进触发的会话；null = 没有挂起的自动发送。 */
+  const autoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  /** 会话切换/挂载时，把该会话的推进状态从 localStorage 恢复到内存。 */
+  const syncAutoState = useCallback((conversationId: string) => {
+    const s = loadState(conversationId);
+    autoStateRef.current = s;
+    setAutoRules(s.rules);
+    setAutoEnabled(s.enabled);
+    setAutoRound(loadRound(conversationId));
+  }, []);
+
+  /** 把内存里的规则写回 localStorage（持久化入口）。 */
+  const commitAutoState = useCallback(
+    (conversationId: string, next: AutoAdvanceState) => {
+      autoStateRef.current = next;
+      persistState(conversationId, next);
+      setAutoRules(next.rules);
+      setAutoEnabled(next.enabled);
+    },
+    []
+  );
+
+  const toggleAuto = useCallback(
+    (conversationId: string, on: boolean) => {
+      if (on) saveRound(conversationId, 0), setAutoRound(0); // 开启 ⇒ 从 0 重新计数
+      const next = { ...autoStateRef.current, enabled: on };
+      commitAutoState(conversationId, next);
+    },
+    [commitAutoState]
+  );
+
+  /**
+   * 回复正常收尾后的推进入口。只在 send() 的成功路径调用。
+   * - 计数 +1；
+   * - 取到期的规则合并成一条消息，挂一个 setTimeout 触发发送；
+   * - 任何情况下不 throw（推进失败不能影响正常收尾）。
+   */
+  const maybeAutoAdvance = useCallback(
+    (conversationId: string) => {
+      try {
+        const s = autoStateRef.current;
+        if (!s.enabled) return;
+        const round = loadRound(conversationId) + 1;
+        saveRound(conversationId, round);
+        setAutoRound(round);
+        const due = mergeDueMessage(pickDueRules(s.rules, round));
+        if (!due) return;
+        // 延迟一拍：让收尾的 setStreaming(false) 先提交，避免 send() 里
+        // `if (streaming) return` 的守卫读到的还是旧值。
+        autoTimerRef.current = setTimeout(() => {
+          autoTimerRef.current = null;
+          void autoSendRef.current?.(due);
+        }, 50);
+      } catch {
+        // 推进出错静默：功能坏了不能把聊天也弄坏。
+      }
+    },
+    []
+  );
+
+  /** send() 的稳定引用（见下）：自动推进不经过用户输入框，直接以此内容发送。 */
+  const autoSendRef = useRef<((content: string) => Promise<void>) | null>(null);
+  useEffect(
+    () => () => {
+      // 卸载时清掉挂起的自动发送，避免打在已卸载组件上。
+      if (autoTimerRef.current) clearTimeout(autoTimerRef.current);
+    },
+    []
+  );
 
   const scrollToBottom = useCallback(() => {
     requestAnimationFrame(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }));
@@ -240,6 +330,8 @@ export default function ChatPage() {
       setActiveId(id);
       setMessages([]);
       setHasMore(false);
+      setAutoPanelOpen(false); // 面板若开着，别让它编辑到新会话的规则
+      syncAutoState(id); // 恢复该会话的自动推进规则与开关
       try {
         const msgs = await platformApi.messages(id, { limit: PAGE_SIZE });
         setMessages(msgs);
@@ -249,7 +341,7 @@ export default function ChatPage() {
         setError(err instanceof Error ? err.message : "加载会话失败");
       }
     },
-    [disposePacing, scrollToBottom]
+    [disposePacing, scrollToBottom, syncAutoState]
   );
 
   /** 点人设：优先接续该人设最近的会话，没有才新建。 */
@@ -274,6 +366,7 @@ export default function ChatPage() {
       setActiveId(conv.id);
       setMessages(await platformApi.messages(conv.id));
       setHasMore(false);
+      syncAutoState(conv.id); // 新会话：恢复（必为空态）
       scrollToBottom();
     } catch (err) {
       setError(err instanceof Error ? err.message : "创建会话失败");
@@ -337,11 +430,14 @@ export default function ChatPage() {
     }
   }
 
-  async function send() {
-    if (!activeId || !input.trim() || streaming) return;
-    const content = input.trim();
+  async function send(autoContent?: string) {
+    if (!activeId || streaming) return;
+    // 自动推进走的发送路径：内容来自规则，不读也不清输入框。
+    const isAuto = typeof autoContent === "string";
+    const content = isAuto ? autoContent : input.trim();
+    if (!content) return;
     const conversationId = activeId;
-    setInput("");
+    if (!isAuto) setInput("");
     setStreaming(true);
     setReplyStarted(false);
     setError(null);
@@ -383,6 +479,8 @@ export default function ChatPage() {
       setError(null); // 清掉退避期间的「N 秒后自动重试」提示
       await finishStream(conversationId, false); // 正常收尾：按速率放完，不跳变
       setConversations(await platformApi.conversations());
+      // 自动推进：只在正常收尾后触发（错误/停止路径不进来，天然满足）。
+      maybeAutoAdvance(conversationId);
     } catch (err) {
       // 收尾前先把缓冲排空：错误必须**立刻**看得见，不能让积压继续慢慢放。
       // 判据 C2（流内错误帧）/C3（开流前 502）要的就是这一下 —— 指示撤掉、错误显示出来。
@@ -398,6 +496,12 @@ export default function ChatPage() {
       scrollToBottom();
     }
   }
+
+  // 自动推进的发送入口：send 会随每次渲染重建，这里用 ref 持有最新实例，
+  // setTimeout 的回调经它调用（避免闭包捕获过期状态）。
+  useEffect(() => {
+    autoSendRef.current = (content: string) => send(content);
+  });
 
   async function regenerate() {
     if (!activeId || streaming) return;
@@ -805,6 +909,32 @@ export default function ChatPage() {
               <div ref={bottomRef} />
             </div>
             <footer className="composer">
+              <div className="composer-left">
+                <button
+                  type="button"
+                  className={`auto-toggle ${autoEnabled ? "on" : ""}`}
+                  title={autoEnabled ? "自动推进已开启（点击关闭）" : "自动推进已关闭（点击开启）"}
+                  aria-pressed={autoEnabled}
+                  onClick={() => {
+                    if (!activeId) return;
+                    setAutoPanelOpen(true);
+                    if (!autoEnabled) toggleAuto(activeId, true);
+                  }}
+                >
+                  <span className="auto-knob" aria-hidden />
+                  自动推进
+                </button>
+                {autoEnabled && (
+                  <button
+                    type="button"
+                    className="auto-round-chip"
+                    title="点击编辑自动推进规则"
+                    onClick={() => setAutoPanelOpen(true)}
+                  >
+                    第 {autoRound} 轮 · {autoRules.filter((r) => r.enabled).length} 条规则
+                  </button>
+                )}
+              </div>
               <textarea
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
@@ -823,7 +953,7 @@ export default function ChatPage() {
                   <IconStop /> 停止
                 </button>
               ) : (
-                <button className="primary" onClick={send} disabled={!input.trim()}>
+                <button className="primary" onClick={() => send()} disabled={!input.trim()}>
                   发送
                 </button>
               )}
@@ -866,6 +996,17 @@ export default function ChatPage() {
         />
       )}
 
+      {autoPanelOpen && activeId && (
+        <AutoAdvancePanel
+          conversationId={activeId}
+          state={{ rules: autoRules, enabled: autoEnabled }}
+          round={autoRound}
+          onClose={() => setAutoPanelOpen(false)}
+          onChange={(next) => commitAutoState(activeId, next)}
+          onToggle={(on) => toggleAuto(activeId, on)}
+        />
+      )}
+
       {showSettings && (
         <SettingsModal
           me={me}
@@ -876,6 +1017,130 @@ export default function ChatPage() {
           }}
         />
       )}
+    </div>
+  );
+}
+
+function AutoAdvancePanel({
+  conversationId,
+  state,
+  round,
+  onClose,
+  onChange,
+  onToggle,
+}: {
+  conversationId: string;
+  state: AutoAdvanceState;
+  round: number;
+  onClose: () => void;
+  onChange: (s: AutoAdvanceState) => void;
+  onToggle: (on: boolean) => void;
+}) {
+  const [drafts, setDrafts] = useState<Array<{ content: string; interval: string }>>(() =>
+    state.rules.map((r) => ({ content: r.content, interval: String(r.interval) }))
+  );
+  const [error, setError] = useState<string | null>(null);
+
+  function addRule() {
+    setDrafts((prev) => [...prev, { content: "继续", interval: "1" }]);
+  }
+
+  function removeRule(i: number) {
+    setDrafts((prev) => prev.filter((_, idx) => idx !== i));
+  }
+
+  function save() {
+    const cleaned = drafts.map((d) => ({
+      content: d.content,
+      interval: d.interval,
+      enabled: true,
+    }));
+    for (const d of cleaned) {
+      const n = Number(d.interval);
+      if (!Number.isInteger(n) || n < 1) {
+        setError(`间隔必须是 ≥1 的整数（收到「${d.interval}」）`);
+        return;
+      }
+      if (!d.content.trim()) {
+        setError("规则内容不能为空");
+        return;
+      }
+    }
+    setError(null);
+    // 规则变更 ⇒ 计数清零重新起算，避免旧计数对新规则语义错位。
+    saveRound(conversationId, 0);
+    onChange({
+      rules: sanitizeRules(cleaned),
+      enabled: state.enabled,
+    });
+    onClose();
+  }
+
+  return (
+    <div className="modal-mask" onClick={onClose}>
+      <div
+        className="modal auto-advance-panel"
+        role="dialog"
+        aria-label="自动推进规则"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h3>自动推进</h3>
+        <p className="auto-advance-hint">
+          开启后，每轮模型回复正常结束，都会按下面的规则自动发送一条消息让剧情继续。
+          多条规则同一轮到期时，会合并成一条消息发送。
+        </p>
+        <label className="auto-advance-switch">
+          <input
+            type="checkbox"
+            checked={state.enabled}
+            onChange={(e) => onToggle(e.target.checked)}
+          />
+          开启自动推进（当前第 {round} 轮）
+        </label>
+        <div className="auto-advance-rules">
+          {drafts.length === 0 && <p className="auto-advance-empty">还没有规则，先加一条。</p>}
+          {drafts.map((d, i) => (
+            <div className="auto-advance-rule" key={i}>
+              <textarea
+                value={d.content}
+                rows={2}
+                placeholder="自动发送的内容，例如：继续"
+                onChange={(e) =>
+                  setDrafts((prev) => prev.map((x, idx) => (idx === i ? { ...x, content: e.target.value } : x)))
+                }
+              />
+              <label className="auto-advance-interval">
+                每
+                <input
+                  type="number"
+                  min={1}
+                  step={1}
+                  value={d.interval}
+                  onChange={(e) =>
+                    setDrafts((prev) => prev.map((x, idx) => (idx === i ? { ...x, interval: e.target.value } : x)))
+                  }
+                />
+                轮回复后发送
+              </label>
+              <button type="button" className="auto-advance-remove" onClick={() => removeRule(i)}>
+                删除
+              </button>
+            </div>
+          ))}
+          <button type="button" className="auto-advance-add" onClick={addRule}>
+            + 添加规则
+          </button>
+        </div>
+        {error && <p className="auto-advance-error">{error}</p>}
+        <div className="auto-advance-actions">
+          <button type="button" onClick={onClose}>
+            取消
+          </button>
+          <button type="button" className="primary" onClick={save}>
+            保存
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

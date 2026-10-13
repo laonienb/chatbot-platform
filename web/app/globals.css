@@ -1121,6 +1121,182 @@ button.stop {
   font-size: 15px;
 }
 
+/* ---------- 自动推进 ---------- */
+
+/* composer 左侧列：开关 + 状态 chip 竖排，不挤压输入框。 */
+.composer-left {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  gap: 4px;
+  flex-shrink: 0;
+}
+.auto-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  align-self: flex-start;
+}
+.auto-toggle .auto-knob {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-faint);
+  transition: background 0.15s ease;
+}
+.auto-toggle.on {
+  color: var(--text);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.auto-toggle.on .auto-knob {
+  background: var(--accent);
+}
+.auto-round-chip {
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  border: none;
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+  align-self: flex-start;
+}
+.auto-round-chip:hover {
+  color: var(--text-dim);
+  background: var(--bg-hover);
+}
+
+.auto-advance-panel {
+  max-width: 520px;
+  width: min(520px, calc(100vw - 32px));
+}
+.auto-advance-hint {
+  margin: 8px 0 12px;
+  color: var(--text-dim);
+  font-size: 13px;
+  line-height: 1.6;
+}
+.auto-advance-switch {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  font-size: 14px;
+  cursor: pointer;
+}
+.auto-advance-rules {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.auto-advance-empty {
+  color: var(--text-faint);
+  font-size: 13px;
+  margin: 0;
+}
+.auto-advance-rule {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-elevated);
+}
+.auto-advance-rule textarea {
+  flex: 1 1 200px;
+  resize: vertical;
+  min-height: 40px;
+  border-radius: 8px;
+  font-size: 13px;
+}
+.auto-advance-interval {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.auto-advance-interval input {
+  width: 64px;
+  height: 30px;
+  border-radius: 8px;
+  text-align: center;
+}
+.auto-advance-remove {
+  height: 30px;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 12px;
+  cursor: pointer;
+}
+.auto-advance-remove:hover {
+  color: #ff6b7a;
+  border-color: #ff6b7a;
+}
+.auto-advance-add {
+  align-self: flex-start;
+  height: 32px;
+  padding: 0 12px;
+  border-radius: 8px;
+  border: 1px dashed var(--border-strong);
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 13px;
+  cursor: pointer;
+}
+.auto-advance-add:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+.auto-advance-error {
+  color: #ff6b7a;
+  font-size: 13px;
+  margin: 4px 0 8px;
+}
+.auto-advance-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 8px;
+}
+.auto-advance-actions button {
+  height: 34px;
+  padding: 0 14px;
+  border-radius: 10px;
+  border: 1px solid var(--border-strong);
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 13px;
+  cursor: pointer;
+}
+.auto-advance-actions button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.auto-advance-actions button.primary:hover {
+  background: var(--accent-hover);
+}
+
 .chat-empty {
   flex: 1;
   display: flex;
