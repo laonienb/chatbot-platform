@@ -148,16 +148,12 @@ async def startup_self_check() -> None:
     # ① 会发心跳的服务把内层设成 120s（合法，<180s）被拦下；② 断言放行但流被 180s 砍断、
     # 归因成"上游超时"。
     #
-    # 声明位**缺失即失败**（RB-3-3 的"缺键即失败"清单含本键）：此处**不**回落保守侧——
-    # 保守侧只用于"显式声明了 false"，见下条. 两种情况都是**拒启动**（fail-closed），
-    # 但缺失必须点名报错，否则运维只会看到一个语焉不详的分层违规。
-    if "stream_keepalive" not in features:
-        raise ProtocolVersionError(
-            "capabilities 缺少声明键 features.stream_keepalive（§28.2）。平台据它决定流式"
-            "内层预算对标「空闲上限 90s」还是「绝对上限 180s」；缺失无法判断，拒绝启动。"
-            "模型服务应在 capabilities 的 features 里声明本服务是否会在推理静默期发 "
-            "`: keepalive`（值必须与真实行为一致，写死 true 会造出虚假的安全感）。"
-        )
+    # 声明位缺失**不**拒启动（协议 §8.1 硬约束 2 末尾，v1.7-澄清6）：
+    # 它是**能力放宽位**，只在显式 true 时才把对标放宽到 180s ⇒ 缺失本身即安全的确定值
+    # （不可能比 90s 宽），断言照常执行、无静默跳过 ⇒ 与显式 false 同待遇。
+    # 这与**超时键**的"缺失即失败"不矛盾：超时键缺失时「内层 < 外层」**根本无从执行**
+    # （P2-2 空转病根），而本键缺失不影响断言可执行性。且本键随本批新增，拒启动会让
+    # 平台拒绝与任何未升级的旧服务启动（滚动升级先升平台 = 自造停服），换不到任何安全收益。
     keepalive = features.get("stream_keepalive") is True
 
     outer_idle = float(s.model_service_stream_idle_timeout)
@@ -170,7 +166,8 @@ async def startup_self_check() -> None:
             "MODEL_SERVICE_STREAM_MAX_DURATION",
         )
     else:
-        # 不发心跳（显式 false）⇒ **保守侧**：空闲上限是真外层。
+        # 不发心跳（显式 false **或声明位缺失**，v1.7-澄清6 两者同待遇）⇒ **保守侧**：
+        # 空闲上限是真外层。
         outer, outer_label, outer_cfg = (
             outer_idle,
             "平台流式空闲上限",

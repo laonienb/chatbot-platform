@@ -1503,12 +1503,51 @@ async def test_rb3_missing_timeout_key_refuses_startup(remote_mode, monkeypatch,
     assert "缺" in msg, f"必须是缺键类报错（不是分层违规）：{msg}"
 
 
-async def test_rb3_missing_stream_keepalive_refuses_startup(remote_mode, monkeypatch):
-    """A3②（§28.2）：caps 缺 `features.stream_keepalive` ⇒ **拒绝启动**，报错点名该键。
+async def test_rb3_missing_stream_keepalive_starts_on_conservative_side(remote_mode, monkeypatch):
+    """C1（§8.1 硬约束 2 末尾，v1.7-澄清6）：caps 缺 `features.stream_keepalive`
+    ⇒ **照常启动**（不得拒启动），且按**保守侧**对标。
 
-    与上一条**分属两条判定路径**（超时四项走循环、声明位走独立检查），必须各有一条用例，
-    否则其中一条分支无人看守。声明位缺失时**不**静默回落保守侧：保守侧只适用于"显式声明
-    了 false"，缺失是服务没履约（协议 §8.1 硬约束 2 把它列进"缺键即失败"清单）。
+    声明位与超时键**不是同一类**，判据必须分开：超时键缺失时「内层 < 外层」这条断言
+    **根本无从执行**（P2-2「名义闭合、实则空转」的病）⇒ 必须失败；而声明位是**能力放宽位**，
+    只在**显式 `true`** 时才把对标放宽到 180s ⇒ **缺失本身就是一个安全的确定值**
+    （不可能比 90s 宽），断言照常执行、没有任何静默跳过 ⇒ 与显式 `false` 同待遇。
+
+    两条工程理由：该键随本批**新增**，拒启动会让平台**拒绝与任何未升级的旧服务启动**
+    （滚动升级先升平台 = 自造停服，属运维必然去关掉的检查）；且它**不带来任何安全收益**
+    （缺失不可能放宽）。
+
+    mutation（本用例的牙齿）：把缺失改回 `raise ProtocolVersionError`（`3fa62c9` 的旧行为）
+    ⇒ 本用例必须红。
+
+    ⚠️ **本用例必须与下一条 `..._still_benchmarks_idle_cap` 配对**：只有 C1 的话，
+    "缺失 ⇒ 当成 true（放宽到 180s）"这个错误实现也会**全绿**。另一半才是
+    "缺失确实落在保守侧"的证据。
+    """
+    from app.config import get_settings
+    from app.llm.model_service_ops import startup_self_check
+
+    control, _ = remote_mode
+    monkeypatch.setattr(get_settings(), "model_service_stream_idle_timeout", 90.0)
+    monkeypatch.setattr(get_settings(), "model_service_stream_max_duration", 180.0)
+    caps = _valid_caps()  # 内层 15/60/30/60 全部合法（< 90s 保守侧）
+    del caps["features"]["stream_keepalive"]
+    control.capabilities = caps
+
+    await startup_self_check()  # 不抛即通过：缺失**不**拒启动
+
+
+async def test_rb3_missing_stream_keepalive_still_benchmarks_idle_cap(remote_mode, monkeypatch):
+    """C2（同一条裁定的另一半）：caps 缺 `features.stream_keepalive` ＋ 内层 120s
+    ⇒ **必须失败**，且原因必须指向**保守侧**（空闲上限 90s）。
+
+    这一半比"能启动"更有价值：它证明缺失落的是**保守侧**、**不是被放过**。
+    （120s < 绝对上限 180s ⇒ 若实现把缺失当成 `true`，这条就放行了 ⇒ 红线 8 被静默放水。）
+
+    mutation（本用例的牙齿）：把缺失当成 `true`（`keepalive = features.get("stream_keepalive", True) is True`）
+    ⇒ 本用例必须红。
+
+    ⚠️ 与 C1 配对才锁得住"缺失 ⇒ 保守侧 90s"：只有 C2 的话，"缺失即拒启动"（`3fa62c9`
+    的旧行为）也会全绿——两种相反的错法都过得去。
     """
     from app.config import get_settings
     from app.llm.model_service_ops import ProtocolVersionError, startup_self_check
@@ -1516,14 +1555,24 @@ async def test_rb3_missing_stream_keepalive_refuses_startup(remote_mode, monkeyp
     control, _ = remote_mode
     monkeypatch.setattr(get_settings(), "model_service_stream_idle_timeout", 90.0)
     monkeypatch.setattr(get_settings(), "model_service_stream_max_duration", 180.0)
-    caps = _valid_caps()
+    caps = _valid_caps(
+        timeouts={
+            "upstream_first_token_s": 15,
+            "upstream_first_content_s": 120,  # < 180s 绝对上限，但 ≥ 90s 空闲上限 ⇒ 保守侧下违规
+            "upstream_chunk_idle_s": 30,
+            "upstream_total_s": 60,
+        },
+    )
     del caps["features"]["stream_keepalive"]
     control.capabilities = caps
 
     with pytest.raises(ProtocolVersionError) as ei:
         await startup_self_check()
-    assert "stream_keepalive" in str(ei.value), (
-        f"报错必须点名 stream_keepalive：{ei.value}"
+    msg = str(ei.value)
+    assert "空闲上限" in msg, f"缺失必须按**保守侧**对标（不是放宽到 180s）：{msg}"
+    assert "MODEL_SERVICE_STREAM_IDLE_TIMEOUT" in msg, f"必须指出该调哪个配置：{msg}"
+    assert "stream_keepalive=False" in msg, (
+        f"必须说明判定依据是声明位（缺失被当作 False 处理）：{msg}"
     )
 
 

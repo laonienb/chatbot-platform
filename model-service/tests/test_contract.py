@@ -313,7 +313,11 @@ async def test_t9_capabilities_version_and_timeouts(client):
     d = (await client.get("/v1/capabilities")).json()
     assert d["protocol_version"] == 1
     to = d["features"]["timeouts"]
-    # §8.1 红线8：模型服务上游总超时 < 平台流式空闲上限（90s）
+    # §8.1 红线8：模型服务上游总超时 < 平台流式空闲上限（90s）。
+    # ⚠️ 措辞更正（v1.7-澄清5／W-3 §2-4）：90s 只是**流式三项**在"不发心跳/声明位缺失"
+    # 那一档的对标（保守侧）；发心跳时流式三项标的对象是**绝对上限 180s**。本项
+    # `upstream_total_s` **仅约束非流式**、按平台读超时口径，故固定对 90s——断言值本身
+    # 仍然成立、不动（对标基准的修订见 W-2）。
     assert to["upstream_total_s"] < 90 and to["upstream_first_token_s"] <= to["upstream_total_s"]
 
 

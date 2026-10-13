@@ -76,6 +76,11 @@ services:
       MS_UPSTREAM_FIRST_TOKEN_TIMEOUT: ${MS_UPSTREAM_FIRST_TOKEN_TIMEOUT:-15}
       MS_UPSTREAM_CHUNK_IDLE_TIMEOUT: ${MS_UPSTREAM_CHUNK_IDLE_TIMEOUT:-30}
       MS_UPSTREAM_TOTAL_TIMEOUT: ${MS_UPSTREAM_TOTAL_TIMEOUT:-60}
+      # RB-1（协议 §28.1）：**首个正文 token** 预算（到首个非空 `delta.content`，含推理时长）。
+      # 上面那句「三者 < 90s」是 v1.7-澄清5 前的口径：现为四项，且流式三项的对标随
+      # `features.stream_keepalive` 分档（发心跳 ⇒ < 180s 绝对上限；不发/缺失 ⇒ 仍 < 90s 空闲上限）。
+      # 代码默认 60s（`msvc/config.py:51`），与下面三行同款 `${VAR:-默认}` 形态、同值。
+      MS_UPSTREAM_FIRST_CONTENT_TIMEOUT: ${MS_UPSTREAM_FIRST_CONTENT_TIMEOUT:-60}
       # ---- DW-6（生产切换清单 ⑥）：幂等窗容量按 H3 公式定值 ----
       # 依据与算例见 `model-service/README.md`「幂等窗容量定值（DW-6）」一节，不在此重复推导。
       # 假设峰值 10 RPS（= 5 个持续活跃身份 × 平台 `rpm_default=120`/60s）× 窗长 600s ⇒ 6000 条；
@@ -85,6 +90,9 @@ services:
       MS_IDEMPOTENCY_CACHE_MAX_CHARS: ${MS_IDEMPOTENCY_CACHE_MAX_CHARS:-9000000}
       # SW-5 的在飞位兜底（防持有者泄漏后 409 永久化），默认对齐上游总超时
       MS_IDEMPOTENCY_INFLIGHT_TTL_SECONDS: ${MS_IDEMPOTENCY_INFLIGHT_TTL_SECONDS:-60}
+      # RB-5（协议 §8.2.1／§28.3）：错误类入窗的独立短 TTL，默认 60s（`msvc/config.py:72`）。
+      # 必须 < `MS_IDEMPOTENCY_WINDOW_SECONDS`，否则服务**拒绝启动**（代码内校验）。
+      MS_IDEMPOTENCY_ERROR_TTL_SECONDS: ${MS_IDEMPOTENCY_ERROR_TTL_SECONDS:-60}
       # 真实上游接线（MS_UPSTREAM=litellm）时才需要；凭证落点属 DW-3/DW-5，此处仅留空位
       MS_LITELLM_API_BASE: ${MS_LITELLM_API_BASE:-}
       MS_LITELLM_API_KEY: ${MS_LITELLM_API_KEY:-}

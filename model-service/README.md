@@ -68,9 +68,20 @@
     一次真实重调上游（二次计费），所以宁可调大上限，也不要靠淘汰兜底。
 - 取消传播（红线6）：客户端断连 → 上游流式调用在 ≤2s 内被中止（`msvc/main.py:_handle_stream`）。
   断连时**终态未知**，故不入窗、只清在飞位（§6.5：由平台按 `abandoned` 对账收编）。
-- 超时自持（红线8）：首 token 15s / 中途空闲 30s（O1，`MS_UPSTREAM_CHUNK_IDLE_TIMEOUT`）/
-  总 60s（仅约束非流式，v1.7-澄清2），三者均 < 平台流式空闲上限 90s，并在 `/v1/capabilities`
+- 超时自持（红线8）：**四项**——首 token 15s（`MS_UPSTREAM_FIRST_TOKEN_TIMEOUT`）/
+  **首个正文 token 60s**（`MS_UPSTREAM_FIRST_CONTENT_TIMEOUT`，RB-1，v1.7-澄清5：到首个非空
+  `delta.content` 的预算、**含全部推理时长**）/ 中途空闲 30s（O1，`MS_UPSTREAM_CHUNK_IDLE_TIMEOUT`）/
+  总 60s（`MS_UPSTREAM_TOTAL_TIMEOUT`，**仅约束非流式**，v1.7-澄清2）；四项均在 `/v1/capabilities`
   的 `features.timeouts` 暴露实际值供平台启动断言「内层 < 外层」。
+  ⚠️ **对标基准随 `features.stream_keepalive` 分档**（v1.7-澄清5 的 A 裁定，不要再用"均 < 90s"
+  这个已过期的口径概括）：
+  - 服务**会**发心跳（`MS_UPSTREAM=litellm` ⇒ 声明 `true`）⇒ 平台空闲上限 90s 永不触发，
+    真外层是**绝对上限 180s**，故**流式三项须 < 180s**；
+  - 服务**不发**或**声明位缺失**（按保守侧；出厂默认 `MS_UPSTREAM=fake` 即此档）⇒ 流式三项
+    **仍须 < 空闲上限 90s**；
+  - `upstream_total_s`（仅非流式）对标基准的修订见工作单 W-2，**本轮未动**。
+  ⚠️ 声明位**缺失不拒启动**（协议 §8.1 硬约束 2 末尾，v1.7-澄清6）：它是能力放宽位、缺失即安全的
+  确定值，与显式 `false` 同待遇；只有 `features.timeouts` 的四个**超时键**缺失才「缺键即失败」。
 
 ## Provider
 - `FakeUpstream`（默认，`MS_UPSTREAM=fake`）：离线确定性，供本地与契约测试。
