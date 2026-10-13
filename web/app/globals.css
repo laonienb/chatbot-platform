@@ -968,6 +968,52 @@ a {
   padding: 0 4px;
 }
 
+/* ---------- 思考中指示 ----------
+   模型返回前气泡里是空的：实测真实首块要 +11.97s，那 12 秒用户无法区分
+   「在思考」与「卡死了」。指示只加在气泡**内部**、且内容一到就整块撤掉
+   （page.tsx 里 thinking = streaming && !replyStarted），所以不会与正文并存。
+   三点动画是纯装饰：prefers-reduced-motion 下由下面那条统一关掉动画，
+   改用一个静态脉冲不动的圆点，指示本身仍然可见（信息不能因为关动画而丢失）。 */
+.thinking {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  color: var(--text-dim);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.thinking-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.thinking-dots i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.35;
+  animation: thinking-bounce 1.2s var(--ease) infinite;
+}
+.thinking-dots i:nth-child(2) {
+  animation-delay: 0.16s;
+}
+.thinking-dots i:nth-child(3) {
+  animation-delay: 0.32s;
+}
+@keyframes thinking-bounce {
+  0%,
+  60%,
+  100% {
+    opacity: 0.35;
+    transform: translateY(0);
+  }
+  30% {
+    opacity: 1;
+    transform: translateY(-3px);
+  }
+}
+
 /* ---------- Markdown ---------- */
 
 .md-body {
@@ -1806,5 +1852,28 @@ html[data-theme="light"] .admin-alert strong {
 }
 html[data-theme="light"] .admin-alert span {
   color: #5a6070;
+}
+
+/* ============================================================
+   无障碍：prefers-reduced-motion
+   ============================================================ */
+/* 用户明确要求减少动效时，所有装饰性动画/过渡一律停掉。
+   注意作用域：**只关动画，不关信息** —— 「思考中」那三点在下面被按住不动，
+   但文字与圆点仍在，用户照样看得出来「模型还在跑」；而节奏缓冲的关闭不在这里，
+   在 JS 侧（lib/pacing.ts 的 prefersReducedMotion → immediate 模式），
+   因为「显示速度」不是 CSS 动画，靠 CSS 关不掉，必须在实现里选另一条路。 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+  .thinking-dots i {
+    opacity: 0.6;
+    transform: none;
+  }
 }
 

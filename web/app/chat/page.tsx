@@ -21,6 +21,12 @@ import {
   type User,
 } from "@/lib/api";
 import { downloadText, fetchAllMessages, safeFilename, toJson, toMarkdown } from "@/lib/export";
+import {
+  PacedReveal,
+  reconcileTail,
+  prefersReducedMotion,
+  THINKING_SLOW_AFTER_MS,
+} from "@/lib/pacing";
 import { applyTheme, getTheme, type Theme } from "@/lib/theme";
 import MemoryModal from "@/components/MemoryModal";
 import Select from "@/components/Select";
@@ -60,6 +66,10 @@ export default function ChatPage() {
   const [hasMore, setHasMore] = useState(false);
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
+  /** 本次流是否已经收到过内容/终态：用来决定气泡里是否还显示「思考中」。 */
+  const [replyStarted, setReplyStarted] = useState(false);
+  /** 「思考中」持续过久 ⇒ 换文案（不报错，长推理是合法状态）。 */
+  const [slowThinking, setSlowThinking] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [personaModal, setPersonaModal] = useState<
     { mode: "create" } | { mode: "edit"; persona: Persona } | null
@@ -75,10 +85,99 @@ export default function ChatPage() {
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  /** 当前这条回复的节奏缓冲（null = 未在流式，或 reduced-motion 下不需要缓冲）。 */
+  const pacingRef = useRef<PacedReveal | null>(null);
+  /** 显示层已放出的正文。refetch 与「停止」都以它为准，故必须与 setMessages 同步维护。 */
+  const pacedTextRef = useRef("");
+  /** 当前这条临时气泡的 id：收尾对齐时要确认它还在末尾（切会话后不能乱接）。 */
+  const streamBubbleIdRef = useRef<string | null>(null);
 
   const scrollToBottom = useCallback(() => {
     requestAnimationFrame(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }));
   }, []);
+
+  /** 结束节奏缓冲：停循环、丢弃剩余、此后不再回调（卸载/切会话/开新流都用它）。 */
+  const disposePacing = useCallback(() => {
+    pacingRef.current?.dispose();
+    pacingRef.current = null;
+  }, []);
+
+  /**
+   * 把显示层已放出的正文写回末尾气泡。
+   *
+   * **不能用「把新 delta 追加到气泡当前内容」那种写法**：那样放出的量取决于
+   * setMessages 的调用次数，而缓冲是逐帧推进的 —— 重渲染的批次数一变，
+   * 实际显示速度就跟着变（React 会把同一 tick 内的两次更新合并）。
+   * 这里一律写成 `已放出的完整前缀`，显示内容就与渲染时机完全解耦。
+   */
+  const revealPaced = useCallback((chunk: string) => {
+    if (!chunk) return;
+    pacedTextRef.current += chunk;
+    const full = pacedTextRef.current;
+    const id = streamBubbleIdRef.current;
+    setMessages((prev) => {
+      if (!id) return prev;
+      const idx = prev.findIndex((m) => m.id === id);
+      if (idx === -1) return prev; // 气泡已被替换/移除（切会话等），不再幽灵更新
+      if (prev[idx].content === full) return prev;
+      const next = [...prev];
+      next[idx] = { ...next[idx], content: full };
+      return next;
+    });
+    scrollToBottom(); // 气泡在长高，跟住底部
+  }, [scrollToBottom]);
+
+  /**
+   * 收尾：等缓冲排空 → 再与服务端列表对齐（判据 R3）。
+   *
+   * ⚠️ 顺序不能颠倒（本次实测过跳变）：refetch 若在缓冲放完之前发生，
+   * 服务端那份**完整**文本会把气泡瞬间补全，动画凭空跳一大段。
+   * 所以**先放完再 refetch**，本地文本那一版永远不早于服务端出现。
+   *
+   * ⚠️ `flush` 参数是判据 S1 的成败关键（浏览器实弹抓到过一次）：
+   *   - 正常收尾（收到 `[DONE]`）必须走 `end()` —— 上游结束了，但**显示还要按
+   *     自适应速率把积压放完**。这里若也走 flush，300 字会在 0.2s 内一次性铺满，
+   *     压速等于没做（实测 maxJump=306@244ms）。
+   *   - 只有「人为停止 / 出错」才 flush：那两种情况下用户要的是**立刻**看到终态，
+   *     不能对着慢慢冒字的气泡干等。
+   */
+  const finishStream = useCallback(async (conversationId: string, flush: boolean) => {
+    const p = pacingRef.current;
+    pacingRef.current = null;
+    if (p) {
+      if (flush) p.flush();
+      else p.end(); // 上游结束：队列继续按速率放完，不跳变
+      await p.whenDrained();
+    }
+    // 对齐时给「已放出的正文」建一条等价消息：不能拿 setMessages 里那份读，
+    // 因为这里在 await 之后、闭包拿到的还是旧 messages。
+    const id = streamBubbleIdRef.current;
+    const local = pacedTextRef.current
+      ? ({ id: id ?? `tmp-a-${Date.now()}`, role: "assistant", content: pacedTextRef.current, model: null, created_at: "" } as Message)
+      : null;
+    try {
+      const server = await platformApi.messages(conversationId, { limit: PAGE_SIZE });
+      setMessages((prev) => (prev.some((m) => m.id === id) ? reconcileTail(server, local) : prev));
+    } catch {
+      // 拉不到服务端列表就保留本地这份（用户看得见的内容绝不因为刷新失败而消失）
+    }
+  }, []);
+
+  // 卸载时清理缓冲循环：否则 rAF 还挂着，回调会打在已卸载的组件上（幽灵更新）。
+  // ⚠️ 只在卸载时跑：React 严格模式下开发环境会「挂载→卸载→再挂载」，
+  // 这里清掉的只是当前这个（尚未开始流式的）实例，不会误伤正在跑的流。
+  useEffect(() => disposePacing, [disposePacing]);
+
+  // 「思考中」超过 THINKING_SLOW_AFTER_MS 仍无任何块 ⇒ 改口成「仍在等待模型…」。
+  // 只换文案、不报错：本单实测真实首块 +11.97s，长推理是合法状态。
+  useEffect(() => {
+    if (!streaming || replyStarted) {
+      setSlowThinking(false);
+      return;
+    }
+    const timer = setTimeout(() => setSlowThinking(true), THINKING_SLOW_AFTER_MS);
+    return () => clearTimeout(timer);
+  }, [streaming, replyStarted]);
 
   const loadData = useCallback(async () => {
     try {
@@ -130,6 +229,14 @@ export default function ChatPage() {
 
   const openConversation = useCallback(
     async (id: string) => {
+      // 切会话：把在跑的缓冲循环停掉，且此后不再回调（否则会往新会话的消息里写旧内容）
+      disposePacing();
+      pacedTextRef.current = "";
+      setStreaming(false);
+      setReplyStarted(true);
+      setSlowThinking(false);
+      abortRef.current?.abort();
+      abortRef.current = null;
       setActiveId(id);
       setMessages([]);
       setHasMore(false);
@@ -142,7 +249,7 @@ export default function ChatPage() {
         setError(err instanceof Error ? err.message : "加载会话失败");
       }
     },
-    [scrollToBottom]
+    [disposePacing, scrollToBottom]
   );
 
   /** 点人设：优先接续该人设最近的会话，没有才新建。 */
@@ -199,6 +306,10 @@ export default function ChatPage() {
   }
 
   function stopStreaming() {
+    // 先排空缓冲再 abort：已生成的内容一次性显示齐全（判据 R1），
+    // 不能让用户点了「停止」还对着慢慢冒字的气泡。abort 之后的收尾在 send() 的
+    // catch → finishStream 里统一做（flush 幂等，重复调用无副作用）。
+    pacingRef.current?.flush();
     abortRef.current?.abort();
   }
 
@@ -229,90 +340,120 @@ export default function ChatPage() {
   async function send() {
     if (!activeId || !input.trim() || streaming) return;
     const content = input.trim();
+    const conversationId = activeId;
     setInput("");
     setStreaming(true);
+    setReplyStarted(false);
     setError(null);
+    disposePacing();
+    pacedTextRef.current = "";
     const controller = new AbortController();
     abortRef.current = controller;
+    const assistantId = `tmp-a-${Date.now()}`;
+    streamBubbleIdRef.current = assistantId;
     setMessages((prev) => [
       ...prev,
       { id: `tmp-u-${Date.now()}`, role: "user", content, model: null, created_at: "" },
-      { id: `tmp-a-${Date.now()}`, role: "assistant", content: "", model: null, created_at: "" },
+      { id: assistantId, role: "assistant", content: "", model: null, created_at: "" },
     ]);
     scrollToBottom();
+    // 节奏缓冲：上游来多少进度、显示层按积压量连续算出的速率放多少。
+    // reduced-motion 为真时 immediate 模式（来多少显示多少，不做任何延迟）。
+    const reveal = new PacedReveal({
+      onReveal: (chunk) => {
+        setReplyStarted(true);
+        revealPaced(chunk);
+      },
+      immediate: prefersReducedMotion(),
+    });
+    pacingRef.current = reveal;
     try {
       await sendMessageStream(
-        activeId,
+        conversationId,
         content,
-        (delta) => {
-          setMessages((prev) => {
-            const next = [...prev];
-            const last = next[next.length - 1];
-            if (last?.role === "assistant") next[next.length - 1] = { ...last, content: last.content + delta };
-            return next;
-          });
-          scrollToBottom();
-        },
+        (delta) => reveal.push(delta),
         controller.signal,
-        setError
+        (msg) => {
+          // 退避等待的进度提示：这不是"内容"，但确实是"已经不在思考了"，
+          // 所以一并撤掉「思考中」，免得用户对着转圈以为还在等模型。
+          setReplyStarted(true);
+          setError(msg);
+        }
       );
       setError(null); // 清掉退避期间的「N 秒后自动重试」提示
-      setMessages(await platformApi.messages(activeId, { limit: PAGE_SIZE }));
+      await finishStream(conversationId, false); // 正常收尾：按速率放完，不跳变
       setConversations(await platformApi.conversations());
     } catch (err) {
-      if ((err as Error).name !== "AbortError") {
-        setError(err instanceof Error ? err.message : "发送失败");
-      }
-      if (activeId) setMessages(await platformApi.messages(activeId, { limit: PAGE_SIZE }).catch(() => []));
+      // 收尾前先把缓冲排空：错误必须**立刻**看得见，不能让积压继续慢慢放。
+      // 判据 C2（流内错误帧）/C3（开流前 502）要的就是这一下 —— 指示撤掉、错误显示出来。
+      const aborted = (err as Error).name === "AbortError";
+      if (!aborted) setError(err instanceof Error ? err.message : "发送失败");
+      await finishStream(conversationId, true);
     } finally {
       abortRef.current = null;
+      streamBubbleIdRef.current = null;
       setStreaming(false);
+      setReplyStarted(true); // 指示必须先消失，再等 React 提交这次渲染
+      setSlowThinking(false);
       scrollToBottom();
     }
   }
 
   async function regenerate() {
     if (!activeId || streaming) return;
+    const conversationId = activeId;
     setStreaming(true);
+    setReplyStarted(false);
     setError(null);
+    disposePacing();
+    pacedTextRef.current = "";
     const controller = new AbortController();
     abortRef.current = controller;
     // 服务端会替换最后一条助手回复；前端先把末尾助手消息清空接流
+    let assistantId: string;
     setMessages((prev) => {
       const next = [...prev];
       if (next[next.length - 1]?.role === "assistant") {
+        assistantId = next[next.length - 1].id;
         next[next.length - 1] = { ...next[next.length - 1], content: "" };
       } else {
-        next.push({ id: `tmp-a-${Date.now()}`, role: "assistant", content: "", model: null, created_at: "" });
+        assistantId = `tmp-a-${Date.now()}`;
+        next.push({ id: assistantId, role: "assistant", content: "", model: null, created_at: "" });
       }
       return next;
     });
+    streamBubbleIdRef.current = assistantId!;
     scrollToBottom();
+    const reveal = new PacedReveal({
+      onReveal: (chunk) => {
+        setReplyStarted(true);
+        revealPaced(chunk);
+      },
+      immediate: prefersReducedMotion(),
+    });
+    pacingRef.current = reveal;
     try {
       await regenerateStream(
-        activeId,
-        (delta) => {
-          setMessages((prev) => {
-            const next = [...prev];
-            const last = next[next.length - 1];
-            if (last?.role === "assistant") next[next.length - 1] = { ...last, content: last.content + delta };
-            return next;
-          });
-          scrollToBottom();
-        },
+        conversationId,
+        (delta) => reveal.push(delta),
         controller.signal,
-        setError
+        (msg) => {
+          setReplyStarted(true);
+          setError(msg);
+        }
       );
       setError(null); // 清掉退避期间的「N 秒后自动重试」提示
-      setMessages(await platformApi.messages(activeId, { limit: PAGE_SIZE }));
+      await finishStream(conversationId, false); // 正常收尾：按速率放完，不跳变
     } catch (err) {
-      if ((err as Error).name !== "AbortError") {
-        setError(err instanceof Error ? err.message : "重新生成失败");
-      }
-      if (activeId) setMessages(await platformApi.messages(activeId, { limit: PAGE_SIZE }).catch(() => []));
+      const aborted = (err as Error).name === "AbortError";
+      if (!aborted) setError(err instanceof Error ? err.message : "重新生成失败");
+      await finishStream(conversationId, true);
     } finally {
       abortRef.current = null;
+      streamBubbleIdRef.current = null;
       setStreaming(false);
+      setReplyStarted(true);
+      setSlowThinking(false);
       scrollToBottom();
     }
   }
@@ -605,6 +746,10 @@ export default function ChatPage() {
                   minute: "2-digit",
                 });
                 const activePersona = personaOf(activeConv.persona_id);
+                // 「思考中」只在「正在流式 + 还没有任何块可显示」时为真。
+                // 首块一到（replyStarted）立刻为假 ⇒ 指示与内容不会并存（C1）；
+                // 错误帧/开流前失败同样把 replyStarted 置真并结束流式 ⇒ 指示立刻消失（C2/C3）。
+                const thinking = streaming && !replyStarted && i === messages.length - 1;
                 return (
                   <div key={m.id} className={`bubble-row ${m.role}`}>
                     {m.role === "assistant" ? (
@@ -620,7 +765,24 @@ export default function ChatPage() {
                     )}
                     <div className="msg-col">
                       <div className={`bubble ${m.role}`}>
-                        {m.role === "assistant" ? <Markdown content={m.content} /> : m.content}
+                        {m.role === "assistant" ? (
+                          thinking ? (
+                            <span className="thinking" role="status" aria-live="polite">
+                              <span className="thinking-dots" aria-hidden>
+                                <i />
+                                <i />
+                                <i />
+                              </span>
+                              <span className="thinking-text">
+                                {slowThinking ? "仍在等待模型…" : "思考中…"}
+                              </span>
+                            </span>
+                          ) : (
+                            <Markdown content={m.content} />
+                          )
+                        ) : (
+                          m.content
+                        )}
                         {m.role === "assistant" && (
                           <span className="bubble-meta">
                             {m.model && <small>{m.model}</small>}
