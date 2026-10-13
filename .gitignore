@@ -39,3 +39,12 @@ data/
 # 浏览器/前端验证工具产物（前一位前端 agent 的 playwright-cli 遗留）
 .playwright-cli/
 output/
+
+# 本地一次性脚本（常含真实凭证/临时探针，绝不入库）
+# 背景：tt.py 里硬编码过真实 API Key；本文件只管「不入库」，
+# 凭证本体仍应改成读 env / 读 llm_models 表，别把 gitignore 当唯一防线。
+scratch/
+tt.py
+tt_*.py
+probe_*.py
+
