@@ -95,6 +95,17 @@ cd D:\workingcode\chatbot-platform\deploy
 docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build
 ```
 
+> **先别急着 up** —— 装好 Docker 后**先跑一次自检**，它会替你把所有能静态发现的问题挡在 up 之前：
+>
+> ```powershell
+> powershell -ExecutionPolicy Bypass -File deploy\local\check-docker.ps1
+> ```
+>
+> 检查项：docker 是否存在且在跑 → 文件是否齐 → **必填项是否真填了**（空值/残留 dev 默认值/
+> `LLM_BACKEND=mock` 都会被点名）→ **`docker compose config` 语法与插值**（这一步在写 compose
+> 的机器上做不了，见「六」的说明）→ **是否只有 web 对外** → 三个镜像能否构建。
+> 全绿之后再 up，能省掉一轮"起来了但打不开"的排查。
+
 首次构建要几分钟（拉镜像 + 装依赖）。看状态与日志：
 
 ```powershell
@@ -222,6 +233,22 @@ Test-NetConnection 127.0.0.1 -Port 5432 -InformationLevel Quiet
 
 **未能证实**（不要当成结论）：Cloudflare / ngrok 在中国大陆的实际可达性——两者都没有官方
 文档能证明「可用」或「被墙」，只能靠实际网络环境验证。cpolar 免费档是否需实名，官网未提及。
+
+### 本仓库部署产物的验证程度（如实标注）
+
+写这份文档与 compose 的机器上**没有 docker**（`docker` 命令不存在、无 WSL2、无管理员权限），
+所以下面把「验到什么程度」分开写清楚，避免把「结构自洽」误当成「docker 接受」：
+
+| 产物 | 验证程度 |
+|---|---|
+| `deploy/docker-compose.prod.yml` | ⚠️ **只做过 YAML 解析 + 结构断言**（变量有出处、依赖服务存在、build 上下文与 Dockerfile 存在、命名卷已声明、只有 web 发布端口）。**没跑过 `docker compose config`** |
+| `web/Dockerfile` | ✅ runner 层布局**本机实测**：复刻目录后用 `node server.js` 起在 3100，80ms 就绪、页面 200、经代理回 /healthz、静态 chunk 可服务。但**没跑过 `docker build`** |
+| `deploy/local/*.ps1` | ✅ **全部实测**（start 3.7s 返回、stop 释放端口、status 输出正确 pid 与端口） |
+| 前端生产形态 | ✅ 实测 `next build` + standalone 启动 133ms，浏览器真实走通登录→聊天 |
+| 真实模型链路 | ✅ 实测到 SSE 8 chunk + `[DONE]`，真实模型回复 |
+
+⇒ **docker 相关的两格必须由 `deploy/local/check-docker.ps1` 在你的机器上补验**（见「三」）。
+这不是可选项：一个 compose 语法错误会让 `up` 直接失败，而结构断言发现不了它。
 
 ---
 
