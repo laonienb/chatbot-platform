@@ -1,0 +1,123 @@
+# deploy/docker-compose.prod.yml —— **公网部署**（自包含，非 override）
+#
+# 用法（在 deploy/ 目录）：
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# 为什么不复用 docker-compose.yml + 覆盖文件：compose 的合并对 `ports` 是**追加**语义，
+# 想在覆盖文件里「删掉」基础文件发布的 5432/6379 需要 `!override` 标签（Compose v2.24+）。
+# 而基础文件是**本地开发**态（postgres/redis 发布到宿主、密码是公开 dev 值、源码热重载），
+# 它那几个默认值直接上公网就是现成的洞。所以这里写一份**自包含**的生产文件：
+# 不依赖任何合并规则，任何 compose 版本行为一致，也不需要操作者理解 override 语义。
+#
+# 与开发态的关键差异（每条对应一个公网风险）：
+#   1. **只有 web 发布宿主端口**（默认 3000）。postgres/redis/server/model-service 一律
+#      只在 compose 内网可达 —— 数据库与模型服务不该能从公网直连。
+#   2. 密码/密钥用 `${VAR:?}` 强制注入：没设就**拒绝启动**，杜绝"忘了改默认值"。
+#   3. `SIGNUP_GRANT_CREDITS` 默认 0：`/register` 公开、无审核、无频控，送额度＝开门让人刷。
+#   4. `LLM_BACKEND` 无默认值，必须显式给：prod 下为 mock 会被 main.py 守卫拒绝启动（红线9）。
+#   5. 不挂载源码、不暴露 8000：生产镜像代码烤进镜像，入口只有 web。
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: chatbot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?必须设置 POSTGRES_PASSWORD（照 deploy/.env.example 生成）}
+      POSTGRES_DB: chatbot
+    # 刻意不写 ports：数据库只在 compose 内网可达
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chatbot"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    # 刻意不写 ports：Redis 无认证，暴露即等于把限流/会话状态送人
+    volumes:
+      - redisdata:/data
+    restart: unless-stopped
+
+  server:
+    build: ../server
+    environment:
+      DATABASE_URL: postgresql+asyncpg://chatbot:${POSTGRES_PASSWORD:?}@postgres:5432/chatbot
+      # 不换掉代码里的 insecure 默认值，JWT 可被任意伪造
+      SECRET_KEY: ${SECRET_KEY:?必须设置 SECRET_KEY（≥32 字节随机）}
+      # 浏览器只跟 web 同源通信（Next rewrites 代理），无需放开其它来源
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+      # ⚠️ 公网安全：注册即送额度的默认值必须为 0
+      SIGNUP_GRANT_CREDITS: ${SIGNUP_GRANT_CREDITS:-0}
+      # 无默认值 ⇒ 逼操作者明确选择；prod 下 mock 会被守卫拒绝启动
+      LLM_BACKEND: ${LLM_BACKEND:?必须显式设置 LLM_BACKEND（prod 下不得为 mock）}
+      APP_ENV: ${APP_ENV:-prod}
+      # 模型服务（仅 remote 模式用）
+      MODEL_SERVICE_BASE_URL: ${MODEL_SERVICE_BASE_URL:-http://model-service:8000}
+      MODEL_SERVICE_MODE: ${MODEL_SERVICE_MODE:-native}
+      MODEL_SERVICE_TOKEN: ${MODEL_SERVICE_TOKEN:-}
+    # 刻意不写 ports：后端由 web 统一入口，不单独对外
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # 刻意不挂载 ../server/app：生产镜像里代码是烤进镜像的，挂载会让宿主源码覆盖它
+    restart: unless-stopped
+
+  # 模型服务：仅内网；真实凭证落点见 deploy/.env（不入库）
+  model-service:
+    build: ../model-service
+    expose:
+      - "8000"
+    environment:
+      MS_UPSTREAM: ${MS_UPSTREAM:-fake}
+      MS_SERVICE_TOKENS: ${MS_SERVICE_TOKENS:-dev-insecure-model-service-token}
+      MS_COMPLIANCE_DENY_PROVIDERS: ${MS_COMPLIANCE_DENY_PROVIDERS:-openai,anthropic}
+      MS_CATALOG_MODELS: ${MS_CATALOG_MODELS:-deepseek-chat,qwen-plus}
+      MS_UPSTREAM_FIRST_TOKEN_TIMEOUT: ${MS_UPSTREAM_FIRST_TOKEN_TIMEOUT:-15}
+      MS_UPSTREAM_CHUNK_IDLE_TIMEOUT: ${MS_UPSTREAM_CHUNK_IDLE_TIMEOUT:-30}
+      MS_UPSTREAM_TOTAL_TIMEOUT: ${MS_UPSTREAM_TOTAL_TIMEOUT:-60}
+      MS_UPSTREAM_FIRST_CONTENT_TIMEOUT: ${MS_UPSTREAM_FIRST_CONTENT_TIMEOUT:-60}
+      MS_IDEMPOTENCY_WINDOW_SECONDS: ${MS_IDEMPOTENCY_WINDOW_SECONDS:-600}
+      MS_IDEMPOTENCY_CACHE_MAX_ENTRIES: ${MS_IDEMPOTENCY_CACHE_MAX_ENTRIES:-6000}
+      MS_IDEMPOTENCY_CACHE_MAX_CHARS: ${MS_IDEMPOTENCY_CACHE_MAX_CHARS:-9000000}
+      MS_IDEMPOTENCY_INFLIGHT_TTL_SECONDS: ${MS_IDEMPOTENCY_INFLIGHT_TTL_SECONDS:-60}
+      MS_IDEMPOTENCY_ERROR_TTL_SECONDS: ${MS_IDEMPOTENCY_ERROR_TTL_SECONDS:-60}
+      MS_LITELLM_API_BASE: ${MS_LITELLM_API_BASE:-}
+      MS_LITELLM_API_KEY: ${MS_LITELLM_API_KEY:-}
+      MS_LITELLM_DEFAULT_MODEL: ${MS_LITELLM_DEFAULT_MODEL:-}
+      MS_LITELLM_PROVIDER: ${MS_LITELLM_PROVIDER:-openai}
+      MS_UPSTREAM_VENDOR: ${MS_UPSTREAM_VENDOR:-}
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/liveness', timeout=3).read()",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # 公网唯一入口：前端 + 经它代理到 server（Next rewrites）
+  web:
+    build:
+      context: ../web
+      dockerfile: Dockerfile
+    environment:
+      # next.config.mjs 的 rewrites 在**运行时**求值，故同一镜像可指向不同后端
+      BACKEND_URL: http://server:8000
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    depends_on:
+      server:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:

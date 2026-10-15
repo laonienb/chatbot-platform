@@ -21,7 +21,11 @@ build/
 # 环境与密钥（绝不入库）
 .env
 .env.*
+# 反向放行模板：`!.env.example` 只认这一个**字面名**，`.env.prod.example`
+# 之类会连带被上面的 `.env.*` 吞掉（实测：git check-ignore 命中，模板进不了库）。
+# 故用 `!*.example` 覆盖所有模板名，保持"只放行模板、真值一律拦"。
 !.env.example
+!*.example
 
 # IDE / OS
 .idea/

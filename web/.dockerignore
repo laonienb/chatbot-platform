@@ -1,0 +1,10 @@
+# web 构建上下文排除项：别把本机 node_modules / 构建产物 / 密钥塞进镜像上下文
+node_modules
+.next
+out
+.git
+*.log
+.env
+.env.*
+!.env.example
+tsconfig.tsbuildinfo
