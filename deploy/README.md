@@ -318,7 +318,14 @@ powershell -ExecutionPolicy Bypass -File deploy\local\stop.ps1
 
 # 装成开机自启（登录时自动拉起；-Remove 卸载）
 powershell -ExecutionPolicy Bypass -File deploy\local\autostart.ps1
+
+# 验收：一条命令确认「真的可用」（23 项检查，失败则 exit 1）
+powershell -ExecutionPolicy Bypass -File deploy\local\verify.ps1
 ```
+
+`verify.ps1` 检查 7 组：端口 → 健康检查 → **局域网可访问** → **公网 Host 兼容**（隧道前提）
+→ **真实模型端到端**（注册/人设/会话/SSE 流式/`[DONE]`/真实回复）→ 开机自启任务 → 交付物是否入库。
+也可以拿去验公网链路：`verify.ps1 -Base https://<你的隧道域名>`。
 
 `start.ps1` **是幂等的**：服务已在跑且 `/healthz` 通时直接报「已就绪」并 `exit 0`，
 不会重复起、也不会报错（这样开机自启重复触发不会留失败记录）。
