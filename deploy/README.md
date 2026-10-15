@@ -8,6 +8,9 @@
 
 ## 零、结论速览
 
+> **不想装 Docker？** 直接跳到「八、不用 Docker 的部署」——那条路**已实测可用**，
+> 四个脚本命令搞定，今天就能让同网段的人访问。
+
 **形态**：本机用 Docker Compose 跑 4 个容器（web / server / postgres / model-service），
 再用**内网穿透工具**把 `web` 的 3000 端口发布到公网。**只有 web 一个入口**——
 它通过 Next.js 的 rewrites 把 `/api/v1`、`/v1` 转发给后端的 server 容器，
@@ -245,19 +248,100 @@ web 容器用 `BACKEND_URL=http://server:8000` 找后端。确认 server 容器�
 
 ---
 
-## 八、本地开发（不用 Docker）
+## 八、不用 Docker 的部署（本机进程，已可用）
 
-如果只想在本机快速起（不装 Docker）：
+**这条路已经实测跑通，且不需要装 Docker。** 适用于：还没装 Docker、或本机不想装。
+
+### 一键脚本
+
+```powershell
+cd D:\workingcode\chatbot-platform
+
+# 起（跑迁移 + 构建前端 + 起前后端，约 4 秒；首次构建前端 30-60s）
+powershell -ExecutionPolicy Bypass -File deploy\local\start.ps1
+
+# 看状态 / 日志尾部 / 局域网地址
+powershell -ExecutionPolicy Bypass -File deploy\local\status.ps1
+
+# 停
+powershell -ExecutionPolicy Bypass -File deploy\local\stop.ps1
+```
+
+`start.ps1` 做完这几件事：
+
+1. 跑 `alembic upgrade head`（**必须**，缺列会让 `/v1` 直接 502）；
+2. 检查前端构建产物是否过期，过期才 `next build`（省时间）；
+3. 起后端（uvicorn，**不带 `--reload`**）与前端（**standalone 生产模式**，不是 `npm run dev`）；
+4. 探活并把「本机地址 / 局域网地址 / 接口健康」打出来；
+5. 记真实监听进程的 pid 到 `deploy/local/logs/*.pid`，供 stop 用。
+
+两个服务都写日志到 `deploy/local/logs/`（`api.log` / `web.log` / `*.err.log`），崩溃可回溯。
+
+可选参数：`-WebPort 8080`、`-ApiPort 8001`、`-BindHost 127.0.0.1`（只本机可访问时）。
+
+### 实测结果（2026-10-15）
+
+| 项 | 结果 |
+|---|---|
+| `start.ps1` 耗时（产物已就绪） | **3.7s** |
+| 前端启动 | `Ready in 133ms`（standalone，非 dev） |
+| `http://127.0.0.1:3000/healthz` | `{"status":"ok","backend":"litellm"}` |
+| 局域网 `http://192.168.31.153:3000` | 200 |
+| 完整链路（局域网地址、真实模型） | 注册 → 建人设 → 建会话 → **8 个 SSE chunk + `[DONE]`** → 拼出真实回复 |
+| stop → 端口释放 → 再 start | 通过 |
+
+### 让别人用（局域网）
+
+同网段的手机/电脑直接打开 `http://192.168.31.153:3000` 即可（把 IP 换成你本机的，
+`status.ps1` 会打出来）。**无需任何穿透工具、无需配 CORS**——前端同源代理了后端。
+
+> 公网访问见「四」，需要用穿透工具把 3000 发布出去。
+
+### 开机自启
+
+`start.ps1` 起的进程**不会**开机自启。两种做法：
+
+**做法 A：任务计划程序（推荐，无需管理员也能建当前用户的任务）**
+
+```powershell
+$action  = New-ScheduledTaskAction -Execute "powershell.exe" `
+  -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"D:\workingcode\chatbot-platform\deploy\local\start.ps1`""
+$trigger = New-ScheduledTaskTrigger -AtLogOn
+Register-ScheduledTask -TaskName "chatbot-platform" -Action $action -Trigger $trigger -Force
+```
+
+之后每次登录自动拉起。卸载：`Unregister-ScheduledTask -TaskName "chatbot-platform" -Confirm:$false`
+
+**做法 B：启动文件夹放一个快捷方式**
+
+`Win+R` → `shell:startup` → 把 `start.ps1` 的快捷方式丢进去（可设「最小化」）。
+
+⚠️ Docker Desktop 的「开机启动」开关只管 Docker 那条路；本机进程这条路要用上面的任务计划。
+
+### 与 Docker 路的取舍（如实说明）
+
+| | 本机进程（第八节） | Docker（一~三节） |
+|---|---|---|
+| 要装 Docker | ❌ 不用 | ✅ 要（WSL2 + 管理员） |
+| 隔离 | ❌ 直接跑在宿主 | ✅ 容器隔离 |
+| 崩溃自动重启 | ❌ 需自己配任务计划 | ✅ `restart: unless-stopped` |
+| 数据库 | SQLite 文件（`server/dev.db`） | PostgreSQL 容器 |
+| 适合 | **今天就想让别人用** | 长期稳定运行 |
+
+两者可以共存，但**别同时起**——会抢 3000/8000 端口（`start.ps1` 会检测并拒绝启动）。
+
+### 纯手动（不用脚本）
 
 ```powershell
 # 后端
 cd D:\workingcode\chatbot-platform\server
-.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 
-# 前端（另开一个窗口）
+# 前端（另开一个窗口；生产模式）
 cd D:\workingcode\chatbot-platform\web
-npm run dev
+$env:BACKEND_URL="http://127.0.0.1:8000"; $env:PORT="3000"; $env:HOSTNAME="0.0.0.0"
+node .next\standalone\server.js
 ```
 
-访问 <http://localhost:3000>。此时**同一局域网**的设备可用 `http://<本机IP>:3000`
-直接访问（实测 `http://192.168.31.153:3000` 返回 200），无需任何穿透工具。
+开发用 `npm run dev` 也行，但那是**开发模式**（有热重载、启动 2.4s 而非 133ms），
+给别人用建议走上面的生产形态。
