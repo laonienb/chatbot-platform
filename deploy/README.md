@@ -292,7 +292,13 @@ powershell -ExecutionPolicy Bypass -File deploy\local\status.ps1
 
 # 停
 powershell -ExecutionPolicy Bypass -File deploy\local\stop.ps1
+
+# 装成开机自启（登录时自动拉起；-Remove 卸载）
+powershell -ExecutionPolicy Bypass -File deploy\local\autostart.ps1
 ```
+
+`start.ps1` **是幂等的**：服务已在跑且 `/healthz` 通时直接报「已就绪」并 `exit 0`，
+不会重复起、也不会报错（这样开机自启重复触发不会留失败记录）。
 
 `start.ps1` 做完这几件事：
 
@@ -326,20 +332,44 @@ powershell -ExecutionPolicy Bypass -File deploy\local\stop.ps1
 
 ### 开机自启
 
-`start.ps1` 起的进程**不会**开机自启。两种做法：
-
-**做法 A：任务计划程序（推荐，无需管理员也能建当前用户的任务）**
+`start.ps1` 起的进程**不会**开机自启。用附带脚本装成计划任务：
 
 ```powershell
-$action  = New-ScheduledTaskAction -Execute "powershell.exe" `
-  -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"D:\workingcode\chatbot-platform\deploy\local\start.ps1`""
-$trigger = New-ScheduledTaskTrigger -AtLogOn
-Register-ScheduledTask -TaskName "chatbot-platform" -Action $action -Trigger $trigger -Force
+# 装（登录时自动拉起，隐藏窗口）
+powershell -ExecutionPolicy Bypass -File deploy\local\autostart.ps1
+
+# 立即试跑一次，不等下次登录
+Start-ScheduledTask -TaskName chatbot-platform
+Get-ScheduledTaskInfo -TaskName chatbot-platform   # LastTaskResult 0 = 成功
+
+# 卸载
+powershell -ExecutionPolicy Bypass -File deploy\local\autostart.ps1 -Remove
 ```
 
-之后每次登录自动拉起。卸载：`Unregister-ScheduledTask -TaskName "chatbot-platform" -Confirm:$false`
+⚠️ **早先本文件写的「无需管理员也能建任务」是错的**（已实测更正）。裸调
+`Register-ScheduledTask`（不带 `-Principal`）在本机**非管理员**下报 `Access is denied.`。
+可用配方是**显式指定 principal**：
 
-**做法 B：启动文件夹放一个快捷方式**
+```powershell
+$principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" `
+  -LogonType Interactive -RunLevel Limited
+Register-ScheduledTask -TaskName "chatbot-platform" -Action $action -Trigger $trigger -Principal $principal -Force
+```
+
+`autostart.ps1` 就是按这个配方写的。若仍拿到 Access is denied，改用**管理员** PowerShell 跑它。
+
+**实测（2026-10-15）**：
+
+| 场景 | LastTaskResult | 结果 |
+|---|---|---|
+| 服务已在跑时触发 | **0** | 识别为「已在运行且健康」，幂等成功 |
+| 冷启动（先 stop 再触发） | **0** | 两个服务被拉起，`/healthz` = ok |
+
+> 幂等这条是**修出来的**：不加判断时重复触发会返回 **1**（因为 `start.ps1` 见端口被占就拒绝
+> 启动），每次登录都在任务历史里留一条"失败"，看着像坏了。现在 `start.ps1` 会先探
+> `/healthz`：占用者是**我们自己**就报成功退出；是**别的进程**才拒绝（不会去抢端口）。
+
+**做法 B：启动文件夹放快捷方式**
 
 `Win+R` → `shell:startup` → 把 `start.ps1` 的快捷方式丢进去（可设「最小化」）。
 

@@ -48,12 +48,37 @@ if (-not (Test-Path (Join-Path $root "web\node_modules"))) {
   exit 1
 }
 
-# 端口占用检查：避免起第二个实例互相抢端口（历史上同项目并跑两个 dev server 会共用 .next 而互相污染）
+# 端口占用检查：
+#   - 若占用的**就是我们自己的服务**（/healthz 通、且 pid 文件对得上）⇒ 视为**已就绪**，
+#     直接报成功退出。这让「开机自启」具备**幂等性**：登录时若服务已在跑（比如手动起过、
+#     或上次没退），任务不该报失败。实测教训：不加这一步时，重复触发任务会
+#     LastTaskResult=1，每次登录都留一条"失败"记录，看着像坏了。
+#   - 若被**别的进程**占着 ⇒ 仍然明确拒绝，别去抢端口（历史上并跑两个 dev server 会共用
+#     .next 互相污染）。
+$alreadyMine = $true
+foreach ($p in @($WebPort, $ApiPort)) {
+  $busy = Get-NetTCPConnection -LocalPort $p -State Listen -ErrorAction SilentlyContinue
+  if (-not $busy) { $alreadyMine = $false; break }
+}
+if ($alreadyMine) {
+  try {
+    $h = Invoke-WebRequest "http://127.0.0.1:$WebPort/healthz" -UseBasicParsing -TimeoutSec 5
+    if ($h.StatusCode -eq 200) {
+      Write-Host "[start] 服务已在运行且健康（$($h.Content.Trim())），无需重复启动。" -ForegroundColor Green
+      $lanIp0 = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike "127.*" -and $_.IPAddress -notlike "169.254.*" } | Select-Object -First 1).IPAddress
+      if ($lanIp0) { Write-Host "        局域网： http://${lanIp0}:$WebPort" -ForegroundColor Green }
+      exit 0
+    }
+  } catch { }
+}
+
 foreach ($p in @($WebPort, $ApiPort)) {
   $busy = Get-NetTCPConnection -LocalPort $p -State Listen -ErrorAction SilentlyContinue
   if ($busy) {
-    Write-Host "[start] 端口 $p 已被占用（PID $($busy.OwningProcess -join ',')）。" -ForegroundColor Yellow
-    Write-Host "        先跑 stop.ps1，或换端口：-WebPort/-ApiPort。" -ForegroundColor Yellow
+    $op = Get-Process -Id $busy.OwningProcess[0] -ErrorAction SilentlyContinue
+    Write-Host "[start] 端口 $p 已被占用（$($op.ProcessName), PID $($busy.OwningProcess -join ',')）。" -ForegroundColor Yellow
+    Write-Host "        若不是本项目的服务，请换端口：-WebPort/-ApiPort；" -ForegroundColor Yellow
+    Write-Host "        若是本项目的残留，先跑 stop.ps1。" -ForegroundColor Yellow
     exit 1
   }
 }
